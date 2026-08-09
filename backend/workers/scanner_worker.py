@@ -53,6 +53,7 @@ from utils.utcnow import utcnow
 
 logger = get_logger("scanner_worker")
 _CANCEL_GRACE_SECONDS = 5.0
+_MARKET_REFRESH_STRATEGY_SOURCE_KEYS = ("scanner", "sports")
 _abandoned_tasks: set[asyncio.Task] = set()
 _inflight_timed_tasks: dict[str, asyncio.Task] = {}
 _last_pressure_snapshot_skip_log_at = 0.0
@@ -305,7 +306,7 @@ async def _run_scan_loop() -> None:
     global _last_pressure_heavy_skip_log_at
 
     await scanner.load_settings()
-    await scanner.load_plugins(source_keys=["scanner"])
+    await scanner.load_plugins(source_keys=list(_MARKET_REFRESH_STRATEGY_SOURCE_KEYS))
     restored_count = await _hydrate_scanner_pool_from_snapshot()
     scanner._running = True
     scanner._enabled = True
@@ -529,7 +530,7 @@ async def _run_scan_loop() -> None:
 
             try:
                 await refresh_strategy_runtime_if_needed(
-                    source_keys=["scanner"],
+                    source_keys=list(_MARKET_REFRESH_STRATEGY_SOURCE_KEYS),
                 )
             except Exception as exc:
                 logger.warning("Scanner strategy refresh check failed: %s", exc)

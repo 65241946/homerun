@@ -10,8 +10,9 @@
 
 - 体育页面和顶部数量徽标都调用 `GET /api/opportunities?category=sports`。
 - 当前后端对 `category` 使用严格字符串相等判断。
-- 实际体育机会可能使用 `WNBA`、`MLB` 等联赛分类，也可能没有顶层分类但市场包含 `sports_market_type` 或 `game_start_time`。
-- 当前运行态存在一条分类为 `WNBA` 的机会，但严格查询 `category=sports` 返回 0。
+- 实际体育机会可能使用 `WNBA`、`MLB` 等联赛分类，也可能没有顶层分类但市场包含 `sports_market_type`。
+- 部署前快照曾存在一条分类为 `WNBA` 的机会，但严格查询 `category=sports` 返回 0；机会本身会随扫描结果过期，不能把“必须仍有该条机会”作为验收条件。
+- 运行态验收确认天气市场也会带 `game_start_time`，因此该字段只能表示时间，不能单独证明市场属于体育。
 - `sports_overreaction_fader` 已由 detection worker 加载并订阅市场刷新事件；其原始阈值当前没有产生机会。
 - 扫描器状态构造只枚举 `source_key=scanner`，因此漏掉了已经加载的 `source_key=sports` 策略。
 
@@ -35,8 +36,9 @@
 
 1. 原始机会分类为 `sports` 或明确的体育联赛/项目分类，例如 `NBA`、`WNBA`、`NFL`、`MLB`、`NHL`、`ATP`、`WTA`、足球、篮球、棒球、冰球、网球、综合格斗、电子竞技等；
 2. 策略为 `sports_overreaction_fader`；
-3. 任一关联市场具有非空 `sports_market_type`；
-4. 任一关联市场具有非空 `game_start_time`。
+3. 任一关联市场具有非空 `sports_market_type`。
+
+`game_start_time` 不作为独立体育分类证据，避免把天气等具有通用开始/结算时间的市场误纳入体育页。
 
 该匹配函数同时用于机会列表、机会 ID 和机会数量统计所依赖的统一过滤路径，确保页面内容和数量一致。
 
@@ -63,7 +65,7 @@
 
 1. `WNBA` 分类能够匹配 `sports`；
 2. 顶层分类为空但 `sports_market_type=moneyline` 的机会能够匹配 `sports`；
-3. 顶层分类为空但存在 `game_start_time` 的机会能够匹配 `sports`；
+3. 只有 `game_start_time` 的天气机会不能匹配 `sports`；
 4. 普通政治或经济机会不能匹配 `sports`；
 5. 非体育分类仍保持精确匹配；
 6. 扫描器状态包含已加载的 `source_key=sports` 策略；
@@ -71,7 +73,7 @@
 
 部署后进行只读验收：
 
-- `/api/opportunities?category=sports` 至少能返回当前已存在的 WNBA 机会；
+- `/api/opportunities?category=sports` 只返回满足结构化体育证据的当前机会；若当前没有真实体育机会，允许为 0；
 - 体育页数量与接口总数一致；
 - `/api/scanner/status` 能看到 `sports_overreaction_fader` 为 loaded；
 - 体育专用策略的机会数仍由原策略真实触发，允许为 0；

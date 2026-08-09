@@ -41,6 +41,7 @@ _NEWS_PREFETCH_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="news_prefetch",
 )
 logger = get_logger(__name__)
+_MARKET_REFRESH_STRATEGY_SOURCE_KEYS = frozenset({"scanner", "sports"})
 
 
 def _make_aware(dt: Optional[datetime]) -> Optional[datetime]:
@@ -1938,7 +1939,8 @@ class ArbitrageScanner:
         if self._strategy_overrides is not None:
             for instance in self._strategy_overrides:
                 slug = getattr(instance, "slug", None) or getattr(instance, "name", "__override__")
-                if str(getattr(instance, "source_key", "scanner") or "").strip().lower() != "scanner":
+                source_key = str(getattr(instance, "source_key", "scanner") or "").strip().lower()
+                if source_key not in _MARKET_REFRESH_STRATEGY_SOURCE_KEYS:
                     continue
                 if getattr(instance, "wants_full_snapshot", False):
                     full_snapshot.add(slug)
@@ -1962,7 +1964,8 @@ class ArbitrageScanner:
 
         for slug, loaded in strategy_loader._loaded.items():
             instance = loaded.instance
-            if str(getattr(instance, "source_key", "scanner") or "").strip().lower() != "scanner":
+            source_key = str(getattr(instance, "source_key", "scanner") or "").strip().lower()
+            if source_key not in _MARKET_REFRESH_STRATEGY_SOURCE_KEYS:
                 continue
             if getattr(instance, "wants_full_snapshot", False):
                 full_snapshot.add(slug)
@@ -2885,14 +2888,16 @@ class ArbitrageScanner:
         await self.load_plugins()
 
     def _get_all_strategies(self) -> list:
-        """Return DB-loaded strategy instances whose source_key is 'scanner'."""
+        """Return DB-loaded market-refresh strategy instances for this scanner."""
         if self._strategy_overrides is not None:
             return list(self._strategy_overrides)
         plugin_strategies = strategy_loader.get_all_instances()
-        scanner_strategies = [
-            s for s in plugin_strategies if str(getattr(s, "source_key", "scanner") or "").strip().lower() == "scanner"
+        return [
+            strategy
+            for strategy in plugin_strategies
+            if str(getattr(strategy, "source_key", "scanner") or "").strip().lower()
+            in _MARKET_REFRESH_STRATEGY_SOURCE_KEYS
         ]
-        return scanner_strategies
 
     def _get_news_edge_helper(self):
         """Return the news_edge strategy instance for prefetch utilities."""

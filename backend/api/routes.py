@@ -229,6 +229,60 @@ def _coerce_int_param(value: Any, default: int) -> int:
         return default
 
 
+_SPORTS_CATEGORY_ALIASES = frozenset(
+    {
+        "sports",
+        "nba",
+        "wnba",
+        "nfl",
+        "mlb",
+        "nhl",
+        "ncaa",
+        "ncaab",
+        "ncaaf",
+        "soccer",
+        "football",
+        "basketball",
+        "baseball",
+        "hockey",
+        "tennis",
+        "atp",
+        "wta",
+        "ufc",
+        "mma",
+        "boxing",
+        "golf",
+        "cricket",
+        "rugby",
+        "formula 1",
+        "f1",
+        "esports",
+    }
+)
+_SPORTS_STRATEGY_SLUGS = frozenset({"sports_overreaction_fader"})
+
+
+def _payload_matches_category(payload: Mapping[str, Any], requested_category: str) -> bool:
+    """Match an opportunity payload to an API category without rewriting it."""
+    requested = str(requested_category or "").strip().lower()
+    actual = str(payload.get("category") or "").strip().lower()
+    if requested != "sports":
+        return actual == requested
+    if actual in _SPORTS_CATEGORY_ALIASES:
+        return True
+    strategy = str(payload.get("strategy") or "").strip().lower()
+    if strategy in _SPORTS_STRATEGY_SLUGS:
+        return True
+    markets = payload.get("markets")
+    if not isinstance(markets, list):
+        return False
+    return any(
+        isinstance(market, Mapping)
+        and bool(str(market.get("sports_market_type") or "").strip())
+        for market in markets
+    )
+
+
 async def _resolve_strategy_to_filter(strategy_param: Optional[str]) -> list[str]:
     """Resolve strategy param to list of strategy type strings.
 
@@ -480,7 +534,7 @@ async def _list_filtered_opportunity_payloads(
             max_risk=max_risk,
             strategies=sorted(strategies),
             min_liquidity=min_liquidity,
-            category=category,
+            category=None,
         )
         legacy_opportunities = await shared_state.get_opportunities_from_db(
             session,
@@ -488,6 +542,8 @@ async def _list_filtered_opportunity_payloads(
             source=source,
         )
         payloads = [opportunity.model_dump() for opportunity in legacy_opportunities]
+        if category:
+            payloads = [payload for payload in payloads if _payload_matches_category(payload, category)]
         if exclude_strategy:
             exclude_strategy_lower = str(exclude_strategy).strip().lower()
             payloads = [
@@ -535,12 +591,7 @@ async def _list_filtered_opportunity_payloads(
         ]
 
     if category:
-        category_lower = str(category).strip().lower()
-        payloads = [
-            payload
-            for payload in payloads
-            if str(payload.get("category") or "").strip().lower() == category_lower
-        ]
+        payloads = [payload for payload in payloads if _payload_matches_category(payload, category)]
 
     if exclude_strategy:
         exclude_strategy_lower = str(exclude_strategy).strip().lower()

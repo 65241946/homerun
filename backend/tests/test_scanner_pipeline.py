@@ -147,6 +147,43 @@ class TestScannerInit:
         assert "tail_end_carry" not in incremental
         assert "tail_end_carry" in full_snapshot
 
+    def test_sports_source_strategy_routes_to_market_refresh_lane(self):
+        scanner = _build_scanner()
+        sports_strategy = MagicMock()
+        sports_strategy.slug = "sports_market_strategy"
+        sports_strategy.name = "Sports Market Strategy"
+        sports_strategy.source_key = "sports"
+        sports_strategy.strategy_type = "sports_market_strategy"
+        sports_strategy.subscriptions = [EventType.MARKET_DATA_REFRESH]
+        sports_strategy.mispricing_type = MispricingType.WITHIN_MARKET.value
+        scanner._strategy_overrides = [sports_strategy]
+
+        incremental, full_snapshot = scanner._partition_market_refresh_strategies()
+
+        assert "sports_market_strategy" in incremental | full_snapshot
+
+    def test_runtime_strategy_list_includes_sports_market_refresh_source(self, monkeypatch):
+        from services.scanner import strategy_loader
+
+        scanner = _build_scanner()
+        scanner._strategy_overrides = None
+        scanner_strategy = SimpleNamespace(source_key="scanner", strategy_type="basic", name="Basic")
+        sports_strategy = SimpleNamespace(
+            source_key="sports",
+            strategy_type="sports_overreaction_fader",
+            name="Sports Overreaction Fader",
+        )
+        news_strategy = SimpleNamespace(source_key="news", strategy_type="news_edge", name="News Edge")
+        monkeypatch.setattr(
+            strategy_loader,
+            "get_all_instances",
+            lambda: [scanner_strategy, sports_strategy, news_strategy],
+        )
+
+        types = {strategy.strategy_type for strategy in scanner._get_all_strategies()}
+
+        assert types == {"basic", "sports_overreaction_fader"}
+
     def test_polymarket_active_filter_requires_condition_and_clob_token(self):
         from services.scanner import ArbitrageScanner
 
@@ -198,6 +235,12 @@ class TestScannerInit:
         assert ArbitrageScanner._is_market_active(missing_tokens, now) is False
         assert ArbitrageScanner._is_market_active(empty_json_token_ids, now) is False
         assert ArbitrageScanner._is_market_active(orderbook_disabled, now) is False
+
+
+def test_scanner_worker_loads_and_refreshes_market_strategy_sources():
+    from workers import scanner_worker
+
+    assert scanner_worker._MARKET_REFRESH_STRATEGY_SOURCE_KEYS == ("scanner", "sports")
 
 
 # ---------------------------------------------------------------------------

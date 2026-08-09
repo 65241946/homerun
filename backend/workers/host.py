@@ -376,7 +376,7 @@ _PLANE_CONFIGS: dict[str, dict[str, Any]] = {
         ),
         "runtime_names": (),
         "load_strategy_registry": True,
-        "strategy_source_keys": ("scanner",),
+        "strategy_source_keys": ("scanner", "sports"),
         "load_data_source_registry": True,
         "start_event_bus": True,
         "start_event_dispatcher": True,

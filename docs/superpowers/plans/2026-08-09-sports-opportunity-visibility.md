@@ -72,7 +72,7 @@ from api import routes
         ({"category": "WNBA", "strategy": "stat_arb", "markets": []}, True),
         ({"category": None, "strategy": "sports_overreaction_fader", "markets": []}, True),
         ({"category": None, "strategy": "stat_arb", "markets": [{"sports_market_type": "moneyline"}]}, True),
-        ({"category": None, "strategy": "stat_arb", "markets": [{"game_start_time": "2026-08-10T01:00:00Z"}]}, True),
+        ({"category": "Weather", "strategy": "stat_arb", "markets": [{"game_start_time": "2026-08-10T01:00:00Z"}]}, False),
         ({"category": "Politics", "strategy": "stat_arb", "markets": [{}]}, False),
     ],
 )
@@ -124,10 +124,7 @@ def _payload_matches_category(payload: Mapping[str, Any], requested_category: st
         return False
     return any(
         isinstance(market, Mapping)
-        and (
-            bool(str(market.get("sports_market_type") or "").strip())
-            or bool(str(market.get("game_start_time") or "").strip())
-        )
+        and bool(str(market.get("sports_market_type") or "").strip())
         for market in markets
     )
 ```
@@ -326,7 +323,7 @@ $structuredSportsIdsBefore = @(
     $allBefore | Where-Object {
         $_.category -match '^(Sports|NBA|WNBA|NFL|MLB|NHL|ATP|WTA)$' -or
         $_.strategy -eq 'sports_overreaction_fader' -or
-        @($_.markets | Where-Object { $_.sports_market_type -or $_.game_start_time }).Count -gt 0
+        @($_.markets | Where-Object { $_.sports_market_type }).Count -gt 0
     } | ForEach-Object id
 )
 $sportsBefore = @(Invoke-RestMethod 'http://127.0.0.1:8000/api/opportunities?category=sports&limit=200')
