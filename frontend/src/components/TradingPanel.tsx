@@ -17,6 +17,7 @@ import {
   Loader2,
   PieChart,
   Play,
+  RefreshCw,
   Settings,
   ShieldAlert,
   Sparkles,
@@ -92,6 +93,10 @@ import type { TraderTuneAgentResponse } from '../services/apiIntelligence'
 import { discoveryApi } from '../services/discoveryApi'
 import { cn } from '../lib/utils'
 import { getTraderOrderPlatformLinks } from '../lib/marketUrls'
+import {
+  TRADING_ACTIVITY_REFRESH_MS,
+  refreshTradingActivitySnapshots,
+} from '../lib/tradingActivityRefresh'
 import { accountModeAtom, draftDescriptionAtom, draftIntervalAtom, draftNameAtom, draftRiskValuesAtom, draftTradingScheduleAtom, selectedAccountIdAtom, themeAtom } from '../store/atoms'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
@@ -5361,15 +5366,12 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
   const [terminalViewportHeight, setTerminalViewportHeight] = useState(0)
   // Firehose volume + viewing controls.  ``terminalVolume='off'`` is
   // the default so existing behaviour is preserved until the user
-  // dials the volume up.  ``terminalPaused`` freezes the rendered
-  // list while events keep streaming behind it; ``terminalSlowMode``
-  // drips queued events at one per second so the firehose is
-  // human-readable.  ``terminalMaxRows`` is user-configurable so
-  // WHISPER mode (which fills the default 220-row window in seconds)
-  // can keep more history visible.
+  // dials the volume up.  ``terminalPaused`` freezes only the rendered
+  // list; background collection and trading continue.  ``terminalMaxRows``
+  // remains user-configurable for bounded scrollback.
   const [terminalVolume, setTerminalVolume] = useState<TerminalVolume>('off')
   const [terminalPaused, setTerminalPaused] = useState(false)
-  const [terminalSlowMode, setTerminalSlowMode] = useState(false)
+  const [activityRefreshPending, setActivityRefreshPending] = useState(false)
   const [terminalMaxRows, setTerminalMaxRows] = useState(TERMINAL_SELECTED_MAX_ROWS_DEFAULT)
   const [tradeStatusFilter, setTradeStatusFilter] = useState<TradeStatusFilter>('all')
   const [tradeSearch, setTradeSearch] = useState('')
@@ -5691,9 +5693,11 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
   const allDecisionsQuery = useQuery({
     queryKey: ['trader-decisions-all', traderIdsKey],
     enabled: traderIds.length > 0,
-    refetchInterval: isConnected ? 30000 : 30000,
+    refetchInterval: TRADING_ACTIVITY_REFRESH_MS,
     staleTime: 0,
     refetchOnMount: 'always',
+    refetchOnWindowFocus: 'always',
+    refetchIntervalInBackground: false,
     queryFn: () => getAllTraderDecisions(traderIds, {
       limit: Math.min(5000, Math.max(200, traderIds.length * 160)),
       per_trader_limit: 160,
@@ -5703,7 +5707,10 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
   const allEventsQuery = useQuery({
     queryKey: ['trader-events-all', traderIdsKey],
     enabled: traderIds.length > 0,
-    refetchInterval: isConnected ? 30000 : 30000,
+    refetchInterval: TRADING_ACTIVITY_REFRESH_MS,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: 'always',
+    refetchIntervalInBackground: false,
     queryFn: () => getAllTraderEventsBulk(traderIds, { limit: 500 }),
   })
 
@@ -5718,9 +5725,33 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
   // live WS feed below (dedup by id).
   const firehoseHistoryQuery = useQuery({
     queryKey: ['trader-firehose-recent'],
-    refetchInterval: isConnected ? 60000 : 30000,
+    refetchInterval: TRADING_ACTIVITY_REFRESH_MS,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: 'always',
+    refetchIntervalInBackground: false,
     queryFn: () => getRecentFirehoseEvents({ limit: 500 }),
   })
+
+  const activityLastUpdatedAtMs = Math.max(
+    allDecisionsQuery.dataUpdatedAt,
+    allEventsQuery.dataUpdatedAt,
+    firehoseHistoryQuery.dataUpdatedAt,
+  )
+
+  const handleActivityRefresh = async () => {
+    if (activityRefreshPending) return
+    setActivityRefreshPending(true)
+    try {
+      await refreshTradingActivitySnapshots([
+        () => allDecisionsQuery.refetch(),
+        () => allEventsQuery.refetch(),
+        () => firehoseHistoryQuery.refetch(),
+        () => allOrdersQuery.refetch(),
+      ])
+    } finally {
+      setActivityRefreshPending(false)
+    }
+  }
 
   const allOrders = useMemo(
     () => (allOrdersQuery.data || []).filter((order) => {
@@ -8912,33 +8943,25 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
     })
   }, [selectedTraderActivityRows, traderFeedFilter, terminalVolume])
 
-  // Pause + slow-mode behaviour.  ``displayedActivityRows`` is what
-  // actually renders.  When paused, it stops updating from upstream;
-  // when slow-mode is on, new rows trickle in at one per second so a
-  // human can read the firehose.
+  // ``displayedActivityRows`` is the rendered snapshot.  Pausing freezes
+  // only this snapshot; upstream collection and the 30-second read-only
+  // queries continue unchanged.
   const [displayedActivityRows, setDisplayedActivityRows] = useState<ActivityRow[]>([])
-  const slowModeQueueRef = useRef<ActivityRow[]>([])
-  const slowModeTimerRef = useRef<number | null>(null)
   const seenIdsRef = useRef<Set<string>>(new Set())
 
-  // Reset displayed rows + slow-mode queue when the user changes
-  // trader, filter, density, or volume — those are deliberate
-  // reconfigurations, not stream updates.
+  // Reset displayed rows when the user changes trader, filter, density,
+  // volume, or the row cap — those are deliberate reconfigurations.
   useEffect(() => {
     setDisplayedActivityRows(filteredTraderActivityRows)
-    slowModeQueueRef.current = []
     seenIdsRef.current = new Set(filteredTraderActivityRows.map((r) => `${r.kind}:${r.id}`))
-    if (slowModeTimerRef.current != null) {
-      window.clearInterval(slowModeTimerRef.current)
-      slowModeTimerRef.current = null
-    }
     // Intentionally not depending on filteredTraderActivityRows itself
     // so stream-driven re-renders flow into the next effect below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTraderId, traderFeedFilter, terminalDensity, terminalVolume, terminalMaxRows])
 
-  // Stream new rows into the displayed list (or queue them in
-  // slow-mode / drop them when paused).
+  // Merge each upstream snapshot once; ordinary decision/event updates
+  // arrive through the 30-second queries, while orders and severe events
+  // can still arrive immediately.
   useEffect(() => {
     if (terminalPaused) return
     const fresh: ActivityRow[] = []
@@ -8964,56 +8987,22 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
       // dependency above, so we don't need an auto-shrink fallback.
       return
     }
-    if (terminalSlowMode) {
-      // Push to queue; timer below drains one per second.
-      slowModeQueueRef.current.push(...fresh)
-      if (slowModeTimerRef.current == null) {
-        slowModeTimerRef.current = window.setInterval(() => {
-          const next = slowModeQueueRef.current.shift()
-          if (next == null) {
-            if (slowModeTimerRef.current != null) {
-              window.clearInterval(slowModeTimerRef.current)
-              slowModeTimerRef.current = null
-            }
-            return
-          }
-          setDisplayedActivityRows((prev) => [next, ...prev].slice(0, terminalMaxRows))
-        }, 1000)
-      }
-    } else {
-      setDisplayedActivityRows((prev) => {
-        // ``fresh`` is the set of rows missing from prev; merge and
-        // re-sort by ts so out-of-order arrivals (rare, but possible
-        // with WS + cache invalidation) settle correctly.
-        const merged = [...fresh, ...prev]
-        merged.sort((a, b) => toTs(b.ts) - toTs(a.ts))
-        return merged.slice(0, terminalMaxRows)
-      })
-    }
-  }, [filteredTraderActivityRows, terminalPaused, terminalSlowMode, terminalMaxRows, displayedActivityRows.length])
+    setDisplayedActivityRows((previous) => {
+      const merged = [...fresh, ...previous]
+      merged.sort((left, right) => toTs(right.ts) - toTs(left.ts))
+      return merged.slice(0, terminalMaxRows)
+    })
+  }, [filteredTraderActivityRows, terminalPaused, terminalMaxRows])
 
   // When the user un-pauses, drop straight to the latest filtered
   // snapshot.  This avoids replaying a giant backlog at once.
   useEffect(() => {
     if (!terminalPaused) {
       setDisplayedActivityRows(filteredTraderActivityRows)
-      slowModeQueueRef.current = []
       seenIdsRef.current = new Set(filteredTraderActivityRows.map((r) => `${r.kind}:${r.id}`))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terminalPaused])
-
-  // Cleanup the slow-mode timer on unmount.
-  useEffect(() => {
-    return () => {
-      if (slowModeTimerRef.current != null) {
-        window.clearInterval(slowModeTimerRef.current)
-        slowModeTimerRef.current = null
-      }
-    }
-  }, [])
-
-  const slowModePending = slowModeQueueRef.current.length
 
   useEffect(() => {
     setTerminalScrollTop(0)
@@ -10593,10 +10582,13 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
                           <div className="px-2.5 py-2 border-b border-border/40 flex items-center justify-between gap-2 shrink-0">
                             <div className="flex items-center gap-1.5">
                               <Clock3 className="w-3.5 h-3.5 text-cyan-500" />
-                              <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{t('tradingPanel.allBots.livePulseFeed')}</span>
+                              <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{t('tradingPanel.allBots.recentActivity30s')}</span>
                             </div>
                             <span className="text-[10px] font-mono text-muted-foreground">
                               {terminalPaused ? `${t('tradingPanel.terminal.paused')} · ` : ''}{t('tradingPanel.terminal.eventsCount', { count: displayedActivityRows.length })}
+                              {activityLastUpdatedAtMs > 0
+                                ? ` · ${t('tradingPanel.terminal.lastUiRefresh', { time: new Date(activityLastUpdatedAtMs).toLocaleTimeString() })}`
+                                : ''}
                             </span>
                           </div>
                           {/* Same control surface as the per-trader Terminal tab.
@@ -10631,19 +10623,21 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
                               size="sm"
                               variant={terminalPaused ? 'default' : 'outline'}
                               onClick={() => setTerminalPaused((v) => !v)}
-                              title={terminalPaused ? t('tradingPanel.terminal.resumeStreaming') : t('tradingPanel.terminal.pauseIncoming')}
+                              title={terminalPaused ? t('tradingPanel.terminal.resumeUiUpdates') : t('tradingPanel.terminal.pauseUiUpdates')}
                               className="h-5 px-1.5 text-[10px] ml-1 shrink-0"
                             >
                               {terminalPaused ? '▶' : '⏸'}
                             </Button>
                             <Button
                               size="sm"
-                              variant={terminalSlowMode ? 'default' : 'outline'}
-                              onClick={() => setTerminalSlowMode((v) => !v)}
-                              title={t('tradingPanel.terminal.slowModeTooltip')}
+                              variant="outline"
+                              onClick={() => void handleActivityRefresh()}
+                              disabled={activityRefreshPending}
+                              title={t('tradingPanel.terminal.refreshUi')}
                               className="h-5 px-1.5 text-[10px] shrink-0"
                             >
-                              🐢{terminalSlowMode && slowModePending > 0 ? ` ${slowModePending}` : ''}
+                              <RefreshCw className={cn('mr-1 h-3 w-3', activityRefreshPending && 'animate-spin')} />
+                              {t('common.refresh')}
                             </Button>
                             <select
                               value={terminalMaxRows}
@@ -10661,10 +10655,8 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
                               {displayedActivityRows.length === 0 ? (
                                 <p className="py-10 text-center text-muted-foreground text-xs">
                                   {terminalPaused
-                                    ? t('tradingPanel.terminal.pausedHint')
-                                    : terminalSlowMode && slowModePending > 0
-                                      ? t('tradingPanel.terminal.slowModeQueued', { count: slowModePending })
-                                      : t('tradingPanel.terminal.noActivity')}
+                                    ? t('tradingPanel.terminal.pausedUiHint')
+                                    : t('tradingPanel.terminal.noActivity')}
                                 </p>
                               ) : terminalDensity === 'compact' ? (
                                 displayedActivityRows.map((row) => (
@@ -11497,19 +11489,21 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
                           size="sm"
                           variant={terminalPaused ? 'default' : 'outline'}
                           onClick={() => setTerminalPaused((v) => !v)}
-                          title={terminalPaused ? t('tradingPanel.terminal.resumeStreaming') : t('tradingPanel.terminal.pauseIncoming')}
+                          title={terminalPaused ? t('tradingPanel.terminal.resumeUiUpdates') : t('tradingPanel.terminal.pauseUiUpdates')}
                           className="h-5 px-2 text-[10px]"
                         >
                           {terminalPaused ? `▶ ${t('tradingPanel.terminal.resume')}` : `⏸ ${t('tradingPanel.terminal.pause')}`}
                         </Button>
                         <Button
                           size="sm"
-                          variant={terminalSlowMode ? 'default' : 'outline'}
-                          onClick={() => setTerminalSlowMode((v) => !v)}
-                          title={t('tradingPanel.terminal.slowModeTooltip')}
+                          variant="outline"
+                          onClick={() => void handleActivityRefresh()}
+                          disabled={activityRefreshPending}
+                          title={t('tradingPanel.terminal.refreshUi')}
                           className="h-5 px-2 text-[10px]"
                         >
-                          🐢 {t('tradingPanel.terminal.slow')}{terminalSlowMode && slowModePending > 0 ? ` (${slowModePending})` : ''}
+                          <RefreshCw className={cn('mr-1 h-3 w-3', activityRefreshPending && 'animate-spin')} />
+                          {t('common.refresh')}
                         </Button>
                       </div>
                       <div className="ml-1 inline-flex items-center gap-1">
@@ -11549,10 +11543,8 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
                       {displayedActivityRows.length === 0 ? (
                         <div className="py-8 text-center text-muted-foreground text-xs">
                           {terminalPaused
-                            ? t('tradingPanel.terminal.pausedHint')
-                            : terminalSlowMode && slowModePending > 0
-                              ? t('tradingPanel.terminal.slowModeQueued', { count: slowModePending })
-                              : t('tradingPanel.terminal.noEvents')}
+                            ? t('tradingPanel.terminal.pausedUiHint')
+                            : t('tradingPanel.terminal.noEvents')}
                         </div>
                       ) : terminalDensity === 'compact' ? (
                         <div className="p-1.5 font-mono text-[11px]">
