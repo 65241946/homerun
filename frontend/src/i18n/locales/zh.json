@@ -13,7 +13,7 @@
   },
   "opportunitiesTab": {
     "markets": "市场",
-    "traders": "交易员",
+    "traders": "钱包共识信号",
     "news": "新闻",
     "weather": "天气",
     "crypto": "加密货币",
@@ -3801,13 +3801,13 @@
     "header": {
       "title": {
         "traders": "交易者",
-        "opportunities": "交易者机会",
+        "opportunities": "钱包共识信号",
         "groups": "交易者分组",
         "management": "交易者管理"
       },
       "subtitle": {
         "traders": "已跟踪交易者、交易者分组,以及来自高质量发现钱包的发现合流",
-        "opportunities": "策略筛选后的交易者实时合流,来源包括跟踪钱包、分组与池成员",
+        "opportunities": "策略筛选后的钱包共识信号，来源包括已跟踪钱包、钱包分组与聪明钱包池",
         "groups": "创建、跟踪并管理发现交易者分组",
         "management": "已跟踪交易者列表、分组管理与监控控制"
       }
@@ -3838,12 +3838,12 @@
       "noGroups": "尚未创建任何分组。",
       "noSuggestions": "暂无可用建议。",
       "noActivity": "在所选交易窗口中未发现已跟踪钱包活动。",
-      "noScannedSignals": "未找到扫描的交易者信号",
-      "noExecutableSignals": "未找到可执行的交易者信号",
+      "noScannedSignals": "未找到扫描的钱包共识信号",
+      "noExecutableSignals": "未找到可执行的钱包共识信号",
       "noScopeMatch": "没有信号匹配当前来源范围 ({{labels}})。",
-      "noConfluence": "目前没有可用的池合流或跟踪/分组个人交易信号",
+      "noConfluence": "目前没有可用的钱包共识信号",
       "filteredFromExec": "{{n}} 条扫描的信号目前已从执行中过滤",
-      "noQualified": "目前没有符合策略条件的交易者机会"
+      "noQualified": "目前没有符合策略条件的钱包共识信号"
     },
     "action": {
       "track": "跟踪",
@@ -5315,16 +5315,16 @@
     "buyAmount": "买入 {{amount}}"
   },
   "traderOpportunitiesSettingsFlyout": {
-    "title": "交易者信号显示",
+    "title": "钱包共识信号显示",
     "save": "保存",
     "saving": "正在保存...",
     "close": "关闭",
-    "intro": "交易者机会完全由策略管理。Firehose 资格筛选器在下方的 Traders Confluence 策略配置中定义。自动交易者和跟单设置在 Auto Trader 浮窗中配置。",
+    "intro": "钱包共识信号完全由策略管理。信号资格筛选器在下方的 Traders Confluence 策略配置中定义。自动机器人和逐笔跟单设置在 Auto Trader 浮窗中配置。",
     "displayLimits": "显示限制",
-    "confluenceFetchLimit": "汇合获取限制",
+    "confluenceFetchLimit": "共识信号获取上限",
     "range1to200": "1-200",
-    "firehoseFilteringOwnership": "Firehose 筛选所有权",
-    "firehoseDescription": "交易者 firehose 的包含/排除门控（可交易性、加密排除、来源资格、时间窗口）由下方的 <strategy>Traders Confluence 策略配置</strategy>控制。",
+    "firehoseFilteringOwnership": "钱包信号筛选规则",
+    "firehoseDescription": "钱包共识信号的包含/排除条件（可交易性、加密排除、来源资格、时间窗口）由下方的 <strategy>Traders Confluence 策略配置</strategy> 控制。",
     "strategyCode": "策略代码",
     "strategyCodeDescription": "编辑 Traders Confluence 检测器源代码",
     "editStrategyCode": "编辑策略代码"
