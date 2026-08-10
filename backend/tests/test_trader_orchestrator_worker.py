@@ -478,6 +478,7 @@ async def test_submit_order_executes_without_forcing_decision_persistence():
     async def _fake_execute_signal(**kwargs):
         call_order.append("execute")
         assert kwargs["decision_id"] == "decision-1"
+        assert kwargs["execution_timeout_seconds"] == pytest.approx(7.25)
         return {"status": "ok"}
 
     session_engine = SimpleNamespace(execute_signal=_fake_execute_signal)
@@ -493,6 +494,7 @@ async def test_submit_order_executes_without_forcing_decision_persistence():
         mode="shadow",
         size_usd=25.0,
         reason="selected",
+        execution_timeout_seconds=7.25,
     )
 
     assert result == {"status": "ok"}
@@ -3698,7 +3700,8 @@ async def test_run_trader_once_blocks_stacking_when_allow_averaging_false(monkey
 
 
 @pytest.mark.asyncio
-async def test_run_trader_once_claims_live_signal_before_submit(monkeypatch):
+@pytest.mark.parametrize("mode", ["live", "shadow"])
+async def test_run_trader_once_claims_signal_before_submit_and_passes_mode_budget(monkeypatch, mode):
     signal = _base_signal()
     call_log: list[str] = []
     list_calls = {"count": 0}
@@ -3715,13 +3718,18 @@ async def test_run_trader_once_claims_live_signal_before_submit(monkeypatch):
 
     async def _submit_order(**kwargs):
         assert kwargs["signal"].id == "signal-1"
-        assert "status:selected" in call_log
-        assert "consumption:claiming" in call_log
-        assert "cursor:signal-1" in call_log
+        if mode == "shadow":
+            assert 0.0 < float(kwargs["execution_timeout_seconds"]) <= 8.0
+        else:
+            assert kwargs["execution_timeout_seconds"] is None
+            assert "status:selected" in call_log
+            assert "consumption:claiming" in call_log
+            assert "cursor:signal-1" in call_log
         assert "commit" in call_log
-        assert call_log.index("status:selected") < call_log.index("submit")
-        assert call_log.index("consumption:claiming") < call_log.index("submit")
-        assert call_log.index("cursor:signal-1") < call_log.index("submit")
+        if mode == "live":
+            assert call_log.index("status:selected") < call_log.index("submit")
+            assert call_log.index("consumption:claiming") < call_log.index("submit")
+            assert call_log.index("cursor:signal-1") < call_log.index("submit")
         assert call_log.index("commit") < call_log.index("submit")
         return SimpleNamespace(
             session_id="session-1",
@@ -3880,16 +3888,20 @@ async def test_run_trader_once_claims_live_signal_before_submit(monkeypatch):
 
     monkeypatch.setattr(trader_orchestrator_worker, "submit_order", _submit_wrapper)
 
+    control = _base_control_payload()
+    control["mode"] = mode
     decisions_written, orders_written, processed_signals = await trader_orchestrator_worker._run_trader_once(
         _base_trader_payload(allow_averaging=True),
-        _base_control_payload(),
+        control,
+        cycle_timeout_seconds=10.0,
     )
 
     assert decisions_written == 1
     assert orders_written == 1
     assert processed_signals == 1
-    assert call_log.count("status:selected") == 1
-    assert "consumption:claiming" in call_log
+    if mode == "live":
+        assert call_log.count("status:selected") == 1
+        assert "consumption:claiming" in call_log
     assert "submit" in call_log
     submit_index = call_log.index("submit")
     commit_indexes = [index for index, value in enumerate(call_log) if value == "commit"]

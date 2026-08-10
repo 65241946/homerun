@@ -93,6 +93,12 @@ _PROVIDER_SNAPSHOT_TIMEOUT_SECONDS = 5.0
 _PROVIDER_CANCEL_TIMEOUT_SECONDS = 5.0
 
 
+class _ShadowExecutionDeadlineExceeded(TimeoutError):
+    def __init__(self, *, stage: str) -> None:
+        self.stage = str(stage)
+        super().__init__(f"Shadow execution deadline exceeded during {self.stage}.")
+
+
 def _iso_utc(value: datetime) -> str:
     dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -771,9 +777,23 @@ class ExecutionSessionEngine:
         size_usd: float,
         reason: str | None,
         explicit_strategy_params: dict[str, Any] | None = None,
+        execution_timeout_seconds: float | None = None,
     ) -> SessionExecutionResult:
         _execution_started_at = _time.monotonic()
         _execution_timing_ms: dict[str, float] = {}
+        _shadow_execution_timeout_seconds = None
+        _shadow_execution_deadline_mono = None
+        if str(mode or "").strip().lower() == "shadow":
+            parsed_execution_timeout = safe_float(
+                execution_timeout_seconds,
+                None,
+                reject_nan_inf=True,
+            )
+            if parsed_execution_timeout is not None:
+                _shadow_execution_timeout_seconds = max(0.001, float(parsed_execution_timeout))
+                _shadow_execution_deadline_mono = (
+                    _execution_started_at + _shadow_execution_timeout_seconds
+                )
 
         def _record_execution_timing(stage: str, started_at: float) -> None:
             elapsed_ms = max(0.0, (_time.monotonic() - started_at) * 1000.0)
@@ -844,6 +864,7 @@ class ExecutionSessionEngine:
         skip_reasons: list[str] = []
         bundle_recovery_outcome: dict[str, Any] | None = None
         entry_submit_placeholders: dict[str, tuple[TraderOrder, ExecutionSessionOrder]] = {}
+        shadow_intent_persisted = False
         _record_execution_timing("session_build", _session_build_started_at)
 
         def _append_event(
@@ -1064,6 +1085,22 @@ class ExecutionSessionEngine:
                 "direction": leg_direction,
                 "entry_price": leg_entry_price,
             }
+
+        async def _await_cancellation_safe(operation):
+            """Finish a DB-owned operation before propagating cancellation.
+
+            ``asyncio.shield`` alone returns to the cancelled caller while the
+            inner task keeps using ``self.db``.  The per-submit AsyncSession
+            may then close underneath that task.  Keep an explicit task and
+            join it before re-raising the original cancellation instead.
+            """
+
+            operation_task = asyncio.create_task(operation)
+            try:
+                return await asyncio.shield(operation_task)
+            except asyncio.CancelledError:
+                await asyncio.shield(operation_task)
+                raise
 
         async def _commit_pre_submit_projection() -> None:
             _started_at = _time.monotonic()
@@ -1560,8 +1597,10 @@ class ExecutionSessionEngine:
                 signal_status=signal_status,
                 effective_price=effective_price,
             )
-            if mode == "live" and entry_submit_placeholders:
-                await asyncio.shield(persist)
+            if (mode == "live" and entry_submit_placeholders) or (
+                mode == "shadow" and shadow_intent_persisted
+            ):
+                await _await_cancellation_safe(persist)
                 return
             await persist
 
@@ -1643,6 +1682,157 @@ class ExecutionSessionEngine:
             )
             await _persist_execution_projection_safely(signal_status="failed", effective_price=None)
 
+        async def _finalize_shadow_interruption(
+            *,
+            kind: str,
+            stage: str,
+            error_message: str,
+        ) -> None:
+            nonlocal completed_legs, failed_legs, open_legs, orders_written, skipped_legs
+            if mode != "shadow" or not shadow_intent_persisted:
+                return
+
+            existing_interruption = dict(session_row.payload_json or {}).get(
+                "execution_interruption"
+            )
+            if isinstance(existing_interruption, dict) and str(session_row.status or "") == "failed":
+                return
+
+            # Shadow venue submission has no durable economic effect at this
+            # point.  Discard every in-memory order/fill projection so a
+            # partial result from an earlier wave cannot be reported as an
+            # executed simulated order after interruption.
+            trader_orders.clear()
+            execution_orders.clear()
+            order_write_inputs.clear()
+            recovery_order_write_inputs.clear()
+            created_order_records.clear()
+            leg_execution_records.clear()
+            orders_written = 0
+            completed_legs = 0
+            open_legs = 0
+            skipped_legs = 0
+            failed_legs = len(leg_rows)
+
+            for leg_row in leg_rows.values():
+                _update_leg_row(
+                    leg_row=leg_row,
+                    status="failed",
+                    filled_notional_usd=0.0,
+                    filled_shares=0.0,
+                    last_error=error_message,
+                    metadata_patch={
+                        "execution_interrupted": True,
+                        "interruption_kind": str(kind),
+                        "interruption_stage": str(stage),
+                    },
+                )
+                leg_row.avg_fill_price = None
+
+            interruption = {
+                "kind": str(kind),
+                "stage": str(stage),
+                "decision_id": str(decision_id or "") or None,
+                "signal_id": str(getattr(signal, "id", "") or "") or None,
+                "elapsed_ms": round(
+                    max(0.0, (_time.monotonic() - _execution_started_at) * 1000.0),
+                    3,
+                ),
+                "timeout_seconds": _shadow_execution_timeout_seconds,
+                "orders_written": 0,
+            }
+            _update_session_status(
+                status="failed",
+                error_message=error_message,
+                payload_patch={
+                    "orders_written": 0,
+                    "execution_interruption": interruption,
+                },
+            )
+            _append_event(
+                event_type="session_failed",
+                severity="error",
+                message=error_message,
+                payload={"execution_interruption": interruption},
+            )
+            await _persist_execution_projection_safely(
+                signal_status="failed",
+                effective_price=None,
+            )
+            logger.warning(
+                "shadow execution interrupted",
+                session_id=str(session_row.id or ""),
+                trader_id=str(trader_id or ""),
+                decision_id=str(decision_id or ""),
+                signal_id=str(getattr(signal, "id", "") or ""),
+                interruption_kind=str(kind),
+                interruption_stage=str(stage),
+                elapsed_ms=interruption["elapsed_ms"],
+                timeout_seconds=_shadow_execution_timeout_seconds,
+            )
+
+        async def _await_external_stage(*, stage: str, operation):
+            if _shadow_execution_deadline_mono is None:
+                return await operation()
+            remaining_seconds = _shadow_execution_deadline_mono - _time.monotonic()
+            if remaining_seconds <= 0.0:
+                raise _ShadowExecutionDeadlineExceeded(stage=stage)
+
+            operation_task = asyncio.create_task(operation())
+            try:
+                completed, _ = await asyncio.wait(
+                    {operation_task},
+                    timeout=remaining_seconds,
+                )
+            except asyncio.CancelledError:
+                operation_task.cancel()
+                try:
+                    await operation_task
+                except asyncio.CancelledError:
+                    pass
+                raise
+            if completed:
+                # Preserve an operation-owned TimeoutError (for example a
+                # provider socket timeout).  It is not evidence that the
+                # outer cycle deadline elapsed and must not be relabelled.
+                return operation_task.result()
+
+            operation_task.cancel()
+            try:
+                await operation_task
+            except asyncio.CancelledError:
+                pass
+            raise _ShadowExecutionDeadlineExceeded(stage=stage)
+
+        async def _shadow_deadline_result(
+            deadline_error: _ShadowExecutionDeadlineExceeded,
+        ) -> SessionExecutionResult:
+            error_message = str(deadline_error)
+            await _finalize_shadow_interruption(
+                kind="deadline_exceeded",
+                stage=deadline_error.stage,
+                error_message=error_message,
+            )
+            interruption = dict(session_row.payload_json or {}).get(
+                "execution_interruption"
+            )
+            interruption = interruption if isinstance(interruption, dict) else {}
+            return SessionExecutionResult(
+                session_id=session_row.id,
+                status="failed",
+                effective_price=None,
+                error_message=error_message,
+                orders_written=0,
+                payload=_payload_with_execution_timing(
+                    {
+                        "execution_plan": plan,
+                        "legs": [],
+                        "execution_interruption": interruption,
+                    }
+                ),
+                created_orders=[],
+            )
+
         async def _submit_execution_wave_with_cancellation_protection(
             *,
             legs_with_notionals: list[tuple[dict[str, Any], float]],
@@ -1651,18 +1841,30 @@ class ExecutionSessionEngine:
             _started_at = _time.monotonic()
             try:
                 async with release_conn(self.db):
-                    return await submit_execution_wave(
-                        mode=mode,
-                        signal=signal,
-                        legs_with_notionals=legs_with_notionals,
-                        strategy_params=strategy_params,
-                        risk_limits=risk_limits,
-                        trader_id=trader_id,
+                    return await _await_external_stage(
+                        stage="venue_submit_wave",
+                        operation=lambda: submit_execution_wave(
+                            mode=mode,
+                            signal=signal,
+                            legs_with_notionals=legs_with_notionals,
+                            strategy_params=strategy_params,
+                            risk_limits=risk_limits,
+                            trader_id=trader_id,
+                        ),
                     )
             except asyncio.CancelledError:
-                await asyncio.shield(
-                    _finalize_cancelled_live_submit(error_message=wave_error_message)
-                )
+                if mode == "shadow":
+                    await _await_cancellation_safe(
+                        _finalize_shadow_interruption(
+                            kind="cancelled",
+                            stage="venue_submit_wave",
+                            error_message="Shadow execution cancelled during venue_submit_wave.",
+                        )
+                    )
+                else:
+                    await _await_cancellation_safe(
+                        _finalize_cancelled_live_submit(error_message=wave_error_message)
+                    )
                 raise
             finally:
                 _record_execution_timing("venue_submit_wave", _started_at)
@@ -1786,6 +1988,24 @@ class ExecutionSessionEngine:
             params=dict(explicit_strategy_params or {}),
         )
 
+        if mode == "shadow":
+            try:
+                await _await_cancellation_safe(_commit_pre_submit_projection())
+            except asyncio.CancelledError:
+                # The cancellation-safe helper only re-raises after the
+                # intent commit has finished, so this session is now safe to
+                # terminalize with the same AsyncSession.
+                shadow_intent_persisted = True
+                await _await_cancellation_safe(
+                    _finalize_shadow_interruption(
+                        kind="cancelled",
+                        stage="intent_commit",
+                        error_message="Shadow execution cancelled during intent_commit.",
+                    )
+                )
+                raise
+            shadow_intent_persisted = True
+
         # Stamp a deterministic CLOB idempotency key onto every live leg
         # before either the pre-submit row write or the venue submission.
         # The key is derived from (trader_id, signal_id, leg_id) so:
@@ -1824,10 +2044,26 @@ class ExecutionSessionEngine:
             # ``_commit_pre_submit_projection`` cost for nothing.  Existing
             # in-line gates inside ``submit_leg`` remain the authoritative
             # post-DB backstop.
-            preflight_results = await pre_db_venue_preflight(
-                legs_with_notionals=wave_with_notionals,
-                strategy=strategy_instance,
-            )
+            try:
+                preflight_results = await _await_external_stage(
+                    stage="venue_preflight",
+                    operation=lambda current_wave=wave_with_notionals: pre_db_venue_preflight(
+                        legs_with_notionals=current_wave,
+                        strategy=strategy_instance,
+                    ),
+                )
+            except _ShadowExecutionDeadlineExceeded as deadline_error:
+                return await _shadow_deadline_result(deadline_error)
+            except asyncio.CancelledError:
+                if mode == "shadow":
+                    await _await_cancellation_safe(
+                        _finalize_shadow_interruption(
+                            kind="cancelled",
+                            stage="venue_preflight",
+                            error_message="Shadow execution cancelled during venue_preflight.",
+                        )
+                    )
+                raise
             preflight_pre_rejected_results: list[LegSubmitResult] = []
             submittable_legs_with_notionals: list[tuple[dict[str, Any], float]] = []
             for leg_payload, leg_notional in wave_with_notionals:
@@ -1889,10 +2125,13 @@ class ExecutionSessionEngine:
                 if created_pre_submit_placeholders:
                     await _commit_pre_submit_projection()
             if submittable_legs_with_notionals:
-                wave_results = await _submit_execution_wave_with_cancellation_protection(
-                    legs_with_notionals=submittable_legs_with_notionals,
-                    wave_error_message="Execution session cancelled during live order submission.",
-                )
+                try:
+                    wave_results = await _submit_execution_wave_with_cancellation_protection(
+                        legs_with_notionals=submittable_legs_with_notionals,
+                        wave_error_message="Execution session cancelled during live order submission.",
+                    )
+                except _ShadowExecutionDeadlineExceeded as deadline_error:
+                    return await _shadow_deadline_result(deadline_error)
             else:
                 wave_results = []
 
@@ -1963,14 +2202,16 @@ class ExecutionSessionEngine:
                             except Exception:
                                 pass
                         leg_payload["limit_price"] = reprice_price
-                        retry_result = (
-                            await _submit_execution_wave_with_cancellation_protection(
+                        try:
+                            retry_results = await _submit_execution_wave_with_cancellation_protection(
                                 legs_with_notionals=[
                                     (leg_payload, safe_float(leg_payload.get("requested_notional_usd"), 0.0))
                                 ],
                                 wave_error_message="Execution session cancelled during live order repricing.",
                             )
-                        )[0]
+                        except _ShadowExecutionDeadlineExceeded as deadline_error:
+                            return await _shadow_deadline_result(deadline_error)
+                        retry_result = retry_results[0]
                         # Surface the retry wave's breakdown too.
                         _retry_payload = getattr(retry_result, "payload", None)
                         if isinstance(_retry_payload, dict):
@@ -2388,13 +2629,16 @@ class ExecutionSessionEngine:
 
             rescue_results: list[Any] = []
             if rescue_inputs:
-                rescue_results = await _submit_execution_wave_with_cancellation_protection(
-                    legs_with_notionals=[
-                        (leg_payload, rescue_notional)
-                        for leg_payload, rescue_notional, _, _, _ in rescue_inputs
-                    ],
-                    wave_error_message="Execution session cancelled during bundle rescue submission.",
-                )
+                try:
+                    rescue_results = await _submit_execution_wave_with_cancellation_protection(
+                        legs_with_notionals=[
+                            (leg_payload, rescue_notional)
+                            for leg_payload, rescue_notional, _, _, _ in rescue_inputs
+                        ],
+                        wave_error_message="Execution session cancelled during bundle rescue submission.",
+                    )
+                except _ShadowExecutionDeadlineExceeded as deadline_error:
+                    return await _shadow_deadline_result(deadline_error)
                 # Surface rescue wave breakdowns too.
                 for _rescue_result in rescue_results:
                     _rescue_payload = getattr(_rescue_result, "payload", None)

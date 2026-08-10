@@ -6,14 +6,28 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import func, select, text
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from services.trader_orchestrator import session_engine as session_engine_module
+from models.database import (
+    Base,
+    ExecutionSession,
+    ExecutionSessionEvent,
+    ExecutionSessionLeg,
+    ExecutionSessionOrder,
+    SimulationAccount,
+    Trader,
+    TraderDecision,
+    TraderOrder,
+)
 from services import intent_runtime as intent_runtime_module
+from services.trader_orchestrator import session_engine as session_engine_module
 from utils.utcnow import utcnow
+
+from tests.postgres_test_db import build_postgres_session_factory
 
 
 def _leg_result(
@@ -994,6 +1008,723 @@ async def test_execute_signal_finalizes_pre_submit_placeholder_when_live_submit_
     assert str(trader_rows[-1].status or "") == "failed"
     assert dict(trader_rows[-1].payload_json or {}).get("submission_intent", {}).get("state") == "submit_cancelled"
     assert str(execution_rows[-1].status or "") == "failed"
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_shadow_cancel_persists_failed_intent_without_orders(monkeypatch):
+    db = _FailureProjectionDb()
+    engine = session_engine_module.ExecutionSessionEngine(db)
+
+    plan = {"policy": "SINGLE_LEG", "plan_id": "plan-shadow-cancel"}
+    legs = [
+        {
+            "leg_id": "leg-shadow-cancel-1",
+            "market_id": "market-shadow-cancel-1",
+            "market_question": "Will a cancelled Shadow attempt remain auditable?",
+            "token_id": "token-shadow-cancel-1",
+            "side": "buy",
+            "outcome": "yes",
+            "requested_notional_usd": 9.0,
+            "requested_shares": 18.0,
+            "limit_price": 0.5,
+            "price_policy": "taker_limit",
+            "time_in_force": "IOC",
+            "post_only": False,
+        }
+    ]
+    constraints = {"max_unhedged_notional_usd": 0.0, "hedge_timeout_seconds": 20}
+    monkeypatch.setattr(engine, "_build_plan", lambda *args, **kwargs: (plan, legs, constraints))
+    monkeypatch.setattr(session_engine_module, "supports_reprice", lambda _policy: False)
+    monkeypatch.setattr(session_engine_module, "execution_waves", lambda _policy, leg_rows: [leg_rows])
+    monkeypatch.setattr(session_engine_module, "requires_pair_lock", lambda _policy, _constraints: False)
+    monkeypatch.setattr(session_engine_module, "set_trade_signal_status", AsyncMock(return_value=True))
+    monkeypatch.setattr(session_engine_module, "sync_trader_position_inventory", AsyncMock(return_value={}))
+    monkeypatch.setattr(session_engine_module.event_bus, "publish", AsyncMock(return_value=None))
+    monkeypatch.setattr(engine, "_publish_hot_signal_status", AsyncMock(return_value=None))
+    submit_started = asyncio.Event()
+    state_at_submit: dict[str, object] = {}
+
+    async def _submit_wave(**kwargs):
+        del kwargs
+        session_rows = db.persisted_rows_by_type.get("ExecutionSession") or []
+        leg_rows = db.persisted_rows_by_type.get("ExecutionSessionLeg") or []
+        state_at_submit.update(
+            {
+                "session_count": len(session_rows),
+                "leg_count": len(leg_rows),
+                "session_status": str(session_rows[-1].status or "") if session_rows else None,
+                "commit_calls": db.commit_calls,
+                "trader_order_count": len(db.persisted_rows_by_type.get("TraderOrder") or []),
+                "execution_order_count": len(
+                    db.persisted_rows_by_type.get("ExecutionSessionOrder") or []
+                ),
+            }
+        )
+        submit_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(session_engine_module, "submit_execution_wave", AsyncMock(side_effect=_submit_wave))
+
+    signal = SimpleNamespace(
+        id="signal-shadow-cancel",
+        source="traders",
+        trace_id="trace-shadow-cancel",
+        strategy_type="traders_confluence",
+        strategy_context_json={},
+        payload_json={},
+        market_id="market-shadow-cancel-1",
+        market_question="Will a cancelled Shadow attempt remain auditable?",
+        direction="buy_yes",
+        entry_price=0.5,
+        edge_percent=3.0,
+        confidence=0.8,
+    )
+    task = asyncio.create_task(
+        engine.execute_signal(
+            trader_id="trader-shadow-cancel",
+            signal=signal,
+            decision_id="decision-shadow-cancel",
+            strategy_key="traders_confluence",
+            strategy_version=None,
+            strategy_params={},
+            risk_limits={},
+            mode="shadow",
+            size_usd=9.0,
+            reason="Wallet consensus selected",
+        )
+    )
+
+    await asyncio.wait_for(submit_started.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert state_at_submit == {
+        "session_count": 1,
+        "leg_count": 1,
+        "session_status": "placing",
+        "commit_calls": 1,
+        "trader_order_count": 0,
+        "execution_order_count": 0,
+    }
+
+    session_rows = db.persisted_rows_by_type.get("ExecutionSession") or []
+    leg_rows = db.persisted_rows_by_type.get("ExecutionSessionLeg") or []
+    trader_rows = db.persisted_rows_by_type.get("TraderOrder") or []
+    execution_rows = db.persisted_rows_by_type.get("ExecutionSessionOrder") or []
+    event_rows = db.persisted_rows_by_type.get("ExecutionSessionEvent") or []
+
+    assert len(session_rows) == 1
+    assert str(session_rows[-1].status or "") == "failed"
+    interruption = dict(session_rows[-1].payload_json or {}).get("execution_interruption") or {}
+    assert interruption["kind"] == "cancelled"
+    assert interruption["stage"] == "venue_submit_wave"
+    assert interruption["decision_id"] == "decision-shadow-cancel"
+    assert interruption["signal_id"] == "signal-shadow-cancel"
+    assert float(interruption["elapsed_ms"]) >= 0.0
+    assert len(leg_rows) == 1
+    assert str(leg_rows[-1].status or "") == "failed"
+    assert float(leg_rows[-1].filled_notional_usd or 0.0) == 0.0
+    assert float(leg_rows[-1].filled_shares or 0.0) == 0.0
+    assert trader_rows == []
+    assert execution_rows == []
+    failed_events = [row for row in event_rows if str(row.event_type or "") == "session_failed"]
+    assert len(failed_events) == 1
+    assert dict(failed_events[0].payload_json or {}).get("execution_interruption") == interruption
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_shadow_cancel_is_durable_in_isolated_postgres(monkeypatch):
+    managed_engine, session_factory = await build_postgres_session_factory(
+        Base,
+        "shadow_timeout_durability",
+    )
+    try:
+        trader_id = "trader-shadow-cancel-postgres"
+        decision_id = "decision-shadow-cancel-postgres"
+        signal_id = "signal-shadow-cancel-postgres"
+        async with session_factory() as setup_db:
+            setup_db.add(
+                Trader(
+                    id=trader_id,
+                    name="Shadow Timeout PostgreSQL Isolation",
+                    mode="shadow",
+                    is_enabled=True,
+                )
+            )
+            setup_db.add(
+                TraderDecision(
+                    id=decision_id,
+                    trader_id=trader_id,
+                    signal_id=signal_id,
+                    source="traders",
+                    strategy_key="traders_confluence",
+                    decision="selected",
+                )
+            )
+            await setup_db.commit()
+
+        plan = {"policy": "SINGLE_LEG", "plan_id": "plan-shadow-cancel-postgres"}
+        legs = [
+            {
+                "leg_id": "leg-shadow-cancel-postgres-1",
+                "market_id": "market-shadow-cancel-postgres-1",
+                "market_question": "Will a cancelled Shadow attempt survive reconnect?",
+                "token_id": "token-shadow-cancel-postgres-1",
+                "side": "buy",
+                "outcome": "yes",
+                "requested_notional_usd": 9.0,
+                "requested_shares": 18.0,
+                "limit_price": 0.5,
+                "price_policy": "taker_limit",
+                "time_in_force": "IOC",
+                "post_only": False,
+            }
+        ]
+        constraints = {"max_unhedged_notional_usd": 0.0, "hedge_timeout_seconds": 20}
+        submit_started = asyncio.Event()
+
+        async def _submit_wave(**kwargs):
+            del kwargs
+            submit_started.set()
+            await asyncio.Future()
+
+        monkeypatch.setattr(session_engine_module, "supports_reprice", lambda _policy: False)
+        monkeypatch.setattr(
+            session_engine_module,
+            "execution_waves",
+            lambda _policy, leg_rows: [leg_rows],
+        )
+        monkeypatch.setattr(
+            session_engine_module,
+            "requires_pair_lock",
+            lambda _policy, _constraints: False,
+        )
+        monkeypatch.setattr(
+            session_engine_module,
+            "set_trade_signal_status",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            session_engine_module,
+            "sync_trader_position_inventory",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            session_engine_module.event_bus,
+            "publish",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            session_engine_module,
+            "submit_execution_wave",
+            AsyncMock(side_effect=_submit_wave),
+        )
+
+        signal = SimpleNamespace(
+            id=signal_id,
+            source="traders",
+            trace_id="trace-shadow-cancel-postgres",
+            strategy_type="traders_confluence",
+            strategy_context_json={},
+            payload_json={},
+            market_id="market-shadow-cancel-postgres-1",
+            market_question="Will a cancelled Shadow attempt survive reconnect?",
+            direction="buy_yes",
+            entry_price=0.5,
+            edge_percent=3.0,
+            confidence=0.8,
+        )
+
+        async with session_factory() as execution_db:
+            engine = session_engine_module.ExecutionSessionEngine(execution_db)
+            monkeypatch.setattr(
+                engine,
+                "_build_plan",
+                lambda *args, **kwargs: (plan, legs, constraints),
+            )
+            monkeypatch.setattr(
+                engine,
+                "_publish_hot_signal_status",
+                AsyncMock(return_value=None),
+            )
+            task = asyncio.create_task(
+                engine.execute_signal(
+                    trader_id=trader_id,
+                    signal=signal,
+                    decision_id=decision_id,
+                    strategy_key="traders_confluence",
+                    strategy_version=None,
+                    strategy_params={},
+                    risk_limits={},
+                    mode="shadow",
+                    size_usd=9.0,
+                    reason="Wallet consensus selected",
+                )
+            )
+
+            await asyncio.wait_for(submit_started.wait(), timeout=2.0)
+            async with session_factory() as observer_db:
+                pre_session_statuses = list(
+                    (
+                        await observer_db.execute(
+                            select(ExecutionSession.status).where(
+                                ExecutionSession.decision_id == decision_id
+                            )
+                        )
+                    ).scalars()
+                )
+                pre_leg_count = int(
+                    (
+                        await observer_db.execute(
+                            select(func.count()).select_from(ExecutionSessionLeg)
+                        )
+                    ).scalar_one()
+                )
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        async with session_factory() as verify_db:
+            session_rows = list(
+                (
+                    await verify_db.execute(
+                        select(ExecutionSession).where(
+                            ExecutionSession.decision_id == decision_id
+                        )
+                    )
+                ).scalars()
+            )
+            leg_rows = list((await verify_db.execute(select(ExecutionSessionLeg))).scalars())
+            event_types = list(
+                (await verify_db.execute(select(ExecutionSessionEvent.event_type))).scalars()
+            )
+            cash_ledger_table = (
+                await verify_db.execute(
+                    select(func.to_regclass("public.simulation_cash_ledger_entries"))
+                )
+            ).scalar_one_or_none()
+            cash_ledger_count = 0
+            if cash_ledger_table is not None:
+                cash_ledger_count = int(
+                    (
+                        await verify_db.execute(
+                            text("SELECT count(*) FROM simulation_cash_ledger_entries")
+                        )
+                    ).scalar_one()
+                )
+            economic_counts = {
+                "trader_orders": int(
+                    (
+                        await verify_db.execute(select(func.count()).select_from(TraderOrder))
+                    ).scalar_one()
+                ),
+                "execution_orders": int(
+                    (
+                        await verify_db.execute(
+                            select(func.count()).select_from(ExecutionSessionOrder)
+                        )
+                    ).scalar_one()
+                ),
+                "simulation_accounts": int(
+                    (
+                        await verify_db.execute(
+                            select(func.count()).select_from(SimulationAccount)
+                        )
+                    ).scalar_one()
+                ),
+                "cash_ledger_entries": cash_ledger_count,
+            }
+
+        assert pre_session_statuses == ["placing"]
+        assert pre_leg_count == 1
+        assert len(session_rows) == 1
+        assert str(session_rows[0].status or "") == "failed"
+        assert len(leg_rows) == 1
+        assert str(leg_rows[0].status or "") == "failed"
+        assert float(leg_rows[0].filled_notional_usd or 0.0) == 0.0
+        assert float(leg_rows[0].filled_shares or 0.0) == 0.0
+        assert event_types.count("session_created") == 1
+        assert event_types.count("session_failed") == 1
+        assert economic_counts == {
+            "trader_orders": 0,
+            "execution_orders": 0,
+            "simulation_accounts": 0,
+            "cash_ledger_entries": 0,
+        }
+    finally:
+        await managed_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_shadow_deadline_returns_failed_zero_order_result(monkeypatch):
+    db = _FailureProjectionDb()
+    engine = session_engine_module.ExecutionSessionEngine(db)
+
+    plan = {"policy": "SINGLE_LEG", "plan_id": "plan-shadow-deadline"}
+    legs = [
+        {
+            "leg_id": "leg-shadow-deadline-1",
+            "market_id": "market-shadow-deadline-1",
+            "market_question": "Will the shared Shadow deadline fail closed?",
+            "token_id": "token-shadow-deadline-1",
+            "side": "buy",
+            "outcome": "yes",
+            "requested_notional_usd": 8.0,
+            "requested_shares": 16.0,
+            "limit_price": 0.5,
+            "price_policy": "taker_limit",
+            "time_in_force": "IOC",
+            "post_only": False,
+        }
+    ]
+    constraints = {"max_unhedged_notional_usd": 0.0, "hedge_timeout_seconds": 20}
+    monkeypatch.setattr(engine, "_build_plan", lambda *args, **kwargs: (plan, legs, constraints))
+    monkeypatch.setattr(session_engine_module, "supports_reprice", lambda _policy: False)
+    monkeypatch.setattr(session_engine_module, "execution_waves", lambda _policy, leg_rows: [leg_rows])
+    monkeypatch.setattr(session_engine_module, "requires_pair_lock", lambda _policy, _constraints: False)
+    monkeypatch.setattr(session_engine_module, "set_trade_signal_status", AsyncMock(return_value=True))
+    monkeypatch.setattr(session_engine_module, "sync_trader_position_inventory", AsyncMock(return_value={}))
+    monkeypatch.setattr(session_engine_module.event_bus, "publish", AsyncMock(return_value=None))
+    monkeypatch.setattr(engine, "_publish_hot_signal_status", AsyncMock(return_value=None))
+    monkeypatch.setattr(session_engine_module, "_strategy_instance_for_execution", lambda _key: None)
+    monkeypatch.setattr(
+        session_engine_module.GatePipeline,
+        "run",
+        AsyncMock(return_value=SimpleNamespace(passed=True, per_gate=[])),
+    )
+
+    async def _never_submit(**kwargs):
+        del kwargs
+        await asyncio.Future()
+
+    monkeypatch.setattr(
+        session_engine_module,
+        "submit_execution_wave",
+        AsyncMock(side_effect=_never_submit),
+    )
+
+    signal = SimpleNamespace(
+        id="signal-shadow-deadline",
+        source="traders",
+        trace_id="trace-shadow-deadline",
+        strategy_type="traders_confluence",
+        strategy_context_json={},
+        payload_json={},
+        market_id="market-shadow-deadline-1",
+        market_question="Will the shared Shadow deadline fail closed?",
+        direction="buy_yes",
+        entry_price=0.5,
+        edge_percent=3.0,
+        confidence=0.8,
+    )
+
+    started_at = asyncio.get_running_loop().time()
+    result = await asyncio.wait_for(
+        engine.execute_signal(
+            trader_id="trader-shadow-deadline",
+            signal=signal,
+            decision_id="decision-shadow-deadline",
+            strategy_key="traders_confluence",
+            strategy_version=None,
+            strategy_params={},
+            risk_limits={},
+            mode="shadow",
+            size_usd=8.0,
+            reason="Wallet consensus selected",
+            execution_timeout_seconds=0.1,
+        ),
+        timeout=1.0,
+    )
+    elapsed_seconds = asyncio.get_running_loop().time() - started_at
+
+    assert elapsed_seconds < 0.5
+    assert result.status == "failed"
+    assert result.orders_written == 0
+    assert result.session_id
+    assert result.payload["execution_interruption"]["kind"] == "deadline_exceeded"
+    assert result.payload["execution_interruption"]["stage"] == "venue_submit_wave"
+    assert result.payload["execution_interruption"]["timeout_seconds"] == pytest.approx(0.1)
+
+    session_rows = db.persisted_rows_by_type.get("ExecutionSession") or []
+    leg_rows = db.persisted_rows_by_type.get("ExecutionSessionLeg") or []
+    assert len(session_rows) == 1
+    assert str(session_rows[-1].status or "") == "failed"
+    assert len(leg_rows) == 1
+    assert str(leg_rows[-1].status or "") == "failed"
+    assert float(leg_rows[-1].filled_notional_usd or 0.0) == 0.0
+    assert (db.persisted_rows_by_type.get("TraderOrder") or []) == []
+    assert (db.persisted_rows_by_type.get("ExecutionSessionOrder") or []) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_shadow_does_not_relabel_inner_timeout_as_cycle_deadline(monkeypatch):
+    db = _FailureProjectionDb()
+    engine = session_engine_module.ExecutionSessionEngine(db)
+    plan = {"policy": "SINGLE_LEG", "plan_id": "plan-shadow-provider-timeout"}
+    legs = [
+        {
+            "leg_id": "leg-shadow-provider-timeout-1",
+            "market_id": "market-shadow-provider-timeout-1",
+            "market_question": "Will provider timeouts preserve their authority?",
+            "token_id": "token-shadow-provider-timeout-1",
+            "side": "buy",
+            "outcome": "yes",
+            "requested_notional_usd": 8.0,
+            "requested_shares": 16.0,
+            "limit_price": 0.5,
+            "price_policy": "taker_limit",
+            "time_in_force": "IOC",
+            "post_only": False,
+        }
+    ]
+    constraints = {"max_unhedged_notional_usd": 0.0, "hedge_timeout_seconds": 20}
+    monkeypatch.setattr(engine, "_build_plan", lambda *args, **kwargs: (plan, legs, constraints))
+    monkeypatch.setattr(session_engine_module, "supports_reprice", lambda _policy: False)
+    monkeypatch.setattr(session_engine_module, "execution_waves", lambda _policy, leg_rows: [leg_rows])
+    monkeypatch.setattr(session_engine_module, "requires_pair_lock", lambda _policy, _constraints: False)
+    monkeypatch.setattr(session_engine_module, "_strategy_instance_for_execution", lambda _key: None)
+    monkeypatch.setattr(
+        session_engine_module.GatePipeline,
+        "run",
+        AsyncMock(return_value=SimpleNamespace(passed=True, per_gate=[])),
+    )
+
+    async def _provider_timeout(**kwargs):
+        del kwargs
+        raise asyncio.TimeoutError("provider socket timed out")
+
+    monkeypatch.setattr(
+        session_engine_module,
+        "submit_execution_wave",
+        AsyncMock(side_effect=_provider_timeout),
+    )
+
+    signal = SimpleNamespace(
+        id="signal-shadow-provider-timeout",
+        source="traders",
+        trace_id="trace-shadow-provider-timeout",
+        strategy_type="traders_confluence",
+        strategy_context_json={},
+        payload_json={},
+        market_id="market-shadow-provider-timeout-1",
+        market_question="Will provider timeouts preserve their authority?",
+        direction="buy_yes",
+        entry_price=0.5,
+        edge_percent=3.0,
+        confidence=0.8,
+    )
+
+    with pytest.raises(asyncio.TimeoutError, match="provider socket timed out"):
+        await engine.execute_signal(
+            trader_id="trader-shadow-provider-timeout",
+            signal=signal,
+            decision_id="decision-shadow-provider-timeout",
+            strategy_key="traders_confluence",
+            strategy_version=None,
+            strategy_params={},
+            risk_limits={},
+            mode="shadow",
+            size_usd=8.0,
+            reason="Wallet consensus selected",
+            execution_timeout_seconds=2.0,
+        )
+
+    session_rows = db.persisted_rows_by_type.get("ExecutionSession") or []
+    assert len(session_rows) == 1
+    assert str(session_rows[-1].status or "") == "placing"
+    assert "execution_interruption" not in dict(session_rows[-1].payload_json or {})
+    assert (db.persisted_rows_by_type.get("TraderOrder") or []) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_shadow_second_wave_deadline_discards_first_wave_memory_fill(monkeypatch):
+    db = _FailureProjectionDb()
+    engine = session_engine_module.ExecutionSessionEngine(db)
+    plan = {"policy": "SEQUENTIAL_TAKER", "plan_id": "plan-shadow-multi-wave-deadline"}
+    legs = [
+        {
+            "leg_id": "leg-shadow-wave-1",
+            "market_id": "market-shadow-wave-1",
+            "market_question": "Will leg one fill only in memory?",
+            "token_id": "token-shadow-wave-1",
+            "side": "buy",
+            "outcome": "yes",
+            "requested_notional_usd": 5.0,
+            "requested_shares": 10.0,
+            "limit_price": 0.5,
+            "price_policy": "taker_limit",
+            "time_in_force": "IOC",
+            "post_only": False,
+        },
+        {
+            "leg_id": "leg-shadow-wave-2",
+            "market_id": "market-shadow-wave-2",
+            "market_question": "Will leg two consume the shared deadline?",
+            "token_id": "token-shadow-wave-2",
+            "side": "buy",
+            "outcome": "yes",
+            "requested_notional_usd": 5.0,
+            "requested_shares": 10.0,
+            "limit_price": 0.5,
+            "price_policy": "taker_limit",
+            "time_in_force": "IOC",
+            "post_only": False,
+        },
+    ]
+    constraints = {"max_unhedged_notional_usd": 0.0, "hedge_timeout_seconds": 20}
+    monkeypatch.setattr(engine, "_build_plan", lambda *args, **kwargs: (plan, legs, constraints))
+    monkeypatch.setattr(session_engine_module, "supports_reprice", lambda _policy: False)
+    monkeypatch.setattr(
+        session_engine_module,
+        "execution_waves",
+        lambda _policy, leg_rows: [[leg_rows[0]], [leg_rows[1]]],
+    )
+    monkeypatch.setattr(session_engine_module, "requires_pair_lock", lambda _policy, _constraints: False)
+    monkeypatch.setattr(session_engine_module, "_strategy_instance_for_execution", lambda _key: None)
+    monkeypatch.setattr(session_engine_module, "set_trade_signal_status", AsyncMock(return_value=True))
+    monkeypatch.setattr(session_engine_module, "sync_trader_position_inventory", AsyncMock(return_value={}))
+    monkeypatch.setattr(session_engine_module.event_bus, "publish", AsyncMock(return_value=None))
+    monkeypatch.setattr(engine, "_publish_hot_signal_status", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        session_engine_module.GatePipeline,
+        "run",
+        AsyncMock(return_value=SimpleNamespace(passed=True, per_gate=[])),
+    )
+
+    submit_calls = 0
+
+    async def _submit_wave(**kwargs):
+        nonlocal submit_calls
+        del kwargs
+        submit_calls += 1
+        if submit_calls == 1:
+            return [
+                _leg_result(
+                    leg_id="leg-shadow-wave-1",
+                    status="executed",
+                    notional_usd=5.0,
+                    shares=10.0,
+                    effective_price=0.5,
+                    payload={"filled_notional_usd": 5.0, "filled_size": 10.0},
+                )
+            ]
+        await asyncio.Future()
+
+    monkeypatch.setattr(session_engine_module, "submit_execution_wave", _submit_wave)
+
+    signal = SimpleNamespace(
+        id="signal-shadow-multi-wave-deadline",
+        source="traders",
+        trace_id="trace-shadow-multi-wave-deadline",
+        strategy_type="traders_confluence",
+        strategy_context_json={},
+        payload_json={},
+        market_id="market-shadow-wave-1",
+        market_question="Will a partial in-memory bundle stay non-economic?",
+        direction="buy_yes",
+        entry_price=0.5,
+        edge_percent=3.0,
+        confidence=0.8,
+    )
+
+    result = await asyncio.wait_for(
+        engine.execute_signal(
+            trader_id="trader-shadow-multi-wave-deadline",
+            signal=signal,
+            decision_id="decision-shadow-multi-wave-deadline",
+            strategy_key="traders_confluence",
+            strategy_version=None,
+            strategy_params={},
+            risk_limits={},
+            mode="shadow",
+            size_usd=10.0,
+            reason="Wallet consensus selected",
+            execution_timeout_seconds=0.2,
+        ),
+        timeout=1.0,
+    )
+
+    assert submit_calls == 2
+    assert result.status == "failed"
+    assert result.orders_written == 0
+    assert result.payload["execution_interruption"]["stage"] == "venue_submit_wave"
+    leg_rows = db.persisted_rows_by_type.get("ExecutionSessionLeg") or []
+    assert len(leg_rows) == 2
+    assert {str(row.status or "") for row in leg_rows} == {"failed"}
+    assert all(float(row.filled_notional_usd or 0.0) == 0.0 for row in leg_rows)
+    assert all(float(row.filled_shares or 0.0) == 0.0 for row in leg_rows)
+    assert (db.persisted_rows_by_type.get("TraderOrder") or []) == []
+    assert (db.persisted_rows_by_type.get("ExecutionSessionOrder") or []) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_shadow_intent_commit_failure_never_calls_venue(monkeypatch):
+    class _IntentCommitFailureDb(_FailureProjectionDb):
+        async def commit(self) -> None:
+            self.commit_calls += 1
+            raise session_engine_module.DBAPIError(
+                "COMMIT",
+                {},
+                RuntimeError("intent commit failed"),
+            )
+
+    db = _IntentCommitFailureDb()
+    engine = session_engine_module.ExecutionSessionEngine(db)
+    plan = {"policy": "SINGLE_LEG", "plan_id": "plan-shadow-intent-commit-failure"}
+    legs = [
+        {
+            "leg_id": "leg-shadow-intent-commit-failure-1",
+            "market_id": "market-shadow-intent-commit-failure-1",
+            "token_id": "token-shadow-intent-commit-failure-1",
+            "side": "buy",
+            "outcome": "yes",
+            "requested_notional_usd": 5.0,
+            "requested_shares": 10.0,
+            "limit_price": 0.5,
+        }
+    ]
+    constraints = {"max_unhedged_notional_usd": 0.0, "hedge_timeout_seconds": 20}
+    monkeypatch.setattr(engine, "_build_plan", lambda *args, **kwargs: (plan, legs, constraints))
+    monkeypatch.setattr(session_engine_module, "supports_reprice", lambda _policy: False)
+    monkeypatch.setattr(session_engine_module, "execution_waves", lambda _policy, leg_rows: [leg_rows])
+    monkeypatch.setattr(session_engine_module, "requires_pair_lock", lambda _policy, _constraints: False)
+    submit_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(session_engine_module, "submit_execution_wave", submit_mock)
+
+    signal = SimpleNamespace(
+        id="signal-shadow-intent-commit-failure",
+        source="traders",
+        trace_id="trace-shadow-intent-commit-failure",
+        strategy_type="traders_confluence",
+        strategy_context_json={},
+        payload_json={},
+        market_id="market-shadow-intent-commit-failure-1",
+        market_question="Will failed intent commits prevent venue I/O?",
+        direction="buy_yes",
+        entry_price=0.5,
+        edge_percent=3.0,
+        confidence=0.8,
+    )
+
+    with pytest.raises(session_engine_module.DBAPIError, match="intent commit failed"):
+        await engine.execute_signal(
+            trader_id="trader-shadow-intent-commit-failure",
+            signal=signal,
+            decision_id="decision-shadow-intent-commit-failure",
+            strategy_key="traders_confluence",
+            strategy_version=None,
+            strategy_params={},
+            risk_limits={},
+            mode="shadow",
+            size_usd=5.0,
+            reason="Wallet consensus selected",
+        )
+
+    assert submit_mock.await_count == 0
+    assert (db.persisted_rows_by_type.get("TraderOrder") or []) == []
+    assert (db.persisted_rows_by_type.get("ExecutionSessionOrder") or []) == []
 
 
 @pytest.mark.asyncio
@@ -2098,6 +2829,7 @@ async def test_execute_signal_shadow_persists_with_commit_so_async_session_close
         mode="shadow",
         size_usd=10.0,
         reason="shadow-commit-regression",
+        execution_timeout_seconds=5.0,
     )
 
     assert result.status == "completed"
@@ -2113,6 +2845,10 @@ async def test_execute_signal_shadow_persists_with_commit_so_async_session_close
     )
     trader_rows = db.persisted_rows_by_type.get("TraderOrder") or []
     execution_rows = db.persisted_rows_by_type.get("ExecutionSessionOrder") or []
+    session_rows = db.persisted_rows_by_type.get("ExecutionSession") or []
+    event_rows = db.persisted_rows_by_type.get("ExecutionSessionEvent") or []
     assert len(trader_rows) == 1
     assert len(execution_rows) == 1
+    assert len(session_rows) == 1
+    assert len([row for row in event_rows if str(row.event_type or "") == "session_created"]) == 1
 

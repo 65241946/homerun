@@ -128,6 +128,7 @@ strategy_db_loader = strategy_loader
 _TRADER_TIMEOUT_CANCEL_GRACE_SECONDS = 5.0
 _MIN_LIVE_PROCESS_SIGNAL_CYCLE_TIMEOUT_SECONDS = 60.0  # do not cancel live order submission mid-flight
 _STRATEGY_EVALUATION_TIMEOUT_SECONDS = 15.0
+_SHADOW_EXECUTION_FINALIZE_RESERVE_SECONDS = 2.0
 
 # Fast-tier traders are owned by ``fast_trader_runtime`` — this shared
 # orchestrator loop skips them entirely so their per-tick budget is not
@@ -1977,6 +1978,7 @@ async def submit_order(
     reason: str,
     explicit_strategy_params: dict[str, Any] | None = None,
     session_engine: Any | None = None,
+    execution_timeout_seconds: float | None = None,
 ):
     if session_engine is not None:
         return await session_engine.execute_signal(
@@ -1991,6 +1993,7 @@ async def submit_order(
             mode=mode,
             size_usd=size_usd,
             reason=reason,
+            execution_timeout_seconds=execution_timeout_seconds,
         )
     async with AsyncSessionLocal() as submit_session:
         _engine = ExecutionSessionEngine(submit_session)
@@ -2006,6 +2009,7 @@ async def submit_order(
             mode=mode,
             size_usd=size_usd,
             reason=reason,
+            execution_timeout_seconds=execution_timeout_seconds,
         )
 
 
@@ -7986,6 +7990,13 @@ async def _run_trader_once_inner(
                         # 97 in 21 min in another.  submit_order opens its
                         # own AsyncSessionLocal so the orchestrator's
                         # released connection here is sufficient.
+                        execution_timeout_seconds = None
+                        if run_mode == "shadow":
+                            execution_timeout_seconds = _remaining_cycle_budget_seconds(
+                                cycle_started_mono=cycle_started_mono,
+                                cycle_timeout_seconds=cycle_timeout_seconds,
+                                reserve_seconds=_SHADOW_EXECUTION_FINALIZE_RESERVE_SECONDS,
+                            )
                         submit_result = await submit_order(
                             trader_id=trader_id,
                             signal=runtime_signal,
@@ -7998,6 +8009,7 @@ async def _run_trader_once_inner(
                             mode=str(control.get("mode", "shadow")),
                             size_usd=size_usd,
                             reason=final_reason,
+                            execution_timeout_seconds=execution_timeout_seconds,
                         )
                         _accumulate("ps_submit_order", _submit_mono)
                         _submit_session_timing_ms: dict[str, float] = {}
