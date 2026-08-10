@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { normalizeUtcTimestampsInPlace } from '../lib/timestamps'
+import {
+  shouldPublishWebSocketMessage,
+  type WebSocketMessage,
+} from './tradingActivityVisibility'
 
-interface WebSocketMessage {
-  type: string
-  data: any
+type UseWebSocketOptions = {
+  suppressOrdinaryTradingActivity?: boolean
 }
 
 // ─── Shared singleton so multiple hook consumers reuse one connection ───
@@ -156,12 +159,18 @@ function sharedDisconnect() {
 
 // ─── Hook ────────────────────────────────────────────────
 
-export function useWebSocket(url: string, messageTypes?: string[]) {
+export function useWebSocket(
+  url: string,
+  messageTypes?: string[],
+  options: UseWebSocketOptions = {},
+) {
   const [isConnected, setIsConnected] = useState(sharedConnected)
   const [lastMessage, setLastMessage] = useState<WebSocketMessage | null>(null)
   const urlRef = useRef(url)
   const messageTypesRef = useRef<Set<string> | null>(null)
+  const optionsRef = useRef(options)
   urlRef.current = url
+  optionsRef.current = options
   messageTypesRef.current = Array.isArray(messageTypes) && messageTypes.length > 0
     ? new Set(messageTypes)
     : null
@@ -174,6 +183,12 @@ export function useWebSocket(url: string, messageTypes?: string[]) {
     const onMsg = (msg: WebSocketMessage) => {
       const allowedTypes = messageTypesRef.current
       if (allowedTypes && !allowedTypes.has(String(msg.type))) return
+      if (!shouldPublishWebSocketMessage(
+        msg,
+        Boolean(optionsRef.current.suppressOrdinaryTradingActivity),
+      )) {
+        return
+      }
       setLastMessage(msg)
     }
     const onStatus = (connected: boolean) => setIsConnected(connected)

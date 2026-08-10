@@ -784,7 +784,9 @@ function App() {
   }, [activeTab])
 
   // WebSocket for real-time updates
-  const { isConnected, lastMessage, sendMessage } = useWebSocket('/ws')
+  const { isConnected, lastMessage, sendMessage } = useWebSocket('/ws', undefined, {
+    suppressOrdinaryTradingActivity: true,
+  })
   useRealtimeInvalidation(lastMessage, queryClient, setScannerActivity, {
     activeTab,
     opportunitiesView,
