@@ -1,0 +1,71 @@
+diff --git a/backend/services/strategies/traders_copy_trade.py b/backend/services/strategies/traders_copy_trade.py
+index 68bf16df..340e2e35 100644
+--- a/backend/services/strategies/traders_copy_trade.py
++++ b/backend/services/strategies/traders_copy_trade.py
+@@ -216,6 +216,19 @@ def validate_traders_copy_trade_config(config: Any) -> dict[str, Any]:
+     cfg["min_live_liquidity_usd"] = _coerce_float(cfg.get("min_live_liquidity_usd"), 150.0, 0.0, 1_000_000_000.0)
+     cfg["max_adverse_entry_drift_pct"] = _coerce_float(cfg.get("max_adverse_entry_drift_pct"), 2.0, 0.0, 100.0)
+     cfg["copy_delay_seconds"] = _coerce_int(cfg.get("copy_delay_seconds"), 0, 0, 300)
++    # P0-1: the freshness gate (age <= max_signal_age_seconds) and the copy-delay
++    # gate (age >= copy_delay_seconds) form a window [copy_delay, max_signal_age].
++    # If copy_delay >= max_signal_age the window is empty and EVERY signal is
++    # silently rejected — the strategy goes dark with no error. When a user asks
++    # for a delay, honour it by widening the freshness window to contain it
++    # (delay + a small execution margin), clamped to the hard ceiling, instead of
++    # producing an unsatisfiable pair.
++    if cfg["copy_delay_seconds"] >= cfg["max_signal_age_seconds"]:
++        _delay_margin_seconds = 5
++        cfg["max_signal_age_seconds"] = min(
++            600,
++            cfg["copy_delay_seconds"] + _delay_margin_seconds,
++        )
+     cfg["copy_existing_positions_on_start"] = _coerce_bool(cfg.get("copy_existing_positions_on_start"), False)
+     cfg["copy_buys"] = _coerce_bool(cfg.get("copy_buys"), True)
+     cfg["copy_sells"] = _coerce_bool(cfg.get("copy_sells"), True)
+@@ -357,21 +370,36 @@ class TradersCopyTradeStrategy(BaseStrategy):
+             copy_event.get("wallet_address")
+             or source_trade.get("wallet_address")
+         )
+-        confidence = to_confidence(copy_event.get("confidence"), 0.70)
++        # P0-4: default a missing copy-signal confidence the SAME way detect and
++        # evaluate do. Previously this defaulted to 0.70 here but 0.0 in
++        # evaluate(), so a confidence-less signal passed detection as "high
++        # conviction" and was then rejected by the min_confidence gate — wasted
++        # work and confusing behaviour. Use the neutral min_confidence default.
++        confidence = to_confidence(copy_event.get("confidence"), 0.45)
+         source_notional = safe_float(source_trade.get("source_notional_usd"), 0.0)
+         if source_notional <= 0.0:
+             source_notional = max(0.0, entry_price * size)
+ 
+-        # Edge-percent calculation reads its midpoint and multiplier from
+-        # the strategy config so the user can tune them in the bot's
+-        # strategy params editor without editing this code.
++        # P0-2: real edge for a copy is the STRUCTURAL upside of the leader's
++        # entry price scaled by the signal's conviction — NOT the geometric
++        # distance from 0.5. The old formula `|0.5 - price| * 200` assigned a
++        # near-certain $0.99 entry a fake ~98% ROI (true upside to $1.00 is ~1%)
++        # while a fair-value $0.50 copy got zero edge, poisoning ROI-based
++        # ranking, sizing and quality filters. A long that pays $1 at resolution
++        # has max ROI (1 - p)/p; we take a conviction-weighted fraction of it and
++        # cap it so deep-longshot entries don't dominate ranking on arithmetic
++        # alone. (edge_midpoint / edge_multiplier remain in the config schema for
++        # backward compatibility but no longer drive the core edge.)
+         cfg = getattr(self, "config", None) or {}
+-        edge_midpoint = safe_float(cfg.get("edge_midpoint"), 0.5)
+-        edge_multiplier = safe_float(cfg.get("edge_multiplier"), 200.0)
+-        edge_percent = (
+-            max(0.0, abs(edge_midpoint - entry_price) * edge_multiplier)
+-            if 0.0 <= entry_price <= 1.0
+-            else 0.0
++        edge_conviction_floor = safe_float(cfg.get("edge_conviction_floor"), 0.15)
++        edge_max_percent = safe_float(cfg.get("edge_max_percent"), 100.0)
++        if 0.0 < entry_price < 1.0:
++            structural_upside_pct = ((1.0 - entry_price) / entry_price) * 100.0
++        else:
++            structural_upside_pct = 0.0
++        edge_percent = max(
++            0.0,
++            min(structural_upside_pct, edge_max_percent) * max(edge_conviction_floor, confidence),
+         )
+         expected_payout = min(1.0, entry_price + max(0.01, edge_percent / 100.0))
+         detected_at = _to_utc(
