@@ -324,7 +324,8 @@ scanner(16)、crypto(8)、traders(2)、news(1)、weather(1)、sports(1)、manual
 
 ## 待核实清单(下一轮针对干净基座)
 
-- [x] ✅ **已核实**:钱包共识(`traders_confluence.py:575`)direction **安全**;manual-buy(`routes_traders.py:2268`)**有 bug**(垃圾 direction,基座就存在,见 CONFIRMED-2)。「钱包共识信号没法下单」**不是 direction 问题**,需另查(门禁/共识阈值)。
+- [x] ✅ **已核实**:钱包共识(`traders_confluence.py:575`)direction **安全**;manual-buy(`routes_traders.py:2268`)**有 bug**(垃圾 direction,基座就存在,见 CONFIRMED-2)。
+- [x] ✅ **已核实**:「钱包共识信号没法下单」**不是单一代码 bug**。上游生产者(`traders_confluence.py:658` 写 confluence_strength)与下游门禁(`custom_checks:808` 读它)键对得上,链路通。它是一条 ~20 项过滤关卡:上游 `tracked_traders_worker` 发 trader_activity → firehose 15 检查(min_wallet_count≥2、min_confidence≥0.45、可交易、活跃、age≤720min、entry≤0.85 等)→ custom_checks 3 检查(source=traders、channel=confluence、confluence_strength≥0.50)→ 平台决策门禁。**最可能真因是配置/状态**(共识钱包不足 2、上游未监控钱包、阈值未达、被风控门拦),非代码缺陷。**每次拦截原因记录在 `trader_decisions.checks_payload`,可从数据精确定位**,是下一步(需 DB 只读查询)。
 - [ ] 候选-4/5/7/9 等标🟠🟡项逐条核实,升级为 CONFIRMED 或排除。
 - [ ] `close_orchestrator_shadow_fill` 修复方案:开开关 vs 改口径,需先定 PnL 权威表。
 - [ ] live_risk_clamps 各 `*_cap` 在 worker/session_engine 的确切落地点。
