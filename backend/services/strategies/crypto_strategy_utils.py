@@ -107,6 +107,27 @@ def bounded_sigmoid(z: float) -> float:
     return 1.0 / (1.0 + math.exp(-bounded))
 
 
+def estimate_p_win(
+    diff_pct: float,
+    elapsed_ratio: float,
+    *,
+    base_scale: float,
+    min_scale: float,
+    prob_min: float,
+    prob_max: float,
+) -> float:
+    """Estimate binary win probability from an oracle-price divergence.
+
+    Crypto strategies share a 0.30 lower confidence-clamp convention; that
+    clamp must remain below each strategy's default ``min_confidence`` so the
+    confidence gate, rather than the clamp, remains authoritative.
+    """
+    elapsed = clamp(float(elapsed_ratio), 0.0, 1.0)
+    scale = max(float(min_scale), float(base_scale) * (1.0 - elapsed))
+    probability = bounded_sigmoid(float(diff_pct) / scale)
+    return clamp(probability, float(prob_min), float(prob_max))
+
+
 def normalize_ratio(value: Any) -> float | None:
     parsed = safe_float(value, None)
     if parsed is None:
