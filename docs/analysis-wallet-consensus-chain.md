@@ -45,13 +45,25 @@
 
 走查称 worker 节奏(默认 30s)必然超过 copy `max_signal_age_seconds`(默认 5s)→ 跟单恒失效。**证伪**:仓库存在快车道(`services/wallet_ws_monitor.py`、`services/trader_orchestrator/fast_submit.py`),copy 的 `detected_at` 取叶子交易时间。若走 WS 快车道,5s 窗口是合理设计。**仅当退回慢桥时才失效** —— 未确认,不作为 bug。若要定性,需追 copy 信号实际走哪条道。
 
-## 待核实清单(代码走查提出,架构师尚未逐一验证)[待核实]
+## 补充核实结果(架构师已逐条验证,2026-08-12)
 
-1. **"medium" tier 永不产生**:`_tier_for_count`(wallet_intelligence:478)只输出 EXTREME/HIGH/WATCH,而 canonical 是 low/medium/high/extreme,`watch → low`。⇒ 2–3 个钱包的簇与最弱信号无法区分。
-2. **`is_tradeable` 在源头是假值**:原始 firehose 里 `is_tradeable = bool(is_active)`(smart_wallet_pool:846),非真实可交易性;只有 worker 事后用 `get_market_tradability_map` 覆盖。读原始 firehose 的消费方信任了未经检查的值。
-3. **`avg_wallet_rank` 算了但丢弃**:持久化在信号上,firehose 读出未透传,到不了策略/机会。
-4. **`min_confluence_strength` 在机会构建阶段不设闸**:只在 orchestrator `custom_checks` 检查,且那里缺省 0.55 ≠ `DEFAULT_CONFIG` 的 0.50。
-5. **死缺省**(与 `fix-02-audit.md` 记录同类):`min_tier` inline "high" vs 声明 "low";`firehose_exclude_crypto_markets` inline True vs 声明 False。→ 已纳入 fix-03 P0-b 第 3 条一并修。
+1. **"medium" tier 永不产生 —— [已核实·属实]**
+   `ConfluenceDetector._tier_for_count` 只返回 `EXTREME`(≥6)/`HIGH`(≥4)/`WATCH`(其余);`StrategySDK.normalize_trader_tier`(strategy_sdk:1205)的 canonical 集是 `("low","medium","high","extreme")`,`"watch"` 不在其中 → 落 `"low"`。
+   而消费侧 `traders_confluence.TIER_ORDER`(:102)是 4 档。⇒ **`medium` 档永远空置**:2–3 钱包的簇与最弱信号同为 `low`,配置 `min_tier="medium"` 形同虚设,tier 的分辨率实际只有 3 档。
+   影响面:`min_tier` 闸、以及 fix-04 F-2 计划引入的 `tier_weights`(其 `medium:1.5` 权重将永不生效)。**实施 tier_weights 前必须先决定:要么让 `_tier_for_count` 产出 medium(如 ≥3),要么把 medium 从权重表移除。**
+
+2. **`is_tradeable` 在源头是假值 —— [已核实·属实]**
+   `smart_wallet_pool:846` 写 `"is_tradeable": bool(s.is_active)`(仅信号活跃标志,非市场可交易性)。只有 `tracked_traders_worker:683-692` 事后用真实 `get_market_tradability_map` 覆盖。
+   ⇒ 不经该 worker 的消费方(UI/回测/直接读 firehose)拿到的是**未经检查的可交易性**。而 `evaluate_firehose_signal` 的 `require_tradable_market` 闸正读这个字段 → 在那些路径上该闸是假通过。
+
+3. **`avg_wallet_rank` 算了但丢弃 —— [已核实·属实]**
+   算于 wallet_intelligence:336,持久化 :685/:719,`get_active_signals` :808 会读;但 firehose 读出(smart_wallet_pool:815-850)**未透传** ⇒ 到不了策略/机会。要用它做钱包质量加权,需先在读出补字段。
+
+4. **`min_confluence_strength` 设闸位置 —— [已核实·部分属实]**
+   缺省不一致**已被 fix-03 修复**(:840-845 现读 `DEFAULT_CONFIG`)。但**设闸位置问题仍在**:该阈值只在 orchestrator 的 `custom_checks`(:865)判定,`evaluate_firehose_signal` / `build_opportunities_from_firehose` 阶段不判 ⇒ 低于强度阈值的信号仍会生成 Opportunity,只在编排器末端被拒。属效率/可观测性问题(拒绝原因出现在更晚的阶段),非资金风险。
+
+5. **死缺省 —— [已核实·已修复]**
+   `min_tier`(:456)、`firehose_exclude_crypto_markets`(:435-438)现均读 `DEFAULT_CONFIG`,fix-03 已解决。此条关闭。
 
 ## 关键阈值速查
 

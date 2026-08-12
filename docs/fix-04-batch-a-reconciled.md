@@ -38,8 +38,10 @@
 
 1. **方向不明丢弃**(A2.1,P0):`_resolve_trade_outcome` 无明确方向时返回 `None`,调用方跳过 —— **不再默认 "NO"**。这是真实资金风险(方向猜错=反向下单)。
 2. **`firehose_max_age_minutes` 720→60**(A2.3,行为变更,记入默认值变更表)。
-3. **tier 加权汇聚**(A2.4):新 key `tier_weights = {"low":1.0,"medium":1.5,"high":2.0,"extreme":3.0}`;有效钱包数 = Σ tier_weight(优先用 cluster_adjusted 名单);`min_wallet_count` 改为对加权和判定;tier 同时进入 score。
-   - ⚠️ 关联已知问题:`docs/analysis-wallet-consensus-chain.md` 记录"**medium tier 永不产生**"(`_tier_for_count` 只出 EXTREME/HIGH/WATCH,watch→low)。实现 tier_weights 时**先核实该问题是否属实**;若属实,在产出文件里记录(修不修另行决策,本 spec 不要求改 wallet_intelligence)。
+3. **tier 加权汇聚**(A2.4):新 key `tier_weights`;有效钱包数 = Σ tier_weight(优先用 cluster_adjusted 名单);`min_wallet_count` 改为对加权和判定;tier 同时进入 score。
+   - 🔴 **前置事实(架构师已核实,勿再假设)**:**`medium` tier 永远不会产生**。`ConfluenceDetector._tier_for_count` 只输出 `EXTREME`(≥6 钱包)/`HIGH`(≥4)/`WATCH`(其余),而 `WATCH` 经 `normalize_trader_tier` 落为 `low`(canonical 集不含 watch)。详见 `docs/analysis-wallet-consensus-chain.md` 第 1 条。
+   - ⇒ 因此 `tier_weights` **不得**照抄 `{"low":1.0,"medium":1.5,"high":2.0,"extreme":3.0}` —— 其中 `medium:1.5` 是死权重。
+   - **本 spec 的裁决**:`tier_weights` 只定义**实际会出现的三档** `{"low":1.0,"high":2.0,"extreme":3.0}`;查表时对未知 tier 取 `low` 的权重作保守兜底。**不要**为了让 medium 生效而去改 `wallet_intelligence._tier_for_count` 的分档 —— 那会改变所有既有信号的 tier 分布,属独立的行为变更,需单独决策与 shadow 对照,不在本批次范围。在产出文件里记录此点。
 4. **重复计算去除**(A2.5):`build_opportunities_from_firehose` 不对已过滤行重跑 `evaluate_firehose_signal`;`normalize_trader_signal` 每行至多一次;`_effective_config()` 按 config 版本 memoize。
    - ⚠️ 与 fix-03 的交互:fix-03 在 pipeline 中**特意移除了提前 normalize**(避免把"缺键"变成"显式全 False")。去重时**不得**恢复那个提前 normalize。
 5. **实例态竞态**(A2.6):`self._confluence_strength` 改为经 payload/params 传递到 compute_score/compute_size。
