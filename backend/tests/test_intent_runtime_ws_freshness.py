@@ -908,6 +908,68 @@ def test_build_signal_contract_strips_market_history_from_durable_payload():
     assert "oracle_history" not in roster_market
 
 
+def test_build_signal_contract_promotes_crypto_strategy_origin_to_payload():
+    opportunity = Opportunity(
+        strategy="btc_eth_directional_edge",
+        title="BTC directional edge",
+        description="Producer origin regression",
+        total_cost=0.42,
+        expected_payout=1.0,
+        gross_profit=0.58,
+        fee=0.0,
+        net_profit=0.58,
+        roi_percent=10.0,
+        markets=[{"id": "btc-market", "question": "BTC up?"}],
+        positions_to_take=[
+            {
+                "market_id": "btc-market",
+                "token_id": "btc-yes-token",
+                "outcome": "YES",
+                "side": "buy",
+                "price": 0.42,
+                "_crypto_context": {"strategy_origin": "crypto_worker"},
+            }
+        ],
+        strategy_context={"strategy_origin": "crypto_worker", "asset": "BTC"},
+    )
+
+    _market_id, _direction, _entry_price, _market_question, payload, _strategy_context = (
+        build_signal_contract_from_opportunity(opportunity)
+    )
+
+    assert payload["strategy_origin"] == "crypto_worker"
+
+
+def test_build_signal_contract_does_not_invent_strategy_origin_for_unmarked_opportunity():
+    opportunity = Opportunity(
+        strategy="generic_contract",
+        title="Generic signal",
+        description="No producer origin",
+        total_cost=0.42,
+        expected_payout=1.0,
+        gross_profit=0.58,
+        fee=0.0,
+        net_profit=0.58,
+        roi_percent=10.0,
+        markets=[{"id": "generic-market", "question": "Generic?"}],
+        positions_to_take=[
+            {
+                "market_id": "generic-market",
+                "token_id": "generic-token",
+                "outcome": "YES",
+                "side": "buy",
+                "price": 0.42,
+            }
+        ],
+    )
+
+    _market_id, _direction, _entry_price, _market_question, payload, _strategy_context = (
+        build_signal_contract_from_opportunity(opportunity)
+    )
+
+    assert "strategy_origin" not in payload
+
+
 @pytest.mark.asyncio
 async def test_publish_opportunities_uses_fresh_scanner_ws_quotes_without_post_arm_deferral(monkeypatch):
     published_batches: list[dict[str, object]] = []

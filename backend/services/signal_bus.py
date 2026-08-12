@@ -1007,6 +1007,23 @@ def build_signal_contract_from_opportunity(
         "positions_to_take": copy.deepcopy(list(getattr(opportunity, "positions_to_take", None) or [])),
         "strategy_context": copy.deepcopy(strategy_context),
     }
+    strategy_origin = str(strategy_context.get("strategy_origin") or "").strip()
+    if not strategy_origin:
+        for position in payload["positions_to_take"]:
+            if not isinstance(position, dict):
+                continue
+            crypto_context = position.get("_crypto_context")
+            if not isinstance(crypto_context, dict):
+                continue
+            strategy_origin = str(crypto_context.get("strategy_origin") or "").strip()
+            if strategy_origin:
+                break
+    if strategy_origin:
+        # Source-provenance gates consume the durable signal payload directly,
+        # before strategy helpers merge nested strategy/position contexts.
+        # Preserve the producer's explicit origin at that contract boundary;
+        # never synthesize one for an unmarked opportunity.
+        payload["strategy_origin"] = strategy_origin
     if plan is not None:
         payload["execution_plan"] = plan
 
