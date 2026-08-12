@@ -1465,6 +1465,20 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                     "min": 0,
                     "max": 1,
                 },
+                {
+                    "key": "min_wallet_count",
+                    "label": "Min Weighted Wallet Count",
+                    "type": "number",
+                    "min": 1,
+                    "phase": "signal",
+                    "description": "Minimum tier-weighted wallet count after cluster adjustment.",
+                },
+                {
+                    "key": "tier_weights",
+                    "label": "Tier Weights",
+                    "type": "object",
+                    "description": "Wallet-count weights for low, medium, high, and extreme tiers.",
+                },
                 {"key": "risk_base_score", "label": "Base Risk Score", "type": "number", "min": 0, "max": 1},
                 *StrategySDK.trader_filter_config_schema().get("param_fields", []),
             ]
