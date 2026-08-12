@@ -855,6 +855,7 @@ class IntentRuntime:
                     "prewarm_waiting_for_strict_ws_quote",
                     "strict_ws_pricing_live_context_unavailable",
                     "strict_ws_pricing_signal_release_stale",
+                    "ws_subscribe_timeout",
                 }:
                     resolved_min_observed_at_iso = snapshot["deferred_started_at"]
                 if resolved_min_observed_at_iso:
@@ -1171,6 +1172,7 @@ class IntentRuntime:
             "prewarm_waiting_for_strict_ws_quote",
             "strict_ws_pricing_live_context_unavailable",
             "strict_ws_pricing_signal_release_stale",
+            "ws_subscribe_timeout",
         }:
             return self._tokens_have_fresh_ws_quotes(
                 list(snapshot.get("required_token_ids") or []),
@@ -1320,6 +1322,64 @@ class IntentRuntime:
                 ),
                 source=normalized_source,
             )
+
+    async def prewarm_execution_signals(
+        self,
+        signals: list[Any],
+        *,
+        timeout_seconds: float = _PREWARM_WAIT_TIMEOUT_SECONDS,
+    ) -> dict[str, str]:
+        """Subscribe executable signal tokens and report bounded-wait failures.
+
+        This runs in the trading process immediately before strict live-market
+        context is built.  Producer-side prewarming is not sufficient for
+        cross-plane ``traders`` signals because each process owns a distinct
+        feed manager and subscription set.
+        """
+        required_by_signal: dict[str, tuple[str, list[str]]] = {}
+        all_token_ids: list[str] = []
+        seen_tokens: set[str] = set()
+        failures: dict[str, str] = {}
+        for signal in signals:
+            signal_id = str(getattr(signal, "id", "") or "").strip()
+            if not signal_id:
+                continue
+            source = str(getattr(signal, "source", "") or "").strip().lower()
+            token_ids = _normalize_token_ids(
+                list(getattr(signal, "required_token_ids", None) or [])
+            )
+            if not token_ids:
+                payload = getattr(signal, "payload_json", None)
+                token_ids = _extract_required_token_ids(
+                    payload if isinstance(payload, dict) else {},
+                    direction=str(getattr(signal, "direction", "") or "").strip().lower(),
+                )
+            if not token_ids:
+                failures[signal_id] = "ws_token_id_missing"
+                continue
+            required_by_signal[signal_id] = (source, token_ids)
+            for token_id in token_ids:
+                if token_id in seen_tokens:
+                    continue
+                seen_tokens.add(token_id)
+                all_token_ids.append(token_id)
+
+        if all_token_ids:
+            await self._ensure_hot_subscriptions(all_token_ids)
+
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while required_by_signal:
+            waiting: dict[str, tuple[str, list[str]]] = {}
+            for signal_id, (source, token_ids) in required_by_signal.items():
+                if not self._tokens_have_fresh_ws_quotes(token_ids, source=source):
+                    waiting[signal_id] = (source, token_ids)
+            if not waiting:
+                break
+            if time.monotonic() >= deadline:
+                failures.update({signal_id: "ws_subscribe_timeout" for signal_id in waiting})
+                break
+            await asyncio.sleep(_PREWARM_WAIT_POLL_SECONDS)
+        return failures
 
     def _on_ws_price_update(
         self,
@@ -1653,6 +1713,7 @@ class IntentRuntime:
             "awaiting_post_arm_ws_tick",
             "prewarm_waiting_for_strict_ws_quote",
             "strict_ws_pricing_live_context_unavailable",
+            "ws_subscribe_timeout",
         }
         async with self._lock:
             all_deferred_signal_ids: set[str] = set()

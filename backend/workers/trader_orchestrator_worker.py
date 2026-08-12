@@ -5966,6 +5966,7 @@ async def _run_trader_once_inner(
             live_context_timeout_seconds: Optional[float] = None
             context_candidates: list[Any] = []
             fallback_candidates: list[Any] = []
+            ws_prewarm_failures: dict[str, str] = {}
             if enable_live_market_context:
                 for sig in signals:
                     if str(sig.id) in occupied_signal_ids or str(sig.id) in cooldown_signal_ids:
@@ -5980,6 +5981,25 @@ async def _run_trader_once_inner(
                     source_config = source_configs.get(sig_source)
                     if _supports_live_market_context(sig, source_config):
                         context_candidates.append(sig)
+
+                if strict_ws_pricing_enforced:
+                    traders_ws_candidates = [
+                        sig
+                        for sig in fallback_candidates
+                        if normalize_source_key(getattr(sig, "source", "")) == "traders"
+                    ]
+                    if traders_ws_candidates:
+                        runtime = get_intent_runtime()
+                        ws_prewarm_failures = await runtime.prewarm_execution_signals(
+                            traders_ws_candidates,
+                        )
+                        if ws_prewarm_failures:
+                            timed_out_ids = set(ws_prewarm_failures)
+                            fallback_candidates = [
+                                sig
+                                for sig in fallback_candidates
+                                if str(getattr(sig, "id", "") or "") not in timed_out_ids
+                            ]
 
                 async def _load_live_contexts() -> dict[str, dict[str, Any]]:
                     loaded_contexts: dict[str, dict[str, Any]] = {}
@@ -6193,6 +6213,30 @@ async def _run_trader_once_inner(
                 assignment_group: str | None = None
                 assignment_sample_pct: float | None = None
                 assignment_source = "pinned_config"
+
+                ws_prewarm_reason = ws_prewarm_failures.get(signal_id)
+                if ws_prewarm_reason:
+                    _enter_stage("ws_subscription_prewarm")
+                    runtime = get_intent_runtime()
+                    required_token_ids = list(getattr(signal, "required_token_ids", None) or [])
+                    if hasattr(runtime, "defer_signal"):
+                        await runtime.defer_signal(
+                            signal_id=signal_id,
+                            required_token_ids=required_token_ids,
+                            reason=ws_prewarm_reason,
+                        )
+                    deferred_signals += 1
+                    deferred_by_reason[ws_prewarm_reason] = deferred_by_reason.get(ws_prewarm_reason, 0) + 1
+                    defer_signal_processing = True
+                    logger.warning(
+                        "Trader signal deferred before strict pricing",
+                        trader_id=trader_id,
+                        signal_id=signal_id,
+                        source=signal_source,
+                        reason=ws_prewarm_reason,
+                        required_token_ids=required_token_ids,
+                    )
+                    break
 
                 try:
                     _enter_stage("signal_persist")
