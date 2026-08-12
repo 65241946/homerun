@@ -1505,7 +1505,7 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                     "key": "tier_weights",
                     "label": "Tier Weights",
                     "type": "object",
-                    "description": "Wallet-count weights for low, medium, high, and extreme tiers.",
+                    "description": "Wallet-count weights for produced low, high, and extreme tiers; unknown tiers use low.",
                 },
                 {"key": "risk_base_score", "label": "Base Risk Score", "type": "number", "min": 0, "max": 1},
                 *StrategySDK.trader_filter_config_schema().get("param_fields", []),

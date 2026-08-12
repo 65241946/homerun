@@ -213,7 +213,11 @@ def test_confluence_default_age_and_weight_schema_are_reconciled() -> None:
     assert TradersConfluenceStrategy.DEFAULT_CONFIG["firehose_max_age_minutes"] == 60
     assert TradersConfluenceStrategy.DEFAULT_CONFIG["tier_weights"] == {
         "low": 1.0,
-        "medium": 1.5,
+        "high": 2.0,
+        "extreme": 3.0,
+    }
+    assert TradersConfluenceStrategy._normalize_tier_weights({"medium": 9.0}) == {
+        "low": 1.0,
         "high": 2.0,
         "extreme": 3.0,
     }
@@ -226,6 +230,7 @@ def test_confluence_default_age_and_weight_schema_are_reconciled() -> None:
     fields = {field["key"]: field for field in row["config_schema"]["param_fields"]}
     assert "weighted" in fields["min_wallet_count"]["description"].lower()
     assert fields["tier_weights"]["type"] in {"object", "json"}
+    assert "unknown tiers use low" in fields["tier_weights"]["description"].lower()
 
     at_limit = TradersConfluenceStrategy().evaluate_firehose_signal(
         _qualified_signal(firehose_age_minutes=60.0)
