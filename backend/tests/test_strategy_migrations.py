@@ -381,6 +381,28 @@ def test_btc_eth_directional_edge_source_origin_rejects_non_crypto():
     assert result.reason == "btc_eth_edge_source_origin"
 
 
+def test_btc_eth_directional_edge_source_origin_rejects_unmarked_crypto_opportunity():
+    from services.strategies.btc_eth_directional_edge import (
+        BtcEthDirectionalEdgeStrategy,
+    )
+
+    gate = next(
+        g
+        for g in BtcEthDirectionalEdgeStrategy().get_pre_submit_gates()
+        if g.name == "btc_eth_edge_source_origin"
+    )
+    signal = SimpleNamespace(
+        source="crypto",
+        signal_type="crypto_opportunity",
+        payload_json={},
+    )
+
+    result = _run_sync(gate, _ctx(runtime_signal=signal, signal_payload={}))
+
+    assert result.passed is False
+    assert result.reason == "btc_eth_edge_source_origin"
+
+
 def test_btc_eth_directional_edge_source_origin_accepts_crypto_worker():
     from services.strategies.btc_eth_directional_edge import (
         BtcEthDirectionalEdgeStrategy,
