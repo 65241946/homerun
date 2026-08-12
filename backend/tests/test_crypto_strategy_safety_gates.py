@@ -48,7 +48,7 @@ def _fresh_btc_row(*, seconds_left: float = 240.0, **overrides):
         },
         "market_data_age_ms": 800.0,
         "liquidity": 5000.0,
-        "move_5m_percent": 6.0,
+        "move_5m_percent": 10.0,
         "move_30m_percent": 1.0,
         "move_2h_percent": 0.5,
         "spread": 0.012,
@@ -146,6 +146,8 @@ def _entropy_cfg(strategy: CryptoEntropyMakerStrategy) -> dict:
 
 def test_entropy_happy_path_uses_binance_direct(entropy_strategy):
     row = _fresh_btc_row(up_price=0.49, down_price=0.51)
+    row["oracle_price"] = 84000.0
+    row["oracle_prices_by_source"]["binance_direct"]["price"] = 84000.0
     signal = entropy_strategy._score_market(row, _entropy_cfg(entropy_strategy))
     assert signal is not None
     assert signal["oracle_source_used"] == "binance_direct"

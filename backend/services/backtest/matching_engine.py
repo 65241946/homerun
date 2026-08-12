@@ -204,7 +204,7 @@ class FeeModel:
     negrisk_conversion_gas_usd: float = 0.01
     maker_rebate_bps: float = 0.0
     maker_rebate_max_spread_bps: float = 50.0
-    # Charge taker fills from Polymarket's published quadratic taker-fee
+    # Charge taker fills from Polymarket's published category-rate taker-fee
     # curve (utils.kelly.polymarket_taker_fee) — the SAME curve the
     # strategies gate on, so backtest fees match what the strategy assumed.
     # ``crypto_fee_multiplier`` scales it for any market-specific surcharge.
@@ -262,6 +262,7 @@ class FeeModel:
             from utils.kelly import polymarket_taker_fee
 
             taker_fee = (
+                # Backtest orders do not carry market category metadata; use the conservative default rate.
                 polymarket_taker_fee(float(price))
                 * float(size)
                 * max(0.0, float(self.crypto_fee_multiplier))

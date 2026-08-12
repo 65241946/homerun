@@ -341,12 +341,8 @@ class CryptoSpikeReversionStrategy(BaseStrategy):
             + (min(1.0, liquidity / 20000.0) * 4.0)
         )
 
-        # ---- Fee-aware net edge: use the docs-accurate Polymarket taker
-        # curve (`p * 0.25 * (p*(1-p))^2`) rather than a flat 0.25% guess.
-        # At p=0.30 the real fee is ~1.10%, at p=0.50 it's ~1.56%, so the old
-        # constant was 4-6× too low at typical entry prices and would let
-        # marginal trades through with negative true edge.
-        taker_fee_pct_value = polymarket_taker_fee_pct(selected_price) * 100.0
+        # ---- Fee-aware net edge uses the current Polymarket crypto fee rate.
+        taker_fee_pct_value = polymarket_taker_fee_pct(selected_price, category="crypto") * 100.0
         net_edge_percent = max(0.0, edge - taker_fee_pct_value)
 
         # Hard fee-clearance gate: refuse trades whose raw edge can't clear

@@ -127,6 +127,7 @@ class FeeModel:
                 max(0.0, min(1.0, float(p))) for p in (entry_prices or []) if isinstance(p, (int, float))
             ]
             if normalized_prices and venue == "polymarket":
+                # This generic fee API has no market category; use the conservative default rate.
                 winner_fee = _to_decimal(sum(polymarket_taker_fee(price) for price in normalized_prices))
             elif normalized_prices and venue == "kalshi":
                 winner_fee = _to_decimal(sum(kalshi_taker_fee(price, contracts=1) for price in normalized_prices))

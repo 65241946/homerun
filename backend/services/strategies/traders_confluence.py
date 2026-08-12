@@ -144,6 +144,14 @@ class TradersConfluenceStrategy(BaseStrategy):
         return default
 
     @staticmethod
+    def _has_source_provenance(signal: dict) -> bool:
+        source_flags = signal.get("source_flags")
+        return isinstance(source_flags, dict) and any(
+            key in source_flags
+            for key in ("from_pool", "from_tracked_traders", "qualified")
+        )
+
+    @staticmethod
     def _has_direction(signal: dict) -> bool:
         outcome = str(signal.get("outcome") or "").strip().upper()
         if outcome in {"YES", "NO"}:
@@ -320,11 +328,20 @@ class TradersConfluenceStrategy(BaseStrategy):
         if not signals:
             return []
 
-        rows = [StrategySDK.normalize_trader_signal(dict(row)) for row in signals if isinstance(row, dict)]
+        rows: list[dict] = []
+        for signal in signals:
+            if not isinstance(signal, dict):
+                continue
+            has_source_provenance = self._has_source_provenance(signal)
+            row = StrategySDK.normalize_trader_signal(dict(signal))
+            if not has_source_provenance:
+                row.pop("source_flags", None)
+            rows.append(row)
         if not rows:
             return []
 
         for row in rows:
+            has_source_provenance = self._has_source_provenance(row)
             market_id = normalize_market_id(row.get("market_id")) or ""
             row["market_id"] = market_id
             row["firehose_market_tradable"] = self._is_market_tradable(row)
@@ -332,6 +349,8 @@ class TradersConfluenceStrategy(BaseStrategy):
             row["firehose_age_minutes"] = self._age_minutes(row)
             row["firehose_confidence"] = self._confidence(row)
             row.update(StrategySDK.normalize_trader_signal(row))
+            if not has_source_provenance:
+                row.pop("source_flags", None)
 
         return rows
 
@@ -346,7 +365,9 @@ class TradersConfluenceStrategy(BaseStrategy):
         This gate is the source of truth for Traders opportunities filtering.
         """
         config = cfg or self._effective_config()
-        signal = StrategySDK.normalize_trader_signal(signal if isinstance(signal, dict) else {})
+        raw_signal = signal if isinstance(signal, dict) else {}
+        has_source_provenance = self._has_source_provenance(raw_signal)
+        signal = StrategySDK.normalize_trader_signal(raw_signal)
         checks: dict[str, bool] = {}
         reasons: list[str] = []
 
@@ -373,10 +394,14 @@ class TradersConfluenceStrategy(BaseStrategy):
             reasons.append("price_out_of_bounds")
 
         source_flags = signal.get("source_flags") or {}
+        checks["has_source_provenance"] = has_source_provenance
+        if not has_source_provenance:
+            reasons.append("missing_source_provenance")
+
         qualified = bool(source_flags.get("qualified", True))
         require_qualified = self._to_bool(config.get("firehose_require_qualified_source"), True)
         checks["has_qualified_source"] = qualified or (not require_qualified)
-        if require_qualified and not qualified:
+        if has_source_provenance and require_qualified and not qualified:
             reasons.append("unqualified_wallet_source")
 
         scope = StrategySDK.normalize_trader_source_scope(config.get("firehose_source_scope"), default="all")
@@ -389,7 +414,7 @@ class TradersConfluenceStrategy(BaseStrategy):
         else:
             source_scope_ok = from_tracked or from_pool
         checks["matches_source_scope"] = source_scope_ok
-        if not source_scope_ok:
+        if has_source_provenance and not source_scope_ok:
             reasons.append("source_scope_mismatch")
 
         signal_active = bool(signal.get("is_active", True))
@@ -405,7 +430,13 @@ class TradersConfluenceStrategy(BaseStrategy):
             reasons.append("market_not_tradable")
 
         is_crypto = bool(signal.get("firehose_is_crypto", False))
-        exclude_crypto = self._to_bool(config.get("firehose_exclude_crypto_markets"), True)
+        exclude_crypto = self._to_bool(
+            config.get(
+                "firehose_exclude_crypto_markets",
+                self.DEFAULT_CONFIG["firehose_exclude_crypto_markets"],
+            ),
+            self.DEFAULT_CONFIG["firehose_exclude_crypto_markets"],
+        )
         checks["not_crypto_market"] = (not is_crypto) or (not exclude_crypto)
         if exclude_crypto and is_crypto:
             reasons.append("crypto_market_excluded")
@@ -422,7 +453,7 @@ class TradersConfluenceStrategy(BaseStrategy):
         if confidence < min_conf:
             reasons.append("confidence_below_threshold")
 
-        min_tier = self._tier_value(config.get("min_tier", "high"))
+        min_tier = self._tier_value(config.get("min_tier", self.DEFAULT_CONFIG["min_tier"]))
         signal_tier = self._tier_value(signal.get("tier", "low"))
         checks["meets_min_tier"] = signal_tier >= min_tier
         if signal_tier < min_tier:
@@ -468,8 +499,9 @@ class TradersConfluenceStrategy(BaseStrategy):
         for signal in signals:
             if not isinstance(signal, dict):
                 continue
-            row = StrategySDK.normalize_trader_signal(dict(signal))
-            passed, reasons, checks = self.evaluate_firehose_signal(row, cfg=cfg)
+            raw_signal = dict(signal)
+            row = StrategySDK.normalize_trader_signal(raw_signal)
+            passed, reasons, checks = self.evaluate_firehose_signal(raw_signal, cfg=cfg)
             row["validation"] = {
                 "is_valid": passed,
                 "is_actionable": passed,
@@ -723,7 +755,6 @@ class TradersConfluenceStrategy(BaseStrategy):
         signals = await StrategySDK.get_trader_firehose_signals(
             limit=250,
             include_filtered=True,
-            include_source_context=False,
         )
         if not signals:
             return []
@@ -806,7 +837,13 @@ class TradersConfluenceStrategy(BaseStrategy):
         else:
             channel = signal_type or "unknown"
 
-        min_confluence_strength = to_confidence(params.get("min_confluence_strength", 0.55), 0.55)
+        min_confluence_strength = to_confidence(
+            params.get(
+                "min_confluence_strength",
+                self.DEFAULT_CONFIG["min_confluence_strength"],
+            ),
+            self.DEFAULT_CONFIG["min_confluence_strength"],
+        )
         confluence_strength = to_confidence(
             payload.get(
                 "strength",

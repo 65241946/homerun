@@ -1822,6 +1822,7 @@ class BaseStrategy(ABC):
         """Return edge percent after platform taker fees."""
 
         if platform == "polymarket":
+            # This generic edge helper receives no market category; use the conservative default rate.
             fee = polymarket_taker_fee(entry_price)
         elif platform == "kalshi":
             fee = kalshi_taker_fee(entry_price)

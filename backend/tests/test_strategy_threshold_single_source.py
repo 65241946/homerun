@@ -59,8 +59,8 @@ def test_ctf_detect_and_evaluate_share_configured_edge_threshold():
         [],
         [market],
         {
-            "ctf-yes": {"bid": 0.515, "ask": 0.60},
-            "ctf-no": {"bid": 0.515, "ask": 0.60},
+            "ctf-yes": {"bid": 0.522, "ask": 0.60},
+            "ctf-no": {"bid": 0.522, "ask": 0.60},
         },
     )
     assert len(opportunities) == 1
@@ -83,8 +83,8 @@ def test_ctf_detect_and_evaluate_share_configured_edge_threshold():
         [],
         [market],
         {
-            "ctf-yes": {"bid": 0.515, "ask": 0.60},
-            "ctf-no": {"bid": 0.515, "ask": 0.60},
+            "ctf-yes": {"bid": 0.522, "ask": 0.60},
+            "ctf-no": {"bid": 0.522, "ask": 0.60},
         },
     ) == []
     blocked = strategy.evaluate(
