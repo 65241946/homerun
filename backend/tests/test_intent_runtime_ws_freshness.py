@@ -189,6 +189,107 @@ async def test_ensure_hot_subscriptions_seeds_every_missing_cache_entry(monkeypa
     assert [call.args[0] for call in seed_mock.await_args_list] == token_ids
 
 
+@pytest.mark.asyncio
+async def test_prewarm_execution_signals_subscribes_traders_token_and_reports_timeout(monkeypatch):
+    subscribe_mock = AsyncMock(return_value=None)
+
+    class _Cache:
+        def is_fresh(self, token_id: str, *, max_age_seconds: float | None = None) -> bool:
+            assert token_id == "traders-token"
+            assert max_age_seconds is not None
+            return False
+
+        def get_mid_price(self, token_id: str):
+            assert token_id == "traders-token"
+            return None
+
+    feed_manager = SimpleNamespace(
+        _started=True,
+        cache=_Cache(),
+        get_order_book=AsyncMock(return_value=None),
+        polymarket_feed=SimpleNamespace(
+            subscribe=subscribe_mock,
+            _subscribed_assets=set(),
+        ),
+    )
+    monkeypatch.setattr("services.intent_runtime.get_feed_manager", lambda: feed_manager)
+
+    runtime = IntentRuntime()
+    signal = SimpleNamespace(
+        id="traders-signal-1",
+        source="traders",
+        direction="buy_yes",
+        required_token_ids=["traders-token"],
+        payload_json={"selected_token_id": "traders-token"},
+    )
+
+    failures = await runtime.prewarm_execution_signals([signal], timeout_seconds=0.0)
+
+    subscribe_mock.assert_awaited_once_with(["traders-token"])
+    assert failures == {"traders-signal-1": "ws_subscribe_timeout"}
+
+
+@pytest.mark.asyncio
+async def test_prewarm_execution_signals_accepts_fresh_ws_price(monkeypatch):
+    subscribe_mock = AsyncMock(return_value=None)
+
+    class _Cache:
+        def is_fresh(self, token_id: str, *, max_age_seconds: float | None = None) -> bool:
+            return token_id == "traders-token" and max_age_seconds is not None
+
+        def get_mid_price(self, token_id: str):
+            return 0.42 if token_id == "traders-token" else None
+
+    feed_manager = SimpleNamespace(
+        _started=True,
+        cache=_Cache(),
+        get_order_book=AsyncMock(return_value=None),
+        polymarket_feed=SimpleNamespace(
+            subscribe=subscribe_mock,
+            _subscribed_assets=set(),
+        ),
+    )
+    monkeypatch.setattr("services.intent_runtime.get_feed_manager", lambda: feed_manager)
+
+    runtime = IntentRuntime()
+    signal = SimpleNamespace(
+        id="traders-signal-2",
+        source="traders",
+        direction="buy_yes",
+        required_token_ids=[],
+        payload_json={"positions_to_take": [{"token_id": "traders-token"}]},
+    )
+
+    failures = await runtime.prewarm_execution_signals([signal], timeout_seconds=0.0)
+
+    subscribe_mock.assert_awaited_once_with(["traders-token"])
+    assert failures == {}
+
+
+def test_ws_subscribe_timeout_deferred_signal_becomes_ready_on_fresh_tick(monkeypatch):
+    class _Cache:
+        def is_fresh(self, token_id: str, *, max_age_seconds: float | None = None) -> bool:
+            return token_id == "traders-token" and max_age_seconds is not None
+
+        def get_mid_price(self, token_id: str):
+            return 0.42 if token_id == "traders-token" else None
+
+    monkeypatch.setattr(
+        "services.intent_runtime.get_feed_manager",
+        lambda: SimpleNamespace(_started=True, cache=_Cache()),
+    )
+    runtime = IntentRuntime()
+    snapshot = {
+        "id": "traders-signal-3",
+        "source": "traders",
+        "deferred_reason": "ws_subscribe_timeout",
+        "required_token_ids": ["traders-token"],
+        "payload_json": {},
+    }
+
+    assert runtime._snapshot_ready_for_runtime(snapshot) is True
+
+
 def test_snapshot_has_strict_scanner_live_market_accepts_current_subscription_without_recent_tick():
     snapshot = {
         "source": "scanner",
