@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { QueryClient, QueryKey } from '@tanstack/react-query'
+import { isFirehoseTraderEvent, mergeTraderEventRows, type TraderEventCacheRow } from '../lib/traderEventCache'
 
 type WSMessage = {
   type?: string
@@ -14,6 +15,8 @@ type RealtimeContext = {
 }
 
 const INVALIDATION_DEBOUNCE_MS = 120
+const TRADER_EVENT_FLUSH_MS = 250
+const TRADER_EVENT_CACHE_MAX_ROWS = 800
 
 export function useRealtimeInvalidation(
   lastMessage: WSMessage,
@@ -23,6 +26,61 @@ export function useRealtimeInvalidation(
 ) {
   const pendingInvalidationsRef = useRef<Map<string, QueryKey>>(new Map())
   const flushTimerRef = useRef<number | null>(null)
+  const pendingTraderEventsRef = useRef<Map<string, TraderEventCacheRow>>(new Map())
+  const traderEventFlushTimerRef = useRef<number | null>(null)
+  const pendingTraderOverviewRefreshRef = useRef(false)
+
+  const flushTraderEvents = useCallback(() => {
+    if (traderEventFlushTimerRef.current != null) {
+      window.clearTimeout(traderEventFlushTimerRef.current)
+      traderEventFlushTimerRef.current = null
+    }
+    if (pendingTraderEventsRef.current.size < 1) return
+
+    const incomingEvents = Array.from(pendingTraderEventsRef.current.values())
+    pendingTraderEventsRef.current.clear()
+    const refreshOverview = pendingTraderOverviewRefreshRef.current
+    pendingTraderOverviewRefreshRef.current = false
+    const mergeRows = (current: unknown) => (
+      mergeTraderEventRows(current, incomingEvents, TRADER_EVENT_CACHE_MAX_ROWS)
+    )
+    queryClient.setQueriesData({ queryKey: ['trader-events-all'] }, mergeRows)
+
+    const eventsByTraderId = new Map<string, TraderEventCacheRow[]>()
+    for (const event of incomingEvents) {
+      const traderId = String(event.trader_id || '').trim()
+      if (!traderId) continue
+      const rows = eventsByTraderId.get(traderId) || []
+      rows.push(event)
+      eventsByTraderId.set(traderId, rows)
+    }
+    for (const [traderId, events] of eventsByTraderId) {
+      queryClient.setQueryData(['trader-events', traderId], (current: unknown) => (
+        mergeTraderEventRows(current, events, TRADER_EVENT_CACHE_MAX_ROWS)
+      ))
+    }
+    if (refreshOverview) {
+      queryClient.invalidateQueries({ queryKey: ['trader-orchestrator-overview'] })
+    }
+  }, [queryClient])
+
+  const queueTraderEvent = useCallback((incomingEvent: unknown, refreshOverview: boolean) => {
+    if (!incomingEvent || typeof incomingEvent !== 'object') return
+    const event = incomingEvent as TraderEventCacheRow
+    const incomingId = String(event.id || '').trim()
+    if (!incomingId) return
+
+    const previous = pendingTraderEventsRef.current.get(incomingId)
+    pendingTraderEventsRef.current.delete(incomingId)
+    pendingTraderEventsRef.current.set(incomingId, {
+      ...(previous || {}),
+      ...event,
+      payload: event.payload ?? previous?.payload,
+    })
+    pendingTraderOverviewRefreshRef.current ||= refreshOverview
+    if (traderEventFlushTimerRef.current != null) return
+    traderEventFlushTimerRef.current = window.setTimeout(flushTraderEvents, TRADER_EVENT_FLUSH_MS)
+  }, [flushTraderEvents])
 
   const flushInvalidations = useCallback(() => {
     if (flushTimerRef.current != null) {
@@ -65,6 +123,11 @@ export function useRealtimeInvalidation(
       if (flushTimerRef.current != null) {
         window.clearTimeout(flushTimerRef.current)
       }
+      if (traderEventFlushTimerRef.current != null) {
+        window.clearTimeout(traderEventFlushTimerRef.current)
+      }
+      pendingTraderEventsRef.current.clear()
+      pendingTraderOverviewRefreshRef.current = false
     }
   }, [])
 
@@ -174,40 +237,6 @@ export function useRealtimeInvalidation(
       const traderId = String(incomingDecision.trader_id || '').trim()
       if (traderId) {
         queryClient.setQueryData(['trader-decisions', traderId], normalizeRows)
-      }
-    }
-
-    const upsertTraderEventCache = (incomingEvent: any) => {
-      if (!incomingEvent || typeof incomingEvent !== 'object') return
-      const incomingId = String(incomingEvent.id || '').trim()
-      if (!incomingId) return
-      const normalizeRows = (old: any) => {
-        if (!Array.isArray(old)) return old
-        let found = false
-        const nextRows = old.map((row: any) => {
-          const rowId = String(row?.id || '').trim()
-          if (rowId !== incomingId) return row
-          found = true
-          return {
-            ...row,
-            ...incomingEvent,
-            payload: incomingEvent.payload ?? row?.payload ?? {},
-          }
-        })
-        if (!found) {
-          nextRows.unshift({
-            ...incomingEvent,
-            payload: incomingEvent.payload ?? {},
-          })
-        }
-        return nextRows
-          .sort((a: any, b: any) => toTs(b?.created_at) - toTs(a?.created_at))
-          .slice(0, 800)
-      }
-      queryClient.setQueriesData({ queryKey: ['trader-events-all'] }, normalizeRows)
-      const traderId = String(incomingEvent.trader_id || '').trim()
-      if (traderId) {
-        queryClient.setQueryData(['trader-events', traderId], normalizeRows)
       }
     }
 
@@ -622,12 +651,7 @@ export function useRealtimeInvalidation(
       ])
     }
     if (messageType === 'trader_event') {
-      upsertTraderEventCache(lastMessage.data)
-      if (viewingTrading) {
-        queueInvalidations([
-          ['trader-orchestrator-overview'],
-        ])
-      }
+      queueTraderEvent(lastMessage.data, viewingTrading && !isFirehoseTraderEvent(lastMessage.data))
     }
-  }, [context.activeTab, context.opportunitiesView, lastMessage, queryClient, queueInvalidations, setScannerActivity])
+  }, [context.activeTab, context.opportunitiesView, lastMessage, queryClient, queueInvalidations, queueTraderEvent, setScannerActivity])
 }
