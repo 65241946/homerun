@@ -50,9 +50,12 @@ from services.strategy_helpers.cycle_tracker import CycleTracker
 from services.strategy_helpers.crypto_strategy_utils import (
     build_binary_crypto_market,
     pick_oracle_source,
+    realized_vol_per_sec,
+    timeframe_seconds,
 )
 from services.strategy_sdk import StrategySDK
 from utils.converters import to_float
+from utils.kelly import polymarket_taker_fee
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -99,6 +102,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Reject Chainlink readings older than this. Chainlink heartbeats
     # at ~250ms-2s; we want a fresh reading at the decision moment.
     "max_oracle_age_ms": 5000,
+    "win_prob_estimate": 0.80,
     # Master switch (also exposed at the row level via Strategy.enabled).
     "enabled": True,
 }
@@ -191,6 +195,15 @@ def crypto_5m_midcycle_config_schema() -> dict[str, Any]:
                 "default": 5_000,
                 "phase": "signal",
             },
+            {
+                "key": "win_prob_estimate",
+                "label": "Fallback Win Probability",
+                "type": "number",
+                "min": 0.0,
+                "max": 1.0,
+                "default": 0.80,
+                "phase": "signal",
+            },
         ]
     }
 
@@ -256,7 +269,6 @@ class Crypto5mMidcycleStrategy(BaseStrategy):
     def __init__(self) -> None:
         super().__init__()
         self.min_profit = 0.0
-        self.fee = 0.0
         # Per-market CycleTracker — fires the midcycle milestone exactly
         # once per cycle and self-resets on cycle rollover.
         self._cycle_trackers: dict[str, CycleTracker] = {}
@@ -384,12 +396,13 @@ class Crypto5mMidcycleStrategy(BaseStrategy):
         # Gate 3: midcycle milestone crossed.  This fires once per cycle
         # — most ticks of crypto_update don't cross it, so most
         # evaluations rest here.  WHISPER only.
+        cycle_seconds = float(timeframe_seconds(market.get("timeframe")))
         tracker = self._cycle_trackers.get(market_id)
-        if tracker is None or tracker.cycle_seconds != 300.0:
-            tracker = CycleTracker(cycle_seconds=300.0, milestones_s=(midcycle_s,))
+        if tracker is None or tracker.cycle_seconds != cycle_seconds:
+            tracker = CycleTracker(cycle_seconds=cycle_seconds, milestones_s=(midcycle_s,))
             self._cycle_trackers[market_id] = tracker
         crossed = tracker.crossed(end_ms_value, now_ms=now_ms)
-        seconds_into_cycle = max(0.0, 300.0 - (end_ms_value - now_ms) / 1000.0)
+        seconds_into_cycle = max(0.0, cycle_seconds - (end_ms_value - now_ms) / 1000.0)
         milestone_passed = midcycle_s in crossed
         gates.append(GateResult(
             "midcycle_crossed", "Midcycle milestone crossed", milestone_passed,
@@ -512,10 +525,23 @@ class Crypto5mMidcycleStrategy(BaseStrategy):
         # All gates passed — build the Opportunity.
         edge_per_share = 1.0 - vwap_price  # max possible profit per share
         edge_percent = (edge_per_share / vwap_price) * 100.0 if vwap_price > 0 else 0.0
-        # Expected payout reflects the report's empirical 80% win rate
-        # at this filter strength, NOT a guaranteed $1.
-        win_prob_estimate = 0.80
+        win_prob_estimate = float(self.config.get("win_prob_estimate", 0.80))
+        history = market.get("oracle_history")
+        if isinstance(history, list) and len(history) >= 3:
+            sigma, _, _ = realized_vol_per_sec(
+                history,
+                now_ms=now_ms,
+                lookback_seconds=cycle_seconds,
+                min_intervals=2,
+                min_span_seconds=0.0,
+            )
+            if sigma is not None:
+                prob_up = StrategySDK.prob_above(spot, reference, sigma, seconds_left)
+                if prob_up is not None:
+                    win_prob_estimate = prob_up if side == "YES" else 1.0 - prob_up
         expected_payout = win_prob_estimate * 1.0  # Polymarket pays $1 per winning share
+        taker_fee = polymarket_taker_fee(vwap_price, category="crypto")
+        net_ev_per_share = win_prob_estimate - vwap_price - taker_fee
         token_id = typed_market.clob_token_ids[0 if side == "YES" else 1]
 
         slug = str(market.get("slug") or market_id)
@@ -553,15 +579,16 @@ class Crypto5mMidcycleStrategy(BaseStrategy):
                         "side": side,
                         "bet_size_usd": bet_size_usd,
                         "win_prob_estimate": win_prob_estimate,
+                        "taker_fee": taker_fee,
+                        "net_ev_per_share": net_ev_per_share,
                     },
                 }
             ],
             is_guaranteed=False,
-            skip_fee_model=True,
-            custom_roi_percent=edge_percent * win_prob_estimate
-            - (1.0 - win_prob_estimate) * 100.0,
+            custom_roi_percent=(net_ev_per_share / vwap_price) * 100.0,
             custom_risk_score=1.0 - win_prob_estimate,
             confidence=win_prob_estimate,
+            fee_model_maker_mode=False,
         )
         if opp is None:
             emit_evaluation_nowait(
@@ -619,5 +646,7 @@ class Crypto5mMidcycleStrategy(BaseStrategy):
             "seconds_left": seconds_left,
             "bet_size_usd": bet_size_usd,
             "win_prob_estimate": win_prob_estimate,
+            "taker_fee": taker_fee,
+            "net_ev_per_share": net_ev_per_share,
         }
         return opp

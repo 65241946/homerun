@@ -346,6 +346,57 @@ def fee_aware_min_edge_pct(price: float, multiplier: float = 2.0) -> float:
     return polymarket_taker_fee_pct(price, category="crypto") * 100.0 * float(multiplier)
 
 
+def realized_vol_per_sec(
+    history: Any,
+    *,
+    now_ms: float,
+    lookback_seconds: float,
+    min_intervals: int,
+    min_span_seconds: float,
+) -> tuple[float | None, int, float]:
+    """Canonical realized volatility per second from irregular oracle samples."""
+    if not isinstance(history, list) or len(history) < 2:
+        return None, 0, 0.0
+    cutoff_ms = now_ms - lookback_seconds * 1000.0
+    points: list[tuple[float, float]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        timestamp_ms = safe_float(item.get("t"), None)
+        price = safe_float(item.get("p"), None)
+        if (
+            timestamp_ms is None
+            or price is None
+            or price <= 0.0
+            or timestamp_ms < cutoff_ms
+            or timestamp_ms > now_ms + 1000.0
+        ):
+            continue
+        points.append((timestamp_ms, price))
+    if len(points) < min_intervals + 1:
+        return None, max(0, len(points) - 1), 0.0
+    points.sort(key=lambda point: point[0])
+    span_seconds = (points[-1][0] - points[0][0]) / 1000.0
+    sum_squared_returns = 0.0
+    sum_seconds = 0.0
+    usable_intervals = 0
+    for (t0, p0), (t1, p1) in zip(points, points[1:]):
+        delta_seconds = (t1 - t0) / 1000.0
+        if delta_seconds <= 0.0 or delta_seconds > 60.0:
+            continue
+        log_return = math.log(p1 / p0)
+        sum_squared_returns += log_return * log_return
+        sum_seconds += delta_seconds
+        usable_intervals += 1
+    if (
+        usable_intervals < min_intervals
+        or sum_seconds <= 0.0
+        or span_seconds < min_span_seconds
+    ):
+        return None, usable_intervals, span_seconds
+    return math.sqrt(sum_squared_returns / sum_seconds), usable_intervals, span_seconds
+
+
 # ---------------------------------------------------------------------------
 # Resolution-boundary safety
 # ---------------------------------------------------------------------------

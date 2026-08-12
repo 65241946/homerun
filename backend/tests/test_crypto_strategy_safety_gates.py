@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import services.strategies.crypto_entropy_maker as entropy_module
+import services.strategies.crypto_spike_reversion as spike_module
 from services.strategies.crypto_entropy_maker import CryptoEntropyMakerStrategy
 from services.strategies.crypto_spike_reversion import CryptoSpikeReversionStrategy
 
@@ -119,6 +121,27 @@ def test_spike_uses_real_timeframe_for_elapsed_ratio(spike_strategy):
     signal = spike_strategy._score_market(row, dict(spike_strategy.default_config))
     assert signal is not None
     assert 0.45 <= signal["elapsed_ratio"] <= 0.55, signal["elapsed_ratio"]
+
+
+def test_spike_scoring_enforces_explicit_min_edge(spike_strategy):
+    cfg = dict(spike_strategy.default_config)
+    cfg["min_edge_percent"] = 100.0
+    assert spike_strategy._score_market(_fresh_btc_row(), cfg) is None
+    assert spike_strategy._last_rejection_reason == "min_edge"
+
+
+def test_spike_rejection_reason_comes_from_single_scoring_pass(monkeypatch, spike_strategy):
+    calls = 0
+
+    def _shape(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return False
+
+    monkeypatch.setattr(spike_module, "reversion_shape_ok", _shape)
+    assert spike_strategy._detect_from_rows([_fresh_btc_row()]) == []
+    assert calls == 1
+    assert spike_strategy._last_rejection_reason == "reversion_shape"
 
 
 # ---------------- entropy maker ----------------
@@ -234,3 +257,30 @@ def test_entropy_rejects_below_min_entry_price(entropy_strategy):
     # Not asserting truthy — other gates may still reject. The asymmetric
     # check above is what locks in the floor's behavior.
     assert signal is None or signal["entry_price"] >= 0.0
+
+
+def test_entropy_default_removes_mathematically_incompatible_gate(entropy_strategy):
+    row = _fresh_btc_row(up_price=0.20, down_price=0.80, oracle_price=77_400.0)
+    row["oracle_prices_by_source"]["binance_direct"]["price"] = 77_400.0
+    signal = entropy_strategy._score_market(row, dict(entropy_strategy.default_config))
+    assert signal is not None
+    strict_cfg = dict(entropy_strategy.default_config)
+    strict_cfg["min_entropy"] = 0.82
+    assert entropy_strategy._score_market(row, strict_cfg) is None
+    assert entropy_strategy._last_rejection_reason == "min_entropy"
+
+
+def test_entropy_rejection_reason_comes_from_single_scoring_pass(monkeypatch, entropy_strategy):
+    calls = 0
+    original = entropy_module._probability_entropy
+
+    def _entropy(probability):
+        nonlocal calls
+        calls += 1
+        return original(probability)
+
+    monkeypatch.setattr(entropy_module, "_probability_entropy", _entropy)
+    row = _fresh_btc_row(up_price=0.49, down_price=0.51, spread=None)
+    assert entropy_strategy._detect_from_rows([row]) == []
+    assert calls == 1
+    assert entropy_strategy._last_rejection_reason == "spread_window"

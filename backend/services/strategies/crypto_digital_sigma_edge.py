@@ -46,7 +46,6 @@ series the resolution reads, NOT Binance spot.
 
 from __future__ import annotations
 
-import math
 from typing import Any, Optional
 
 from utils.utcnow import utcnow  # replay-clock-aware "now" (honors backtest sim time)
@@ -62,10 +61,13 @@ from services.strategies._firehose import (
 from services.strategies.base import BaseStrategy
 from services.strategy_helpers.crypto_strategy_utils import (
     build_binary_crypto_market,
+    default_max_oracle_age_ms,
     pick_oracle_source,
+    realized_vol_per_sec,
 )
 from services.strategy_sdk import StrategySDK
-from utils.converters import to_float
+from utils.converters import clamp, to_float
+from utils.kelly import polymarket_taker_fee
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -99,15 +101,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "vol_cap": 0.005,
     # Oracle: must match the resolution series and be fresh at decision.
     "oracle_source_preference": "chainlink",
-    "max_oracle_age_ms": 4000,
+    "max_oracle_age_ms": None,
     # Entry timing: skip the cycle-open noise and the terminal race.
     "min_cycle_fraction": 0.15,
     "max_cycle_fraction": 0.85,
     "min_seconds_left": 45.0,
     # Edge: fair-minus-cost must clear fees plus a margin of model error.
-    # fee_buffer approximates Polymarket taker fees on fee-enabled crypto
-    # cycles; min_edge is the post-fee floor that must remain.
-    "fee_buffer": 0.015,
+    # Extra model-error margin after the canonical per-side taker fee.
+    "fee_buffer": 0.0,
     "min_edge": 0.045,
     # DOWN-side executable cost is inferred from the UP book by complement
     # parity (the dispatch only carries the UP token's book); pad it so
@@ -120,6 +121,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "min_liquidity": 500.0,
     # Skip oracle jump regimes where trailing realized vol lags reality.
     "max_recent_move_zscore": 3.5,
+    "missing_recent_move_zscore_policy": "reduce_confidence",
+    "missing_recent_move_confidence_multiplier": 0.80,
     "bet_size_usd": 15.0,
 }
 
@@ -140,55 +143,6 @@ def _normalize_timeframe(value: Any) -> str:
         "4h": "4h", "4hr": "4h", "240m": "4h",
     }
     return aliases.get(tf, tf)
-
-
-def _realized_vol_per_sec(
-    history: Any,
-    *,
-    now_ms: float,
-    lookback_seconds: float,
-    min_intervals: int,
-    min_span_seconds: float,
-) -> tuple[Optional[float], int, float]:
-    """Realized per-second volatility from ``[{"t": ms, "p": price}, ...]``.
-
-    sigma^2 = sum(log-return^2) / sum(dt) over the lookback — the canonical
-    realized-variance-per-unit-time estimator, robust to the dispatcher's
-    irregular ~7-8s sampling.  Intervals longer than 60s are gaps (feed
-    outage), not information, and are excluded.
-
-    Returns (sigma_per_sec | None, usable_intervals, span_seconds).
-    """
-    if not isinstance(history, list) or len(history) < 2:
-        return None, 0, 0.0
-    cutoff_ms = now_ms - lookback_seconds * 1000.0
-    pts: list[tuple[float, float]] = []
-    for h in history:
-        if not isinstance(h, dict):
-            continue
-        t = to_float(h.get("t"), None)
-        p = to_float(h.get("p"), None)
-        if t is None or p is None or p <= 0.0 or t < cutoff_ms or t > now_ms + 1000.0:
-            continue
-        pts.append((t, p))
-    if len(pts) < min_intervals + 1:
-        return None, max(0, len(pts) - 1), 0.0
-    pts.sort(key=lambda x: x[0])
-    span_seconds = (pts[-1][0] - pts[0][0]) / 1000.0
-    sum_r2 = 0.0
-    sum_dt = 0.0
-    n = 0
-    for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
-        dt = (t1 - t0) / 1000.0
-        if dt <= 0.0 or dt > 60.0:
-            continue
-        r = math.log(p1 / p0)
-        sum_r2 += r * r
-        sum_dt += dt
-        n += 1
-    if n < min_intervals or sum_dt <= 0.0 or span_seconds < min_span_seconds:
-        return None, n, span_seconds
-    return math.sqrt(sum_r2 / sum_dt), n, span_seconds
 
 
 class CryptoDigitalSigmaEdgeStrategy(BaseStrategy):
@@ -213,11 +167,11 @@ class CryptoDigitalSigmaEdgeStrategy(BaseStrategy):
     def __init__(self) -> None:
         super().__init__()
         self.min_profit = 0.0
-        self.fee = 0.0
         # One entry per market per cycle: each cycle is its own condition_id,
         # so a plain seen-set self-cleans as cycles roll over.  Bounded sweep
         # keeps long-running processes flat.
         self._entered_market_ids: set[str] = set()
+        self._realized_vol_cache: dict[tuple[str, int, float], tuple[Optional[float], int, float]] = {}
 
     def configure(self, config: dict) -> None:
         merged = dict(self.default_config)
@@ -360,10 +314,16 @@ class CryptoDigitalSigmaEdgeStrategy(BaseStrategy):
             _reject()
             return None
 
+        configured_max_oracle_age_ms = cfg.get("max_oracle_age_ms")
+        max_oracle_age_ms = (
+            float(configured_max_oracle_age_ms)
+            if configured_max_oracle_age_ms is not None
+            else default_max_oracle_age_ms(timeframe)
+        )
         oracle = pick_oracle_source(
             market,
             prefer=str(cfg.get("oracle_source_preference", "chainlink")),
-            max_age_ms=float(cfg.get("max_oracle_age_ms", 4000)),
+            max_age_ms=max_oracle_age_ms,
             now_ms=now_ms,
         )
         oracle_ok = (
@@ -385,24 +345,45 @@ class CryptoDigitalSigmaEdgeStrategy(BaseStrategy):
             _reject(MURMUR)
             return None
 
-        zscore = to_float(market.get("recent_move_zscore"), 0.0) or 0.0
+        zscore = to_float(market.get("recent_move_zscore"), None)
         z_cap = float(cfg.get("max_recent_move_zscore", 3.5))
-        z_ok = abs(zscore) <= z_cap
+        missing_zscore_policy = str(
+            cfg.get("missing_recent_move_zscore_policy", "reduce_confidence")
+        ).strip().lower()
+        z_ok = zscore is not None or missing_zscore_policy != "reject"
+        if zscore is not None:
+            z_ok = abs(zscore) <= z_cap
         gates.append(GateResult(
             "jump_regime", "Not in oracle jump regime", z_ok,
-            score=zscore, detail=f"|z|={abs(zscore):.2f} cap={z_cap:.2f}",
+            score=zscore,
+            detail=(
+                f"|z|={abs(zscore):.2f} cap={z_cap:.2f}"
+                if zscore is not None
+                else f"zscore missing policy={missing_zscore_policy}"
+            ),
         ))
         if not z_ok:
             _reject(MURMUR)
             return None
 
-        sigma, n_intervals, span_s = _realized_vol_per_sec(
-            market.get("oracle_history"),
-            now_ms=now_ms,
-            lookback_seconds=float(cfg.get("vol_lookback_seconds", 900.0)),
-            min_intervals=int(cfg.get("min_vol_intervals", 12)),
-            min_span_seconds=float(cfg.get("min_history_span_seconds", 240.0)),
-        )
+        history = market.get("oracle_history")
+        last_history_ts = 0.0
+        if isinstance(history, list) and history and isinstance(history[-1], dict):
+            last_history_ts = to_float(history[-1].get("t"), 0.0) or 0.0
+        vol_cache_key = (market_id, len(history) if isinstance(history, list) else 0, last_history_ts)
+        cached_vol = self._realized_vol_cache.get(vol_cache_key)
+        if cached_vol is None:
+            cached_vol = realized_vol_per_sec(
+                history,
+                now_ms=now_ms,
+                lookback_seconds=float(cfg.get("vol_lookback_seconds", 900.0)),
+                min_intervals=int(cfg.get("min_vol_intervals", 12)),
+                min_span_seconds=float(cfg.get("min_history_span_seconds", 240.0)),
+            )
+            self._realized_vol_cache[vol_cache_key] = cached_vol
+            if len(self._realized_vol_cache) > 1024:
+                self._realized_vol_cache = {vol_cache_key: cached_vol}
+        sigma, n_intervals, span_s = cached_vol
         sigma_ok = sigma is not None
         gates.append(GateResult(
             "realized_vol", "Realized vol estimable", sigma_ok,
@@ -469,16 +450,18 @@ class CryptoDigitalSigmaEdgeStrategy(BaseStrategy):
             _reject(MURMUR)
             return None
 
-        fee_buffer = float(cfg.get("fee_buffer", 0.015))
+        fee_buffer = float(cfg.get("fee_buffer", 0.0))
         down_buffer = float(cfg.get("down_side_slippage_buffer", 0.01))
         cost_up = best_ask
         cost_down = (1.0 - best_bid) + down_buffer
-        edge_up = p_up - cost_up - fee_buffer
-        edge_down = (1.0 - p_up) - cost_down - fee_buffer
+        fee_up = polymarket_taker_fee(cost_up, category="crypto")
+        fee_down = polymarket_taker_fee(cost_down, category="crypto")
+        edge_up = p_up - cost_up - fee_up - fee_buffer
+        edge_down = (1.0 - p_up) - cost_down - fee_down - fee_buffer
         if edge_up >= edge_down:
-            side, fair, cost, edge = "UP", p_up, cost_up, edge_up
+            side, fair, cost, edge, taker_fee = "UP", p_up, cost_up, edge_up, fee_up
         else:
-            side, fair, cost, edge = "DOWN", 1.0 - p_up, cost_down, edge_down
+            side, fair, cost, edge, taker_fee = "DOWN", 1.0 - p_up, cost_down, edge_down, fee_down
         min_edge = float(cfg.get("min_edge", 0.045))
         edge_ok = edge >= min_edge
         gates.append(GateResult(
@@ -521,12 +504,19 @@ class CryptoDigitalSigmaEdgeStrategy(BaseStrategy):
             return None
 
         outcome = "YES" if side == "UP" else "NO"
+        confidence = fair
+        if zscore is None and missing_zscore_policy == "reduce_confidence":
+            confidence *= clamp(
+                to_float(cfg.get("missing_recent_move_confidence_multiplier"), 0.80),
+                0.0,
+                1.0,
+            )
         bet_size_usd = float(cfg.get("bet_size_usd", 15.0))
         slug = str(market.get("slug") or market_id)
         title = f"Digital sigma edge: {slug} {side}"
         description = (
             f"{asset} {timeframe} | fair={fair:.3f} vs cost={cost:.3f} "
-            f"(edge {edge:+.3f} after {fee_buffer:.3f} fees) | "
+            f"(edge {edge:+.3f} after taker_fee={taker_fee:.3f} margin={fee_buffer:.3f}) | "
             f"sigma={sigma:.2e}/s n={n_intervals} | left={seconds_left:.0f}s"
         )
         opp = self.create_opportunity(
@@ -552,6 +542,8 @@ class CryptoDigitalSigmaEdgeStrategy(BaseStrategy):
                         "fair_value": fair,
                         "executable_cost": cost,
                         "net_edge": edge,
+                        "taker_fee": taker_fee,
+                        "fee_buffer": fee_buffer,
                         "seconds_left": seconds_left,
                         "elapsed_fraction": elapsed_fraction,
                         "oracle_source": oracle.get("source"),
@@ -561,10 +553,10 @@ class CryptoDigitalSigmaEdgeStrategy(BaseStrategy):
                 }
             ],
             is_guaranteed=False,
-            skip_fee_model=True,
             custom_roi_percent=(edge / cost) * 100.0 if cost > 0 else 0.0,
-            custom_risk_score=1.0 - fair,
-            confidence=fair,
+            custom_risk_score=1.0 - confidence,
+            confidence=confidence,
+            fee_model_maker_mode=False,
         )
         if opp is None:
             emit_evaluation_nowait(
@@ -619,6 +611,8 @@ class CryptoDigitalSigmaEdgeStrategy(BaseStrategy):
             "fair_value": fair,
             "executable_cost": cost,
             "net_edge": edge,
+            "taker_fee": taker_fee,
+            "fee_buffer": fee_buffer,
             "seconds_left": seconds_left,
             "bet_size_usd": bet_size_usd,
             "win_prob_estimate": fair,

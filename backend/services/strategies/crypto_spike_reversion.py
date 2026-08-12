@@ -97,6 +97,7 @@ class CryptoSpikeReversionStrategy(BaseStrategy):
     def __init__(self) -> None:
         super().__init__()
         self.min_profit = 0.0
+        self._last_rejection_reason: str | None = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -112,8 +113,11 @@ class CryptoSpikeReversionStrategy(BaseStrategy):
 
     def _score_market(self, row: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any] | None:
         gates: list[GateResult] = []
+        self._last_rejection_reason = None
 
         def _emit_reject(verbosity: str = MURMUR) -> None:
+            failed_gate = next((gate for gate in reversed(gates) if gate.passed is False), None)
+            self._last_rejection_reason = failed_gate.name if failed_gate else "scoring_gate_failed"
             emit_evaluation_nowait(
                 strategy_slug="crypto_spike_reversion",
                 market=row,
@@ -293,12 +297,23 @@ class CryptoSpikeReversionStrategy(BaseStrategy):
             diff_pct = 0.0
             edge = abs(move_5m) * 0.6
 
+        min_edge_percent = max(0.0, to_float(cfg.get("min_edge_percent", 2.8), 2.8))
+        edge_ok = edge >= min_edge_percent
+        gates.append(GateResult(
+            "min_edge", "Min edge", edge_ok,
+            score=float(edge),
+            detail=f"edge={edge:.3f}% min={min_edge_percent:.3f}%",
+        ))
+        if not edge_ok:
+            _emit_reject(MURMUR)
+            return None
+
         confidence = clamp(
             0.50
             + clamp(abs(move_5m) / 12.0, 0, 0.20)
             + (0.10 if shape_ok else 0)
             + clamp(elapsed_ratio * 0.10, 0, 0.10),
-            0.44,
+            0.30,
             0.90,
         )
 
@@ -490,77 +505,6 @@ class CryptoSpikeReversionStrategy(BaseStrategy):
         }
         return opp
 
-    def _rejection_reason(self, row: dict[str, Any], cfg: dict[str, Any]) -> str:
-        up_price = safe_float(row.get("up_price"), None)
-        down_price = safe_float(row.get("down_price"), None)
-        if up_price is None or down_price is None:
-            return "missing_prices"
-
-        move_5m = safe_float(row.get("move_5m_percent"), safe_float(row.get("move_5m_pct"), None))
-        move_30m = safe_float(row.get("move_30m_percent"), safe_float(row.get("move_30m_pct"), None))
-        move_2h = safe_float(row.get("move_2h_percent"), safe_float(row.get("move_2h_pct"), None))
-        if move_5m is None:
-            return "missing_move_5m"
-
-        min_abs_move_5m = max(0.0, to_float(cfg.get("min_abs_move_5m", 1.8), 1.8))
-        if abs(move_5m) < min_abs_move_5m:
-            return "move_below_threshold"
-
-        max_abs_move_2h = max(min_abs_move_5m, to_float(cfg.get("max_abs_move_2h", 14.0), 14.0))
-        require_reversion_shape = bool(cfg.get("require_reversion_shape", True))
-        shape_ok = reversion_shape_ok(
-            move_5m,
-            move_30m,
-            move_2h,
-            require_shape=require_reversion_shape,
-            max_abs_move_2h=max_abs_move_2h,
-        )
-        if require_reversion_shape and not shape_ok:
-            return "shape_invalid"
-
-        selected_price = float(down_price if move_5m > 0 else up_price)
-        max_entry_price = clamp(to_float(cfg.get("max_entry_price", 0.92), 0.92), 0.05, 0.99)
-        if selected_price <= 0.0 or selected_price >= 1.0:
-            return "invalid_entry_price"
-        if selected_price > max_entry_price:
-            return "entry_price_too_high"
-
-        oracle_price = safe_float(row.get("oracle_price"), None)
-        price_to_beat = safe_float(row.get("price_to_beat"), None)
-        if oracle_price is not None and price_to_beat is not None and price_to_beat > 0:
-            diff_pct = abs(((oracle_price - price_to_beat) / price_to_beat) * 100.0)
-            edge = abs(move_5m) * 0.6 + diff_pct
-        else:
-            diff_pct = 0.0
-            edge = abs(move_5m) * 0.6
-
-        end_date = parse_datetime_utc(row.get("end_time"))
-        elapsed_ratio = 0.5
-        if end_date is not None:
-            seconds_left = max(0.0, (end_date - utcnow()).total_seconds())
-            elapsed_ratio = clamp(1.0 - (seconds_left / 300.0), 0.0, 1.0)
-        confidence = clamp(
-            0.50
-            + clamp(abs(move_5m) / 12.0, 0, 0.20)
-            + (0.10 if shape_ok else 0)
-            + clamp(elapsed_ratio * 0.10, 0, 0.10),
-            0.44,
-            0.90,
-        )
-        min_confidence = to_confidence(cfg.get("min_confidence", 0.44), 0.44)
-        if confidence < min_confidence:
-            return "confidence_too_low"
-
-        liquidity = max(0.0, float(safe_float(row.get("liquidity"), 0.0) or 0.0))
-        min_liquidity_usd = max(0.0, to_float(cfg.get("min_liquidity_usd", 2000.0), 2000.0))
-        if liquidity < min_liquidity_usd:
-            return "low_liquidity"
-
-        min_edge_percent = max(0.0, to_float(cfg.get("min_edge_percent", 2.8), 2.8))
-        if edge < min_edge_percent:
-            return "edge_too_small"
-        return "filtered"
-
     # ------------------------------------------------------------------
     # Detection from raw crypto rows
     # ------------------------------------------------------------------
@@ -576,7 +520,7 @@ class CryptoSpikeReversionStrategy(BaseStrategy):
                 continue
             signal = self._score_market(row, cfg)
             if signal is None:
-                reason = self._rejection_reason(row, cfg)
+                reason = self._last_rejection_reason or "scoring_gate_failed"
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
                 continue
             firehose_gates = signal.get("_firehose_gates") or []
@@ -783,7 +727,7 @@ class CryptoSpikeReversionStrategy(BaseStrategy):
             entry_price=entry_price if entry_price > 0 else None,
             kelly_fractional_scale=kelly_fractional_scale,
             liquidity_usd=liquidity,
-            liquidity_cap_fraction=0.07,
+            liquidity_cap_fraction=to_float(params.get("liquidity_cap_fraction", 0.07), 0.07),
         )
 
         return StrategyDecision(
