@@ -4,6 +4,24 @@ from __future__ import annotations
 import math
 
 
+FEE_RATE_BY_CATEGORY: dict[str, float] = {
+    "crypto": 0.07,
+    "sports": 0.05,
+    "finance": 0.04,
+    "politics": 0.04,
+    "economics": 0.05,
+    "culture": 0.05,
+    "weather": 0.05,
+    "other / general": 0.05,
+    "other": 0.05,
+    "general": 0.05,
+    "mentions": 0.04,
+    "tech": 0.04,
+    "geopolitics": 0.0,
+}
+DEFAULT_FEE_RATE = 0.07
+
+
 def kelly_fraction(p_estimated: float, p_market: float, fraction: float = 0.25) -> float:
     """Quarter-Kelly fraction for a binary prediction market bet.
 
@@ -49,41 +67,62 @@ def kelly_size(
     return min(size, max_size)
 
 
-def polymarket_taker_fee(p: float, fee_rate: float | None = None) -> float:
-    """Polymarket taker fee for one contract at price ``p`` (USD per share).
+def polymarket_taker_fee(
+    p: float,
+    *,
+    category: str | None = None,
+    fee_rate: float | None = None,
+) -> float:
+    """Current Polymarket taker fee in USD for one share at price ``p``.
 
-    Polymarket's published taker schedule is a *quadratic* curve, not the
-    linear ``p*(1-p)*rate`` shape this function used to return. The two
-    happen to coincide at ``p=0.50`` (~1.56% of price) but diverge at the
-    tails — the old shape over-charged at p=0.30 by ~4× and at p=0.10 by
-    >20×, which made fee-aware strategies refuse profitable trades.
-
-    Per Polymarket docs:
-        fee_per_share = p * 0.25 * (p * (1 - p))**2
-
-    The maximum fee as a fraction of price is ~1.56% at p=0.50; at p=0.10
-    or p=0.90 it falls to ~0.20%. Makers pay zero.
-
-    Args:
-        p: Contract price in [0, 1].
-        fee_rate: Accepted for backward compat and ignored. The Polymarket
-            schedule is fixed; callers that want a different platform's fee
-            should use the relevant helper (e.g. ``kalshi_taker_fee``).
-
-    Returns:
-        Fee per share in USD.
+    An explicit ``fee_rate`` takes precedence over the category schedule.
+    Unknown or missing categories use the highest current rate so fee-aware
+    entry gates remain conservative.
     """
-    del fee_rate  # legacy parameter, no longer used
+    p_clamped = max(0.0, min(1.0, float(p or 0.0)))
+    if fee_rate is not None:
+        resolved_fee_rate = max(0.0, float(fee_rate))
+    else:
+        category_key = str(category or "").strip().lower()
+        resolved_fee_rate = FEE_RATE_BY_CATEGORY.get(category_key, DEFAULT_FEE_RATE)
+    return resolved_fee_rate * p_clamped * (1.0 - p_clamped)
+
+
+def polymarket_maker_fee(
+    p: float,
+    *,
+    category: str | None = None,
+    fee_rate: float | None = None,
+) -> float:
+    """Current Polymarket maker fee per share; makers pay zero."""
+    del p, category, fee_rate
+    return 0.0
+
+
+def polymarket_taker_fee_legacy_quartic(p: float) -> float:
+    """Pre-2026-01 fee curve for historical backtest comparison only.
+
+    New trading and backtest code must not call this legacy helper.
+    """
     p_clamped = max(0.0, min(1.0, float(p or 0.0)))
     return p_clamped * 0.25 * (p_clamped * (1.0 - p_clamped)) ** 2
 
 
-def polymarket_taker_fee_pct(p: float) -> float:
-    """Polymarket taker fee as a fraction of contract price (0.0 – 0.0156)."""
-    p_value = float(p or 0.0)
-    if p_value <= 0.0:
+def polymarket_taker_fee_pct(
+    p: float,
+    *,
+    category: str | None = None,
+    fee_rate: float | None = None,
+) -> float:
+    """Current Polymarket taker fee as a fraction of contract price."""
+    p_clamped = max(0.0, min(1.0, float(p or 0.0)))
+    if p_clamped <= 0.0:
         return 0.0
-    return polymarket_taker_fee(p_value) / p_value
+    return polymarket_taker_fee(
+        p_clamped,
+        category=category,
+        fee_rate=fee_rate,
+    ) / p_clamped
 
 
 def kalshi_taker_fee(p: float, contracts: int = 1, fee_rate: float = 0.07) -> float:
@@ -111,6 +150,7 @@ def fee_adjusted_edge(p_estimated: float, p_market: float, platform: str = "poly
 
     if platform == "polymarket":
         if side == "buy":
+            # This generic helper receives no market metadata; use the conservative default rate.
             fee = polymarket_taker_fee(p_market)
         else:
             fee = 0.0  # Makers pay zero
@@ -128,6 +168,7 @@ def breakeven_edge(p_market: float, platform: str = "polymarket") -> float:
     Returns edge as fraction (multiply by 100 for percent).
     """
     if platform == "polymarket":
+        # This generic helper receives no market metadata; use the conservative default rate.
         fee = polymarket_taker_fee(p_market)
     elif platform == "kalshi":
         fee = kalshi_taker_fee(p_market)

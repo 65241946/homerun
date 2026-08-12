@@ -99,7 +99,7 @@ def spread_pct_from_row(row: dict[str, Any]) -> float:
 
 def taker_fee_pct(entry_price: float) -> float:
     price = clamp(float(entry_price), 0.0001, 0.9999)
-    return 0.25 * ((price * (1.0 - price)) ** 2)
+    return polymarket_taker_fee_pct(price, category="crypto")
 
 
 def bounded_sigmoid(z: float) -> float:
@@ -322,7 +322,7 @@ def fee_aware_min_edge_pct(price: float, multiplier: float = 2.0) -> float:
     fees by ``multiplier``× at the given entry price. Returns a percentage so
     callers can compare directly against existing edge fields that are also
     expressed in percent."""
-    return polymarket_taker_fee_pct(price) * 100.0 * float(multiplier)
+    return polymarket_taker_fee_pct(price, category="crypto") * 100.0 * float(multiplier)
 
 
 # ---------------------------------------------------------------------------

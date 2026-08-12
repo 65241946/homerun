@@ -421,7 +421,7 @@ class CryptoEntropyMakerStrategy(BaseStrategy):
         if not fee_clearance_ok:
             _emit_reject(MURMUR)
             return None
-        taker_fee_pct_value = polymarket_taker_fee_pct(entry_price) * 100.0
+        taker_fee_pct_value = polymarket_taker_fee_pct(entry_price, category="crypto") * 100.0
 
         # Confidence
         confidence = clamp(

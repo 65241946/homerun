@@ -767,6 +767,7 @@ def _has_resolution_divergence_risk(question: str) -> bool:
 
 
 def _polymarket_fee_per_contract(price: float) -> float:
+    # Cross-platform fee comparison has no category argument; use the conservative default rate.
     return max(0.0, polymarket_taker_fee(max(0.0, min(1.0, price))))
 
 

@@ -952,7 +952,7 @@ class StatArbStrategy(BaseStrategy):
             # ROI net of taker fees, computed from the absolute edge as a
             # fraction of the entry price. (price_disagreement / buy_price)
             # × 100 = realized capital efficiency on a directional bet.
-            fee = polymarket_taker_fee(buy_price) if platform == "polymarket" else (
+            fee = polymarket_taker_fee(buy_price, category=category) if platform == "polymarket" else (
                 kalshi_taker_fee(buy_price) if platform == "kalshi" else 0.0
             )
             net_edge = max(0.0, abs(edge) - fee)
