@@ -50,7 +50,13 @@ from services.strategy_helpers.crypto_strategy_utils import (
     resolve_oracle_availability as _resolve_oracle_availability,
     extract_oracle_status as _extract_oracle_status,
     enrich_crypto_market_row as _enrich_crypto_market_row,
+    default_max_market_data_age_ms,
+    default_max_oracle_age_ms,
+    default_min_seconds_left_for_entry,
+    estimate_p_win,
+    fee_aware_min_edge_pct,
     normalize_timeframe,
+    timeframe_seconds,
 )
 from services.data_events import DataEvent
 from services.strategy_sdk import StrategySDK
@@ -558,15 +564,20 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         default_lookback=5,
     )
 
-    quality_filter_overrides = QualityFilterOverrides(
-        min_roi=1.0,
-        max_resolution_months=0.1,
-    )
+    quality_filter_overrides = QualityFilterOverrides(max_resolution_months=0.1)
 
     default_config = {
         # Directional-entry gates
-        "opening_directional_buy_yes_enabled": True,
-        "opening_directional_buy_no_enabled": True,
+        "opening_directional_buy_yes_enabled": False,
+        "opening_directional_buy_no_enabled": False,
+        "opening_directional_buy_yes_block_elapsed_pct": 0.10,
+        "min_edge_percent": 1.5,
+        "min_confidence": 0.45,
+        "min_execution_adjusted_edge_percent": 0.5,
+        "min_oracle_move_pct": 0.15,
+        "kelly_fraction": 0.25,
+        "debug_decision_payload": False,
+        "runtime_cache_ttl_seconds": 600.0,
         # Exit controls
         "rapid_take_profit_pct": 10.0,
         "take_profit_pct": 8.0,
@@ -606,6 +617,8 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         "resolution_risk_disable_when_take_profit_armed": True,
         # Circuit breaker
         "max_consecutive_losses_before_pause": 3,
+        "consecutive_loss_pause_minutes": 15.0,
+        "consecutive_loss_pause_enabled": True,
         # ── Directional-edge phase / scoring tunables ────────────────────
         # The cycle's remaining time is partitioned into early / mid / late
         # phases, each with its own minimum required edge and score
@@ -654,12 +667,160 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         # Runtime anti-churn controls used by evaluate().
         self._edge_first_seen_ms: dict[str, int] = {}
         self._last_selected_at_ms_by_market: dict[str, int] = {}
+        self._market_scope_cache: dict[str, tuple[str, str]] = {}
+        self._book_imbalance_memo: dict[tuple[str, str, int], Optional[float]] = {}
         # Consecutive loss circuit breaker state.
         self._consecutive_losses: int = 0
         self._paused_until_ms: int = 0
 
     def configure(self, config: dict) -> None:
         super().configure({**self.default_config, **(config or {})})
+
+    @classmethod
+    def _directional_phase_settings(
+        cls,
+        params: dict[str, Any],
+        *,
+        timeframe: str,
+        elapsed_ratio: float,
+    ) -> tuple[str, float, float]:
+        total_seconds = float(max(1, timeframe_seconds(timeframe)))
+        early_cutoff = clamp(
+            1.0
+            - (
+                to_float(
+                    params.get("directional_early_phase_minutes", cls.default_config["directional_early_phase_minutes"]),
+                    cls.default_config["directional_early_phase_minutes"],
+                )
+                * 60.0
+                / total_seconds
+            ),
+            0.0,
+            1.0,
+        )
+        mid_cutoff = clamp(
+            1.0
+            - (
+                to_float(
+                    params.get("directional_mid_phase_minutes", cls.default_config["directional_mid_phase_minutes"]),
+                    cls.default_config["directional_mid_phase_minutes"],
+                )
+                * 60.0
+                / total_seconds
+            ),
+            0.0,
+            1.0,
+        )
+        phase = "early" if elapsed_ratio < early_cutoff else ("mid" if elapsed_ratio < mid_cutoff else "late")
+        min_edge = to_float(
+            params.get(f"directional_{phase}_min_edge", cls.default_config[f"directional_{phase}_min_edge"]),
+            cls.default_config[f"directional_{phase}_min_edge"],
+        )
+        score_mult = to_float(
+            params.get(f"directional_{phase}_score_mult", cls.default_config[f"directional_{phase}_score_mult"]),
+            cls.default_config[f"directional_{phase}_score_mult"],
+        )
+        return phase, min_edge, score_mult
+
+    @classmethod
+    def _directional_probability(
+        cls,
+        params: dict[str, Any],
+        *,
+        oracle_diff_pct: float,
+        elapsed_ratio: float,
+    ) -> float:
+        return estimate_p_win(
+            oracle_diff_pct,
+            elapsed_ratio,
+            base_scale=to_float(
+                params.get("directional_base_scale", cls.default_config["directional_base_scale"]),
+                cls.default_config["directional_base_scale"],
+            ),
+            min_scale=to_float(
+                params.get("directional_min_scale", cls.default_config["directional_min_scale"]),
+                cls.default_config["directional_min_scale"],
+            ),
+            prob_min=to_float(
+                params.get("directional_oracle_prob_min", cls.default_config["directional_oracle_prob_min"]),
+                cls.default_config["directional_oracle_prob_min"],
+            ),
+            prob_max=to_float(
+                params.get("directional_oracle_prob_max", cls.default_config["directional_oracle_prob_max"]),
+                cls.default_config["directional_oracle_prob_max"],
+            ),
+        )
+
+    @classmethod
+    def _directional_score(
+        cls,
+        params: dict[str, Any],
+        *,
+        edge_percent: float,
+        phase: str,
+        phase_multiplier: float,
+    ) -> float:
+        scale = to_float(
+            params.get("directional_edge_score_scale", cls.default_config["directional_edge_score_scale"]),
+            cls.default_config["directional_edge_score_scale"],
+        )
+        max_score = to_float(
+            params.get("directional_max_score", cls.default_config["directional_max_score"]),
+            cls.default_config["directional_max_score"],
+        )
+        late_bonus = (
+            to_float(
+                params.get("directional_late_phase_bonus", cls.default_config["directional_late_phase_bonus"]),
+                cls.default_config["directional_late_phase_bonus"],
+            )
+            if phase == "late"
+            else 0.0
+        )
+        return min(max_score, max(0.0, edge_percent) * scale / 100.0 * phase_multiplier) + late_bonus
+
+    @classmethod
+    def _directional_kelly_size(
+        cls,
+        params: dict[str, Any],
+        *,
+        base_size: float,
+        max_size: float,
+        p_win: float,
+        entry_price: float,
+        confidence: float,
+        risk_score: float,
+    ) -> float:
+        return StrategySDK.fractional_kelly_size(
+            base_size,
+            max_size,
+            edge_price=max(0.0, p_win - entry_price),
+            market_price=entry_price,
+            confidence=confidence,
+            risk_score=risk_score,
+            kelly_fraction=to_float(
+                params.get("kelly_fraction", cls.default_config["kelly_fraction"]),
+                cls.default_config["kelly_fraction"],
+            ),
+        )
+
+    @staticmethod
+    def _execution_net_edge(edge_percent: float, entry_price: float) -> float:
+        return edge_percent - fee_aware_min_edge_pct(entry_price, multiplier=2.0)
+
+    def _prune_runtime_caches(self, *, now_ms: int, ttl_seconds: float) -> None:
+        cutoff_ms = now_ms - int(max(1.0, ttl_seconds) * 1000.0)
+        for cache in (self._edge_first_seen_ms, self._last_selected_at_ms_by_market):
+            stale_keys = [key for key, timestamp_ms in cache.items() if timestamp_ms < cutoff_ms]
+            for key in stale_keys:
+                cache.pop(key, None)
+        if len(self._market_scope_cache) > 4096:
+            self._market_scope_cache.clear()
+        if len(self._book_imbalance_memo) > 1024:
+            self._book_imbalance_memo.clear()
+
+    def _build_decision_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Test seam: only called for selected decisions or explicit debug snapshots."""
+        return payload
 
     # ------------------------------------------------------------------
     # Detection entry point — EVENT-DRIVEN (see on_event below)
@@ -987,7 +1148,7 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         )
         no_enabled = _coerce_bool(
             cfg.get("opening_directional_buy_no_enabled"),
-            _coerce_bool(defaults.get("opening_directional_buy_no_enabled"), True),
+            _coerce_bool(defaults.get("opening_directional_buy_no_enabled"), False),
         )
 
         if normalized_direction == "buy_yes":
@@ -1125,6 +1286,15 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         """
         params = context.get("params") or {}
         payload = signal_payload(signal)
+        market_id = str(getattr(signal, "market_id", "") or payload.get("market_id") or "").strip()
+        now_ms = int(utcnow().timestamp() * 1000.0)
+        self._prune_runtime_caches(
+            now_ms=now_ms,
+            ttl_seconds=to_float(
+                params.get("runtime_cache_ttl_seconds", self.default_config["runtime_cache_ttl_seconds"]),
+                self.default_config["runtime_cache_ttl_seconds"],
+            ),
+        )
         live_market = context.get("live_market")
         if not isinstance(live_market, dict):
             live_market = payload.get("live_market")
@@ -1132,8 +1302,10 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
             live_market = {}
 
         # --- Core thresholds ---
-        min_edge = to_float(params.get("min_edge_percent", 3.0), 3.0)
-        min_conf = to_confidence(params.get("min_confidence", 0.45), 0.45)
+        min_edge_default = float(self.default_config["min_edge_percent"])
+        min_conf_default = float(self.default_config["min_confidence"])
+        min_edge = to_float(params.get("min_edge_percent", min_edge_default), min_edge_default)
+        min_conf = to_confidence(params.get("min_confidence", min_conf_default), min_conf_default)
         base_size, max_size = _trader_size_limits(context)
 
         # --- Direction guardrail parameters ---
@@ -1157,26 +1329,32 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         enabled_active_modes = _resolve_enabled_active_modes(params)
 
         # --- Asset / timeframe extraction ---
-        signal_asset = _normalize_asset(
-            _first_present(
-                live_market.get("asset"),
-                live_market.get("coin"),
-                live_market.get("symbol"),
-                payload.get("asset"),
-                payload.get("coin"),
-                payload.get("symbol"),
+        cached_scope = self._market_scope_cache.get(market_id) if market_id else None
+        if cached_scope is not None:
+            signal_asset, signal_timeframe = cached_scope
+        else:
+            signal_asset = _normalize_asset(
+                _first_present(
+                    live_market.get("asset"),
+                    live_market.get("coin"),
+                    live_market.get("symbol"),
+                    payload.get("asset"),
+                    payload.get("coin"),
+                    payload.get("symbol"),
+                )
             )
-        )
-        signal_timeframe = _normalize_timeframe(
-            _first_present(
-                live_market.get("timeframe"),
-                live_market.get("cadence"),
-                live_market.get("interval"),
-                payload.get("timeframe"),
-                payload.get("cadence"),
-                payload.get("interval"),
+            signal_timeframe = _normalize_timeframe(
+                _first_present(
+                    live_market.get("timeframe"),
+                    live_market.get("cadence"),
+                    live_market.get("interval"),
+                    payload.get("timeframe"),
+                    payload.get("cadence"),
+                    payload.get("interval"),
+                )
             )
-        )
+            if market_id and signal_asset and signal_timeframe:
+                self._market_scope_cache[market_id] = (signal_asset, signal_timeframe)
 
         # --- Asset/timeframe include+exclude filtering ---
         include_assets = _normalize_scope(
@@ -1360,11 +1538,11 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
                     0.0,
                     (utcnow() - observed_at.astimezone(timezone.utc)).total_seconds() * 1000.0,
                 )
-        max_market_data_age_ms_cfg = self._float(
-            _timeframe_override(params, "max_market_data_age_ms", signal_timeframe)
-        )
+        max_market_data_age_ms_cfg = self._float(_timeframe_override(params, "max_market_data_age_ms", signal_timeframe))
         if max_market_data_age_ms_cfg is None:
-            max_market_data_age_ms_cfg = to_float(params.get("max_market_data_age_ms", 900.0), 900.0)
+            max_market_data_age_ms_cfg = self._float(params.get("max_market_data_age_ms"))
+        if max_market_data_age_ms_cfg is None:
+            max_market_data_age_ms_cfg = default_max_market_data_age_ms(signal_timeframe)
         max_market_data_age_ms = max(50.0, float(max_market_data_age_ms_cfg))
         if low_notional_live_mode:
             market_data_floor_by_timeframe = {
@@ -1389,12 +1567,6 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
             or (market_data_age_ms is None and not require_market_data_age)
         )
 
-        default_min_seconds_by_timeframe: dict[str, float] = {
-            "5m": 45.0,
-            "15m": 180.0,
-            "1h": 360.0,
-            "4h": 900.0,
-        }
         timeframe_specific_floor = self._float(
             _timeframe_override(params, "min_seconds_left_for_entry", signal_timeframe)
         )
@@ -1405,7 +1577,7 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
             else (
                 max(0.0, global_min_seconds)
                 if global_min_seconds is not None
-                else default_min_seconds_by_timeframe.get(signal_timeframe, 0.0)
+                else default_min_seconds_left_for_entry(signal_timeframe)
             )
         )
         entry_window_ok = signal_seconds_left < 0 or signal_seconds_left >= float(min_seconds_left_for_entry)
@@ -1612,16 +1784,43 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
             int(to_float(params.get("orderbook_imbalance_levels", 5), 5)),
         )
         live_imbalance_signed = None
-        try:
-            live_imbalance_signed = StrategySDK.get_book_imbalance(
-                live_market_for_imbalance,
-                side="YES",
-                levels=live_imbalance_levels,
+        imbalance_token_id = str(
+            _first_present(
+                live_market_for_imbalance.get("token_id"),
+                payload.get("token_id"),
+                getattr(signal, "token_id", None),
             )
-        except Exception:
-            # SDK call should never raise, but defensively swallow any
-            # surprise so a cache hiccup can't take out the evaluate path.
-            live_imbalance_signed = None
+            or ""
+        ).strip()
+        imbalance_tick = str(
+            _first_present(
+                live_market_for_imbalance.get("book_updated_at_ms"),
+                live_market_for_imbalance.get("updated_at_ms"),
+                live_market_for_imbalance.get("market_data_observed_at"),
+                payload.get("market_data_observed_at"),
+            )
+            or ""
+        ).strip()
+        imbalance_memo_key = (
+            (imbalance_token_id, imbalance_tick, live_imbalance_levels)
+            if imbalance_token_id and imbalance_tick
+            else None
+        )
+        if imbalance_memo_key is not None and imbalance_memo_key in self._book_imbalance_memo:
+            live_imbalance_signed = self._book_imbalance_memo[imbalance_memo_key]
+        else:
+            try:
+                live_imbalance_signed = StrategySDK.get_book_imbalance(
+                    live_market_for_imbalance,
+                    side="YES",
+                    levels=live_imbalance_levels,
+                )
+            except Exception:
+                # SDK call should never raise, but defensively swallow any
+                # surprise so a cache hiccup can't take out the evaluate path.
+                live_imbalance_signed = None
+            if imbalance_memo_key is not None:
+                self._book_imbalance_memo[imbalance_memo_key] = live_imbalance_signed
 
         if live_imbalance_signed is not None:
             raw_orderbook_imbalance = live_imbalance_signed
@@ -1754,13 +1953,13 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         )
         oracle_age_ms = self._float(oracle_status.get("age_ms"))
         oracle_age_seconds = (oracle_age_ms / 1000.0) if oracle_age_ms is not None else None
-        max_oracle_age_seconds_cfg = to_float(params.get("max_oracle_age_seconds", 12.0), 12.0)
-        max_oracle_age_seconds_cfg = max(0.1, float(max_oracle_age_seconds_cfg))
-        max_oracle_age_ms_cfg = self._float(params.get("max_oracle_age_ms"))
+        max_oracle_age_ms_cfg = self._float(_timeframe_override(params, "max_oracle_age_ms", signal_timeframe))
+        if max_oracle_age_ms_cfg is None:
+            max_oracle_age_ms_cfg = self._float(params.get("max_oracle_age_ms"))
         max_oracle_age_ms = (
             max(100.0, float(max_oracle_age_ms_cfg))
             if max_oracle_age_ms_cfg is not None
-            else max(100.0, max_oracle_age_seconds_cfg * 1000.0)
+            else default_max_oracle_age_ms(signal_timeframe)
         )
         max_oracle_age_seconds = max_oracle_age_ms / 1000.0
         require_oracle_for_directional = to_bool(params.get("require_oracle_for_directional"), True)
@@ -1967,9 +2166,18 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         )
 
         # --- Regime-aware required thresholds ---
-        required_edge = (
-            min_edge * _EDGE_MODE_FACTORS.get(regime, {}).get(active_mode, 1.0) * oracle_threshold_edge_multiplier
+        timeframe_seconds_value = timeframe_seconds(signal_timeframe)
+        elapsed_ratio = (
+            clamp(1.0 - (signal_seconds_left / float(max(1, timeframe_seconds_value))), 0.0, 1.0)
+            if signal_seconds_left >= 0
+            else 0.0
         )
+        directional_phase, phase_min_edge, phase_score_mult = self._directional_phase_settings(
+            params,
+            timeframe=signal_timeframe,
+            elapsed_ratio=elapsed_ratio,
+        )
+        required_edge = max(min_edge, phase_min_edge) * oracle_threshold_edge_multiplier
         required_conf = (
             min_conf
             * _CONF_MODE_FACTORS.get(active_mode, 1.0)
@@ -1987,7 +2195,7 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         min_oracle_move_pct_effective = (
             max(0.05, float(min_oracle_move_pct_cfg))
             if min_oracle_move_pct_cfg is not None
-            else 0.15
+            else float(self.default_config["min_oracle_move_pct"])
         )
         if low_notional_live_mode and size_cap_for_gates is not None:
             low_notional_edge_ceiling = max(0.35, min_oracle_move_pct_effective * 1.25)
@@ -2064,6 +2272,11 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
             entry_price_for_execution = clamp(entry_price_for_execution, 0.0, 1.0)
         else:
             entry_price_for_execution = None
+        net_edge = (
+            self._execution_net_edge(edge, entry_price_for_execution)
+            if entry_price_for_execution is not None
+            else float("-inf")
+        )
 
         # --- Direction guardrail ---
         guardrail_blocked = False
@@ -2125,8 +2338,6 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
 
         # --- Adaptive edge gating ---
         edge_for_gate = min(edge, mode_edge) if mode_edge > 0.0 else edge
-        now_ms = int(utcnow().timestamp() * 1000.0)
-        market_id = str(getattr(signal, "market_id", "") or "").strip()
         edge_tracker_key = f"{market_id}|{direction}|{active_mode}" if market_id else ""
         min_edge_persistence_ms = max(
             0,
@@ -2358,7 +2569,9 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
             )
         )
         if min_execution_adjusted_edge_percent is None:
-            min_execution_adjusted_edge_percent = 0.0
+            min_execution_adjusted_edge_percent = float(
+                self.default_config["min_execution_adjusted_edge_percent"]
+            )
 
         # --- Decision checks ---
         checks = [
@@ -2623,6 +2836,26 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
                 )
             )
 
+        score = self._directional_score(
+            params,
+            edge_percent=edge_for_gate,
+            phase=directional_phase,
+            phase_multiplier=phase_score_mult,
+        )
+        all_checks_passed = all(check.passed for check in checks)
+        debug_decision_payload = to_bool(
+            params.get("debug_decision_payload"),
+            bool(self.default_config["debug_decision_payload"]),
+        )
+        if not all_checks_passed and not debug_decision_payload:
+            return StrategyDecision(
+                decision="skipped",
+                reason="Crypto worker filters not met",
+                score=score,
+                checks=checks,
+                payload={},
+            )
+
         failed_check_keys = [
             str(getattr(check, "key", "") or "").strip()
             for check in checks
@@ -2641,7 +2874,7 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         age_present_but_unavailable = int(oracle_status.get("availability_state") == "age_present_but_unavailable")
 
         # --- Build shared payload dict ---
-        decision_payload: dict[str, Any] = {
+        decision_payload = self._build_decision_payload({
             "requested_mode": requested_mode,
             "active_mode": active_mode,
             "dominant_mode": dominant_mode,
@@ -2826,13 +3059,11 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
                 "live_market": _json_safe(live_market),
                 "oracle_status": _json_safe(oracle_status),
             },
-        }
+        })
         if maker_execution_plan_override is not None:
             decision_payload["execution_plan_override"] = maker_execution_plan_override
 
-        score = (edge_for_gate * 0.7) + (confidence * 30.0)
-
-        if not all(c.passed for c in checks):
+        if not all_checks_passed:
             return StrategyDecision(
                 decision="skipped",
                 reason="Crypto worker filters not met",
@@ -2842,23 +3073,24 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
             )
 
         # --- Position sizing ---
-        # Historical data shows edge calibration is inverted: higher reported
-        # edge correlates with worse outcomes. Use a conservative, capped
-        # edge boost that penalises suspiciously large edges.
-        edge_excess = max(0.0, edge_for_gate - required_edge)
-        if edge_excess > 15.0:
-            # Suspiciously large edge — size DOWN (inverted calibration)
-            edge_boost = max(0.5, 1.0 - (edge_excess - 15.0) / 60.0)
-        else:
-            # Moderate edge — small linear boost, capped
-            edge_boost = 1.0 + min(edge_excess / 50.0, 0.3)
-        conf_boost = 0.8 + (confidence * 0.8)
+        resolved_entry_price = entry_price_for_execution if entry_price_for_execution is not None else 0.5
+        p_win = clamp(
+            to_float(payload.get("p_win"), resolved_entry_price + (edge_for_gate / 100.0)),
+            0.0,
+            1.0,
+        )
         size = (
-            base_size
+            self._directional_kelly_size(
+                params,
+                base_size=base_size,
+                max_size=max_size,
+                p_win=p_win,
+                entry_price=resolved_entry_price,
+                confidence=confidence,
+                risk_score=1.0 - confidence,
+            )
             * _MODE_SIZE_FACTORS.get(active_mode, 1.0)
             * _REGIME_SIZE_FACTORS.get(regime, 1.0)
-            * edge_boost
-            * conf_boost
             * oracle_size_multiplier
             * edge_calibration_size_multiplier
             * edge_calibration_bucket_multiplier
@@ -3981,12 +4213,20 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
             defaults = self.config
             max_streak = max(
                 1,
-                int(to_float(defaults.get("max_consecutive_losses_before_pause"), 3.0)),
+                int(
+                    to_float(
+                        defaults.get("max_consecutive_losses_before_pause"),
+                        self.default_config["max_consecutive_losses_before_pause"],
+                    )
+                ),
             )
             if self._consecutive_losses >= max_streak:
                 pause_minutes = max(
                     1.0,
-                    to_float(defaults.get("consecutive_loss_pause_minutes"), 15.0),
+                    to_float(
+                        defaults.get("consecutive_loss_pause_minutes"),
+                        self.default_config["consecutive_loss_pause_minutes"],
+                    ),
                 )
                 self._paused_until_ms = int(utcnow().timestamp() * 1000.0) + int(pause_minutes * 60_000)
                 logger.warning(
@@ -3998,7 +4238,10 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
 
     def _circuit_breaker_active(self) -> bool:
         defaults = self.config
-        if not to_bool(defaults.get("consecutive_loss_pause_enabled"), True):
+        if not to_bool(
+            defaults.get("consecutive_loss_pause_enabled"),
+            bool(self.default_config["consecutive_loss_pause_enabled"]),
+        ):
             return False
         if self._paused_until_ms <= 0:
             return False
@@ -4144,7 +4387,12 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
             # Gate 1: Minimum oracle move — small moves are noise, not signal.
             min_oracle_move = to_float(
                 _crypto_hf_param_value(defaults, "min_oracle_move_pct", timeframe),
-                _coerce_float(self._default_param("min_oracle_move_pct", timeframe), 0.30, 0.0, 100.0),
+                _coerce_float(
+                    self._default_param("min_oracle_move_pct", timeframe),
+                    self.default_config["min_oracle_move_pct"],
+                    0.0,
+                    100.0,
+                ),
             )
             oracle_move_ok = oracle_move_pct >= min_oracle_move
             gates.append(GateResult(
@@ -4241,28 +4489,64 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
                 0.0,
                 1.0,
             )
-            base_confidence = clamp(
-                0.55
-                + clamp(oracle_move_pct / 10.0, 0.0, 0.25)
-                + clamp(elapsed_ratio * 0.15, 0.0, 0.15),
-                0.55,
-                0.92,
+            min_oracle_move = max(
+                min_oracle_move,
+                to_float(
+                    defaults.get("directional_min_diff_pct", self.default_config["directional_min_diff_pct"]),
+                    self.default_config["directional_min_diff_pct"],
+                ),
             )
+            side_oracle_diff_pct = diff_pct if direction == "buy_yes" else -diff_pct
+            p_win = self._directional_probability(
+                defaults,
+                oracle_diff_pct=side_oracle_diff_pct,
+                elapsed_ratio=elapsed_ratio,
+            )
+            edge_percent = (p_win - entry_price) * 100.0
+            directional_phase, phase_min_edge, phase_score_mult = self._directional_phase_settings(
+                defaults,
+                timeframe=timeframe,
+                elapsed_ratio=elapsed_ratio,
+            )
+            min_required_edge = max(
+                to_float(
+                    defaults.get("min_edge_percent", self.default_config["min_edge_percent"]),
+                    self.default_config["min_edge_percent"],
+                ),
+                phase_min_edge,
+            )
+            edge_ok = edge_percent >= min_required_edge
+            gates.append(GateResult(
+                "directional_edge",
+                "Directional probability edge",
+                edge_ok,
+                score=float(edge_percent),
+                detail=(
+                    f"p_win={p_win:.4f} entry={entry_price:.4f} edge={edge_percent:.4f}% "
+                    f"phase={directional_phase} min={min_required_edge:.4f}%"
+                ),
+            ))
+            if not edge_ok:
+                rejections.append({
+                    "market": market.get("slug") or market_id,
+                    "asset": asset or "?",
+                    "timeframe": timeframe or "?",
+                    "gate": "directional_edge",
+                    "edge_percent": round(edge_percent, 4),
+                    "threshold_pct": round(min_required_edge, 4),
+                    "phase": directional_phase,
+                })
+                _emit_reject(MURMUR)
+                continue
+
             ml_probability_yes = _market_ml_probability_yes(market)
             if ml_probability_yes is not None:
                 ml_probability_yes = clamp(ml_probability_yes, 0.03, 0.97)
-                expected_prob = ml_probability_yes if direction == "buy_yes" else (1.0 - ml_probability_yes)
-                model_edge_percent = max(0.0, (expected_prob - entry_price) * 100.0)
-                edge_percent = max(oracle_move_pct, model_edge_percent)
-                confidence = clamp(
-                    max(base_confidence, 0.48 + (abs(ml_probability_yes - 0.5) * 1.1)),
-                    0.55,
-                    0.97,
-                )
+                model_prob_yes = ml_probability_yes
             else:
-                edge_percent = oracle_move_pct
-                confidence = base_confidence
-            min_required_edge = 0.0  # evaluate() handles final gating
+                model_prob_yes = p_win if direction == "buy_yes" else 1.0 - p_win
+            model_prob_no = 1.0 - model_prob_yes
+            confidence = clamp(max(0.45, 0.50 + abs(p_win - 0.50)), 0.30, 0.97)
 
             side = "YES" if direction == "buy_yes" else "NO"
             slug = market.get("slug") or market_id
@@ -4284,6 +4568,8 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
                 live_market_fetched_at=live_market_fetched_at,
                 market_data_age_ms=market_data_age_ms,
                 signal_family="crypto_maker", token_id=position_token_id,
+                p_win=p_win, model_prob_yes=model_prob_yes, model_prob_no=model_prob_no,
+                phase=directional_phase, phase_score_mult=phase_score_mult,
             )
             if opp is not None:
                 emit_emit_nowait(
@@ -4330,7 +4616,12 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
             timeframe_key: round(
                 to_float(
                     _crypto_hf_param_value(defaults, "min_oracle_move_pct", timeframe_key),
-                    _coerce_float(self._default_param("min_oracle_move_pct", timeframe_key), 0.30, 0.0, 100.0),
+                    _coerce_float(
+                        self._default_param("min_oracle_move_pct", timeframe_key),
+                        self.default_config["min_oracle_move_pct"],
+                        0.0,
+                        100.0,
+                    ),
                 ),
                 4,
             )
@@ -4397,6 +4688,11 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
         market_data_age_ms,
         signal_family: str,
         token_id,
+        p_win: float,
+        model_prob_yes: float,
+        model_prob_no: float,
+        phase: str,
+        phase_score_mult: float,
     ):
         """Build and return an Opportunity for the detect/on_event path."""
         opp = self.create_opportunity(
@@ -4437,6 +4733,13 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
                         "oracle_prices_by_source": _json_safe(market.get("oracle_prices_by_source") or {}),
                         "machine_learning": _json_safe(_market_ml_contract(market) or {}),
                         "oracle_diff_pct": diff_pct,
+                        "p_win": p_win,
+                        "model_prob_yes": model_prob_yes,
+                        "model_prob_no": model_prob_no,
+                        "up_price": self._float(market.get("up_price")),
+                        "down_price": self._float(market.get("down_price")),
+                        "directional_phase": phase,
+                        "directional_phase_score_mult": phase_score_mult,
                         "taker_fee_gate": min_required_edge,
                         "edge_percent": edge_percent,
                         "spread": spread,
@@ -4460,6 +4763,7 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
                 }
             ],
             is_guaranteed=False,
+            # evaluate() applies the canonical price-curve fee hurdle exactly once.
             skip_fee_model=True,
             custom_roi_percent=edge_percent,
             custom_risk_score=1.0 - confidence,
@@ -4493,6 +4797,13 @@ class BtcEthDirectionalEdgeStrategy(BaseStrategy):
                 "oracle_prices_by_source": _json_safe(market.get("oracle_prices_by_source") or {}),
                 "machine_learning": _json_safe(_market_ml_contract(market) or {}),
                 "oracle_diff_pct": diff_pct,
+                "p_win": p_win,
+                "model_prob_yes": model_prob_yes,
+                "model_prob_no": model_prob_no,
+                "up_price": self._float(market.get("up_price")),
+                "down_price": self._float(market.get("down_price")),
+                "directional_phase": phase,
+                "directional_phase_score_mult": phase_score_mult,
                 "taker_fee_gate": min_required_edge,
                 "edge_percent": edge_percent,
                 "spread": spread,
