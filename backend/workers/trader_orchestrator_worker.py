@@ -25,6 +25,8 @@ from models.database import (
     AsyncSessionLocal,
     apply_telemetry_async_commit,
     DiscoveredWallet,
+    SimulationPosition,
+    SimulationTrade,
     TradeSignal,
     TraderEvent,
     TraderOrder,
@@ -2818,13 +2820,38 @@ async def _backfill_simulation_ledger_for_active_shadow_orders(
     attempted = 0
     backfilled = 0
     skipped = 0
+    stale_markers = 0
     errors: list[dict[str, Any]] = []
     now_utc = utcnow()
     for row in rows:
         payload = dict(row.payload_json or {})
-        if isinstance(payload.get("simulation_ledger"), dict):
-            skipped += 1
-            continue
+        existing_ledger = payload.get("simulation_ledger")
+        if isinstance(existing_ledger, dict):
+            ledger_account_id = str(existing_ledger.get("account_id") or "").strip()
+            ledger_trade_id = str(existing_ledger.get("trade_id") or "").strip()
+            ledger_position_id = str(existing_ledger.get("position_id") or "").strip()
+            ledger_trade = (
+                await session.get(SimulationTrade, ledger_trade_id)
+                if ledger_trade_id
+                else None
+            )
+            ledger_position = (
+                await session.get(SimulationPosition, ledger_position_id)
+                if ledger_position_id
+                else None
+            )
+            ledger_rows_exist = bool(
+                ledger_account_id
+                and ledger_trade is not None
+                and ledger_position is not None
+                and str(ledger_trade.account_id or "") == ledger_account_id
+                and str(ledger_position.account_id or "") == ledger_account_id
+            )
+            if ledger_rows_exist:
+                skipped += 1
+                continue
+            stale_markers += 1
+            payload.pop("simulation_ledger", None)
         attempted += 1
         notional = safe_float(payload.get("filled_notional_usd"), None)
         if notional is None or notional <= 0.0:
@@ -2892,11 +2919,17 @@ async def _backfill_simulation_ledger_for_active_shadow_orders(
             )
 
     if backfilled > 0:
-        await session.flush()
+        await _commit_with_retry(
+            session,
+            retry_attempts=2,
+            base_delay_seconds=0.05,
+            max_delay_seconds=0.1,
+        )
     return {
         "attempted": attempted,
         "backfilled": backfilled,
         "skipped": skipped,
+        "stale_markers": stale_markers,
         "errors": errors,
     }
 

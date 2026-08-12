@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from config import settings
+from config import apply_search_filters, settings
 from models.database import AsyncSessionLocal
 from services import shared_state, trader_binding_cache
 from services.crypto_service import get_crypto_service
@@ -60,6 +60,7 @@ _ML_ANNOTATE_TIMEOUT_SECONDS = 8.0
 _ML_RECORD_TIMEOUT_SECONDS = 8.0
 _ML_PRUNE_TIMEOUT_SECONDS = 8.0
 _CRYPTO_MARKET_FETCH_TIMEOUT_SECONDS = 10.0
+_CRYPTO_SETTINGS_REFRESH_SECONDS = 10.0
 _CRYPTO_SUBSCRIPTION_SYNC_TIMEOUT_SECONDS = 3.0
 _CRYPTO_SNAPSHOT_PUBLISH_TIMEOUT_SECONDS = 5.0
 _BOUNDARY_INTERVALS_SECONDS = (300, 900, 3600, 14400)
@@ -571,6 +572,7 @@ class MarketRuntime:
         self._crypto_control_cache_at: float = 0.0
         self._crypto_lane_was_enabled: bool | None = None
         self._crypto_lane_pending_refresh: bool = False
+        self._last_crypto_settings_refresh_mono: float = 0.0
 
     def _retain_abandoned_task(self, task: asyncio.Task[Any]) -> None:
         self._abandoned_tasks.add(task)
@@ -1174,6 +1176,7 @@ class MarketRuntime:
             self._crypto_lane_pending_refresh = True
         self._crypto_lane_was_enabled = active
         if active:
+            await self._refresh_crypto_runtime_settings_if_due()
             trigger = "periodic_scan"
             if self._crypto_lane_pending_refresh:
                 trigger = "lane_re_enabled"
@@ -1191,6 +1194,23 @@ class MarketRuntime:
             except Exception as snapshot_exc:
                 logger.warning("Failed to persist crypto worker snapshot", exc_info=snapshot_exc)
         return interval_seconds
+
+    async def _refresh_crypto_runtime_settings_if_due(self) -> bool:
+        if not self._started:
+            return False
+        now_mono = time.monotonic()
+        if (
+            now_mono - self._last_crypto_settings_refresh_mono
+            < _CRYPTO_SETTINGS_REFRESH_SECONDS
+        ):
+            return False
+        self._last_crypto_settings_refresh_mono = now_mono
+        try:
+            await apply_search_filters()
+        except Exception as exc:
+            logger.warning("Failed to refresh crypto runtime settings", exc_info=exc)
+            return False
+        return True
 
     async def _read_crypto_control(self) -> dict[str, Any]:
         try:

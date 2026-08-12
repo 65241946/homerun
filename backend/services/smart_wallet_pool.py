@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from utils.utcnow import as_utc, as_utc_naive, utcnow, utcfromtimestamp
 from typing import Any, Awaitable, Optional, TypeVar
 
-from sqlalchemy import select, func, text, update as sa_update
+from sqlalchemy import case, select, func, text, update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import load_only
 
@@ -1069,6 +1069,8 @@ class SmartWalletPoolService:
                 if traded_at is None:
                     continue
 
+                instrument = self._extract_trade_instrument(trade)
+
                 candidates[address]["wallet_trades"] = True
                 events.append(
                     self._event_record(
@@ -1080,6 +1082,7 @@ class SmartWalletPoolService:
                         traded_at=traded_at,
                         source="wallet_trades_api",
                         tx_hash=trade.get("transactionHash") or trade.get("tx_hash"),
+                        **instrument,
                     )
                 )
                 inserted += 1
@@ -1166,6 +1169,14 @@ class SmartWalletPoolService:
             for trade in trades:
                 if not isinstance(trade, dict):
                     continue
+                trade_market_id = str(
+                    trade.get("market")
+                    or trade.get("condition_id")
+                    or trade.get("conditionId")
+                    or market_id
+                ).strip()
+                if not trade_market_id:
+                    continue
                 side = self._normalize_trade_side(
                     trade.get("side"),
                     trade.get("outcome"),
@@ -1183,23 +1194,30 @@ class SmartWalletPoolService:
                 if ts is None:
                     continue
 
-                user = (trade.get("user", "") or "").lower()
+                user = str(
+                    trade.get("proxyWallet")
+                    or trade.get("user")
+                    or trade.get("wallet")
+                    or ""
+                ).strip().lower()
                 maker = (trade.get("maker", "") or "").lower()
                 taker = (trade.get("taker", "") or "").lower()
                 tx_hash = trade.get("transactionHash") or trade.get("tx_hash")
+                instrument = self._extract_trade_instrument(trade)
 
                 if user:
                     candidates[user]["market_trades"] = True
                     events.append(
                         self._event_record(
                             wallet=user,
-                            market_id=str(market_id),
+                            market_id=trade_market_id,
                             side=side or "TRADE",
                             size=size,
                             price=price,
                             traded_at=ts,
                             source="trades_api",
                             tx_hash=tx_hash,
+                            **instrument,
                         )
                     )
                 else:
@@ -1208,13 +1226,14 @@ class SmartWalletPoolService:
                         events.append(
                             self._event_record(
                                 wallet=maker,
-                                market_id=str(market_id),
+                                market_id=trade_market_id,
                                 side="SELL",
                                 size=size,
                                 price=price,
                                 traded_at=ts,
                                 source="trades_api",
                                 tx_hash=tx_hash,
+                                **instrument,
                             )
                         )
                     if taker:
@@ -1222,13 +1241,14 @@ class SmartWalletPoolService:
                         events.append(
                             self._event_record(
                                 wallet=taker,
-                                market_id=str(market_id),
+                                market_id=trade_market_id,
                                 side="BUY",
                                 size=size,
                                 price=price,
                                 traded_at=ts,
                                 source="trades_api",
                                 tx_hash=tx_hash,
+                                **instrument,
                             )
                         )
 
@@ -1265,7 +1285,14 @@ class SmartWalletPoolService:
             if not address:
                 continue
 
-            market_id = row.get("market") or row.get("condition_id") or row.get("asset") or row.get("token_id") or ""
+            market_id = (
+                row.get("market")
+                or row.get("condition_id")
+                or row.get("conditionId")
+                or row.get("asset")
+                or row.get("token_id")
+                or ""
+            )
             if not market_id:
                 continue
 
@@ -1285,6 +1312,8 @@ class SmartWalletPoolService:
             if ts is None:
                 continue
 
+            instrument = self._extract_trade_instrument(row)
+
             candidates[address]["activity"] = True
             events.append(
                 self._event_record(
@@ -1296,6 +1325,7 @@ class SmartWalletPoolService:
                     traded_at=ts,
                     source="activity_api",
                     tx_hash=row.get("transactionHash") or row.get("tx_hash"),
+                    **instrument,
                 )
             )
 
@@ -1536,6 +1566,9 @@ class SmartWalletPoolService:
                     "wallet_address": event["wallet_address"],
                     "market_id": event["market_id"],
                     "side": event.get("side"),
+                    "token_id": event.get("token_id"),
+                    "outcome": event.get("outcome"),
+                    "outcome_index": event.get("outcome_index"),
                     "size": event.get("size"),
                     "price": event.get("price"),
                     "notional": event.get("notional"),
@@ -1547,12 +1580,29 @@ class SmartWalletPoolService:
             ]
             inserted_total = 0
             for row_chunk in _iter_chunks(rows, chunk_size=ACTIVITY_INSERT_CHUNK_SIZE):
-                stmt = (
-                    pg_insert(WalletActivityRollup)
-                    .values(row_chunk)
-                    .on_conflict_do_nothing(index_elements=["id"])
-                    .returning(WalletActivityRollup.id)
-                )
+                insert_stmt = pg_insert(WalletActivityRollup).values(row_chunk)
+                stmt = insert_stmt.on_conflict_do_update(
+                    index_elements=["id"],
+                    # An already-seen event may have been written by a source
+                    # that lacked outcome metadata.  Only fill missing identity
+                    # fields from a later authoritative API/WS observation; do
+                    # not infer values from BUY/SELL and do not overwrite an
+                    # established token identity.
+                    set_={
+                        "token_id": func.coalesce(WalletActivityRollup.token_id, insert_stmt.excluded.token_id),
+                        "outcome": func.coalesce(WalletActivityRollup.outcome, insert_stmt.excluded.outcome),
+                        "outcome_index": case(
+                            (
+                                insert_stmt.excluded.outcome_index.in_([0, 1]),
+                                insert_stmt.excluded.outcome_index,
+                            ),
+                            else_=func.coalesce(
+                                WalletActivityRollup.outcome_index,
+                                insert_stmt.excluded.outcome_index,
+                            ),
+                        ),
+                    },
+                ).returning(WalletActivityRollup.id)
                 result = await session.execute(stmt)
                 inserted_total += len(result.scalars().all())
             await session.commit()
@@ -2766,10 +2816,19 @@ class SmartWalletPoolService:
     async def _on_ws_trade_event(self, event):
         """Capture WS trades into rollups for minute-level recency updates."""
         market_id = event.token_id
+        outcome = None
+        outcome_index = None
         try:
             info = await self.client.get_market_by_token_id(event.token_id)
             if info:
                 market_id = info.get("condition_id") or info.get("slug") or event.token_id
+                token_ids = [str(value or "").strip() for value in (info.get("token_ids") or [])]
+                outcomes = [str(value or "").strip() for value in (info.get("outcomes") or [])]
+                normalized_token = str(event.token_id or "").strip()
+                if normalized_token in token_ids:
+                    outcome_index = token_ids.index(normalized_token)
+                    if outcome_index < len(outcomes):
+                        outcome = outcomes[outcome_index] or None
         except Exception:
             pass
 
@@ -2782,6 +2841,9 @@ class SmartWalletPoolService:
             traded_at=event.timestamp or utcnow(),
             source="ws",
             tx_hash=event.tx_hash,
+            token_id=event.token_id,
+            outcome=outcome,
+            outcome_index=outcome_index,
         )
         await self._persist_activity_events([record])
 
@@ -2799,18 +2861,55 @@ class SmartWalletPoolService:
         traded_at: datetime,
         source: str,
         tx_hash: Optional[str],
+        token_id: Optional[str] = None,
+        outcome: Optional[str] = None,
+        outcome_index: Optional[int] = None,
     ) -> dict:
         notional = abs(size) * abs(price)
+        normalized_token_id = str(token_id or "").strip() or None
+        normalized_outcome = str(outcome or "").strip() or None
+        try:
+            normalized_outcome_index = int(outcome_index) if outcome_index is not None else None
+        except (TypeError, ValueError):
+            normalized_outcome_index = None
         return {
             "wallet_address": wallet.lower(),
             "market_id": market_id,
             "side": side,
+            "token_id": normalized_token_id,
+            "outcome": normalized_outcome,
+            "outcome_index": normalized_outcome_index,
             "size": size,
             "price": price,
             "notional": notional,
             "traded_at": traded_at,
             "source": source,
             "tx_hash": tx_hash,
+        }
+
+    @staticmethod
+    def _extract_trade_instrument(row: dict[str, Any]) -> dict[str, Any]:
+        """Extract current Data API outcome-token identity without inference."""
+        token_id = str(
+            row.get("asset")
+            or row.get("asset_id")
+            or row.get("assetId")
+            or row.get("token_id")
+            or row.get("tokenId")
+            or ""
+        ).strip() or None
+        outcome = str(row.get("outcome") or "").strip() or None
+        raw_outcome_index = row.get("outcomeIndex")
+        if raw_outcome_index is None:
+            raw_outcome_index = row.get("outcome_index")
+        try:
+            outcome_index = int(raw_outcome_index) if raw_outcome_index is not None else None
+        except (TypeError, ValueError):
+            outcome_index = None
+        return {
+            "token_id": token_id,
+            "outcome": outcome,
+            "outcome_index": outcome_index,
         }
 
     def _normalize_trade_side(self, side_raw: Any, outcome_raw: Any = None) -> str:

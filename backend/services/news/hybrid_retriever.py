@@ -98,7 +98,8 @@ class HybridRetriever:
 
         # Get article embedding for semantic search
         article_embedding: Optional[np.ndarray] = None
-        if self._index.is_ml_mode:
+        semantic_index_available = self._index.has_embeddings
+        if semantic_index_available:
             article_embedding = self._index.embed_text(article_text)
 
         # Category filter based on event type affinity
@@ -119,10 +120,10 @@ class HybridRetriever:
         # If entity_weight is non-zero, renormalise the other three weights so
         # the total still sums to ~1.0.  This keeps existing thresholds valid.
         eff_kw_weight = keyword_weight
-        eff_sem_weight = semantic_weight
+        eff_sem_weight = semantic_weight if semantic_index_available else 0.0
         eff_evt_weight = event_weight
         eff_ent_weight = max(0.0, min(1.0, entity_weight))
-        if eff_ent_weight > 0:
+        if eff_ent_weight > 0 or not semantic_index_available:
             base_sum = eff_kw_weight + eff_sem_weight + eff_evt_weight
             if base_sum > 0:
                 scale = (1.0 - eff_ent_weight) / base_sum
@@ -163,10 +164,13 @@ class HybridRetriever:
             overlap_ratio = overlap_count / max(1, len(event_tokens)) if event_tokens else 0.0
 
             # Event alignment score blends category affinity and entity overlap.
-            category_score = 0.0
-            if affinity_categories and market.category:
-                if market.category in affinity_categories:
-                    category_score = 1.0
+            affinity_keys = {str(value).strip().casefold() for value in affinity_categories if value}
+            market_category_keys = {
+                str(value).strip().casefold()
+                for value in [market.category, *(market.tags or [])]
+                if value
+            }
+            category_score = 1.0 if affinity_keys.intersection(market_category_keys) else 0.0
             event_score = min(1.0, (0.35 * category_score) + (0.65 * overlap_ratio))
 
             has_textual_signal = (

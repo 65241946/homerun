@@ -227,6 +227,10 @@ class ConstraintSolver:
                 constraints=constraints,
                 integrality=integrality,
                 bounds=bounds,
+                # HiGHS otherwise creates a native worker pool for every
+                # concurrent solve.  Those native threads outlive the solve
+                # in the long-running detection process and accumulate.
+                options={"threads": 1},
             )
 
             if result.success:

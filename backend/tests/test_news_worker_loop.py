@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,25 @@ class _DummySession:
 
 
 @pytest.mark.asyncio
+async def test_recorded_news_payload_serializes_row_timestamps(monkeypatch):
+    from services.recorded_event_bus import bus
+
+    monkeypatch.setattr(news_worker, "_ensure_news_topic_registered", AsyncMock())
+    publish = AsyncMock()
+    monkeypatch.setattr(bus, "publish", publish)
+    created_at = datetime(2026, 8, 9, 9, 30, tzinfo=timezone.utc)
+
+    await news_worker._publish_news_update_to_bus(
+        SimpleNamespace(timestamp=created_at),
+        [{"id": "intent-1", "created_at": created_at}],
+        [{"id": "finding-1", "created_at": created_at}],
+    )
+
+    envelope = publish.await_args.args[0]
+    json.dumps(dict(envelope.payload))
+
+
+@pytest.mark.asyncio
 async def test_worker_respects_pause_without_manual_request(monkeypatch):
     fake_ai = SimpleNamespace(initialize_ai=AsyncMock(return_value=SimpleNamespace(is_available=lambda: False)))
     fake_feed_service = SimpleNamespace(load_from_db=AsyncMock())
@@ -35,7 +55,8 @@ async def test_worker_respects_pause_without_manual_request(monkeypatch):
     )
 
     monkeypatch.setattr(news_worker, "AsyncSessionLocal", lambda: _DummySession())
-    monkeypatch.setattr(news_worker.shared_state, "write_news_snapshot", AsyncMock())
+    write_news_snapshot_mock = AsyncMock()
+    monkeypatch.setattr(news_worker.shared_state, "write_news_snapshot", write_news_snapshot_mock)
     monkeypatch.setattr(news_worker, "write_worker_snapshot", AsyncMock())
     monkeypatch.setattr(
         news_worker.shared_state,
@@ -78,6 +99,7 @@ async def test_worker_respects_pause_without_manual_request(monkeypatch):
         await news_worker._run_loop()
 
     run_cycle_mock.assert_not_called()
+    assert write_news_snapshot_mock.await_args.kwargs["merge_stats"] is True
 
 
 @pytest.mark.asyncio

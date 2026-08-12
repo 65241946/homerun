@@ -219,6 +219,35 @@ class TestConstraintSolver:
         self.Dependency = Dependency
         self.DependencyType = DependencyType
 
+    def test_scipy_milp_limits_highs_worker_threads(self, monkeypatch):
+        """Each MILP solve must stay single-threaded inside the worker process."""
+        from types import SimpleNamespace
+
+        import scipy.optimize
+
+        captured: dict = {}
+
+        def fake_milp(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                success=True,
+                fun=0.4,
+                x=np.array([1.0, 0.0]),
+                message="optimal",
+            )
+
+        monkeypatch.setattr(scipy.optimize, "milp", fake_milp)
+
+        result = self.solver._solve_scipy(
+            prices=np.array([0.4, 0.6]),
+            A=np.array([[1.0, 1.0]]),
+            b=np.array([1.0]),
+            is_eq=np.array([True]),
+        )
+
+        assert result.solver_status == "optimal"
+        assert captured["options"] == {"threads": 1}
+
     def test_simple_binary_market_no_arbitrage(self):
         """Binary market with fair prices should show no arbitrage."""
         # Two outcomes, exactly one must be true (equality constraint).

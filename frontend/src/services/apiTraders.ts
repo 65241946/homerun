@@ -1572,12 +1572,16 @@ export interface TraderManualBuyPosition {
   market_id?: string
   market_question?: string
   outcome?: string
+  direction?: string
 }
 
 export interface TraderManualBuyResponse {
   status: string
   trader_id: string
   mode: string
+  decision_id: string
+  session_id: string | null
+  account_id: string | null
   orders: Array<{
     order_id: string
     market_id: string
@@ -1586,8 +1590,15 @@ export interface TraderManualBuyResponse {
     status: string
     notional_usd: number
     entry_price: number
+    effective_price: number
     size_shares: number
     error: string | null
+    simulation_ledger: {
+      account_id: string
+      trade_id: string
+      position_id: string
+      cash_ledger_entry_id: string | null
+    } | null
   }>
   message: string
 }
@@ -1597,7 +1608,9 @@ export const traderManualBuy = async (
   params: {
     positions: TraderManualBuyPosition[]
     size_usd: number
-    opportunity_id?: string
+    opportunity_id: string
+    client_request_id: string
+    order_type: 'market' | 'limit'
   }
 ): Promise<TraderManualBuyResponse> => {
   const { data } = await api.post(`/traders/${traderId}/manual-buy`, params)

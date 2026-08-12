@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Trans, useTranslation } from 'react-i18next'
@@ -24,16 +24,17 @@ import type { UnifiedTraderSignal } from './TraderSignalViews'
 
 // ─── Types ──────────────────────────────────────────────
 
-interface BuyPosition {
+export interface BuyPosition {
   token_id: string
   side: string
   price: number
   market_id: string
   market_question: string
   outcome: string
+  direction?: string
 }
 
-interface BuyConfig {
+export interface BuyConfig {
   title: string
   positions: BuyPosition[]
   defaultSizeUsd: number
@@ -56,7 +57,26 @@ interface BuyButtonProps {
 
 const SIZE_PRESETS = [5, 10, 25, 50, 100, 250]
 
+export const MANUAL_BUY_INVALIDATION_KEYS = [
+  ['simulation-accounts'],
+  ['positions-panel'],
+  ['accounts-panel'],
+  ['trader-orders'],
+  ['trader-orders-all'],
+  ['trader-orders-summary'],
+  ['trader-orders-selected'],
+] as const
+
 // ─── Helpers ────────────────────────────────────────────
+
+function canonicalPositionDirection(side: string, outcome: string): string | undefined {
+  const sideKey = String(side || '').trim().toLowerCase()
+  const outcomeKey = String(outcome || '').trim().toLowerCase()
+  if ((sideKey === 'buy' || sideKey === 'sell') && (outcomeKey === 'yes' || outcomeKey === 'no')) {
+    return `${sideKey}_${outcomeKey}`
+  }
+  return undefined
+}
 
 function buildConfigFromOpportunity(opp: Opportunity): BuyConfig {
   return {
@@ -68,6 +88,7 @@ function buildConfigFromOpportunity(opp: Opportunity): BuyConfig {
       market_id: pos.market_id || '',
       market_question: pos.market || '',
       outcome: pos.outcome || '',
+      direction: canonicalPositionDirection(pos.action || 'BUY', pos.outcome || ''),
     })),
     defaultSizeUsd: opp.total_cost > 0 ? opp.total_cost : 10,
     opportunityId: opp.id,
@@ -87,23 +108,38 @@ function resolveTraderSignalOutcomeLabel(sig: UnifiedTraderSignal): string {
   return String(sig.outcome || yesLabel).trim() || yesLabel
 }
 
-function buildConfigFromTraderSignal(sig: UnifiedTraderSignal): BuyConfig {
+export function buildConfigFromTraderSignal(sig: UnifiedTraderSignal): BuyConfig {
   const price = sig.direction === 'SELL'
     ? (sig.current_no_price ?? sig.no_price ?? 0.5)
     : (sig.current_yes_price ?? sig.yes_price ?? 0.5)
   const outcome = resolveTraderSignalOutcomeLabel(sig)
 
+  const retainedPositions = (sig.execution_positions || []).map(pos => ({
+    token_id: pos.token_id || '',
+    side: pos.side || 'BUY',
+    price: pos.price,
+    market_id: pos.market_id || sig.market_id || '',
+    market_question: pos.market_question || sig.market_question || '',
+    outcome: pos.outcome || outcome,
+    direction: pos.direction || canonicalPositionDirection(pos.side || 'BUY', pos.outcome || outcome),
+  }))
+  const positions = retainedPositions.length > 0
+    ? retainedPositions
+    : [{
+        token_id: '',
+        side: 'BUY',
+        price,
+        market_id: sig.market_id || '',
+        market_question: sig.market_question || '',
+        outcome,
+        direction: sig.direction === 'SELL' ? 'buy_no' : 'buy_yes',
+      }]
+
   return {
     title: sig.market_question,
-    positions: [{
-      token_id: '',
-      side: 'BUY',
-      price,
-      market_id: sig.market_id || '',
-      market_question: sig.market_question || '',
-      outcome,
-    }],
+    positions,
     defaultSizeUsd: sig.suggested_size_usd ?? 10,
+    opportunityId: sig.opportunity_id || sig.id,
     suggestedSizeUsd: sig.suggested_size_usd,
     direction: 'BUY',
     confidence: sig.confidence ?? null,
@@ -134,6 +170,7 @@ export default function BuyButton({ opportunity, traderSignal, className, varian
   const [orderType, setOrderType] = useState<'market' | 'limit'>('market')
   const [limitPrice, setLimitPrice] = useState('')
   const [confirmStep, setConfirmStep] = useState(false)
+  const requestIdRef = useRef('')
   const queryClient = useQueryClient()
 
   const config = useMemo<BuyConfig | null>(() => {
@@ -163,6 +200,8 @@ export default function BuyButton({ opportunity, traderSignal, className, varian
   const mutation = useMutation({
     mutationFn: (traderId: string) => {
       if (!config) throw new Error('No configuration')
+      if (!config.opportunityId) throw new Error('The opportunity is no longer identifiable. Refresh and retry.')
+      if (!requestIdRef.current) throw new Error('Manual order request id is missing. Reopen the order dialog.')
       const positions = config.positions.map(pos => ({
         ...pos,
         price: orderType === 'limit' && limitPrice ? parseFloat(limitPrice) : pos.price,
@@ -171,14 +210,19 @@ export default function BuyButton({ opportunity, traderSignal, className, varian
         positions,
         size_usd: effectiveSize,
         opportunity_id: config.opportunityId,
+        client_request_id: requestIdRef.current,
+        order_type: orderType,
       })
     },
     onSuccess: (data) => {
-      const success = data.status !== 'partial_failure'
+      const success = data.status === 'success'
       setResult({ success, message: data.message, traderId: selectedTraderId || undefined })
       setConfirmStep(false)
-      queryClient.invalidateQueries({ queryKey: ['trader-orders'] })
-      queryClient.invalidateQueries({ queryKey: ['trading-positions'] })
+      if (success) {
+        for (const queryKey of MANUAL_BUY_INVALIDATION_KEYS) {
+          void queryClient.invalidateQueries({ queryKey })
+        }
+      }
     },
     onError: (error: any) => {
       setResult({
@@ -196,11 +240,13 @@ export default function BuyButton({ opportunity, traderSignal, className, varian
     setOrderType('market')
     setLimitPrice('')
     setConfirmStep(false)
+    requestIdRef.current = ''
   }
 
   function handleOpen(e: React.MouseEvent) {
     e.stopPropagation()
     resetModal()
+    requestIdRef.current = globalThis.crypto.randomUUID()
     setOpen(true)
   }
 
@@ -351,11 +397,14 @@ export default function BuyButton({ opportunity, traderSignal, className, varian
                     </button>
                     <button
                       onClick={() => setOrderType('limit')}
+                      disabled={selectedTrader?.mode === 'shadow'}
+                      title={selectedTrader?.mode === 'shadow' ? 'Shadow orders use immediate-or-cancel execution.' : undefined}
                       className={cn(
                         'flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium transition-all',
                         orderType === 'limit'
                           ? 'bg-background text-foreground shadow-sm'
-                          : 'text-muted-foreground hover:text-foreground/80'
+                          : 'text-muted-foreground hover:text-foreground/80',
+                        selectedTrader?.mode === 'shadow' && 'cursor-not-allowed opacity-40 hover:text-muted-foreground',
                       )}
                     >
                       <Target className="w-3.5 h-3.5" />
@@ -450,7 +499,10 @@ export default function BuyButton({ opportunity, traderSignal, className, varian
                       {enabledTraders.map((trader: Trader) => (
                         <button
                           key={trader.id}
-                          onClick={() => setSelectedTraderId(trader.id === selectedTraderId ? null : trader.id)}
+                          onClick={() => {
+                            setSelectedTraderId(trader.id === selectedTraderId ? null : trader.id)
+                            if (trader.mode === 'shadow') setOrderType('market')
+                          }}
                           className={cn(
                             'w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all border',
                             selectedTraderId === trader.id
@@ -572,7 +624,15 @@ export default function BuyButton({ opportunity, traderSignal, className, varian
                       </Button>
                     )}
                     <Button
-                      onClick={() => { setOpen(false); setResult(null); resetModal() }}
+                      onClick={() => {
+                        if (!result.success) {
+                          setResult(null)
+                          return
+                        }
+                        setOpen(false)
+                        setResult(null)
+                        resetModal()
+                      }}
                       size="sm"
                       className={cn(
                         'flex-1 h-9 text-xs',
@@ -581,7 +641,7 @@ export default function BuyButton({ opportunity, traderSignal, className, varian
                           : 'bg-muted/40 hover:bg-muted/60 text-foreground border border-border/50'
                       )}
                     >
-                      {result.success ? t('buyButton.done') : t('buyButton.close')}
+                      {result.success ? t('buyButton.done') : t('common.retry')}
                     </Button>
                   </div>
                 ) : confirmStep && selectedTrader?.mode === 'live' ? (

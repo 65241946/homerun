@@ -2,10 +2,12 @@
 
 import sys
 import uuid
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from datetime import timedelta
 from typing import Optional
+from unittest.mock import AsyncMock
 import pytest
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -13,10 +15,12 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from utils.utcnow import utcnow
+import services.smart_wallet_pool as smart_wallet_pool_module  # noqa: E402
 import services.wallet_intelligence as wallet_intelligence_module  # noqa: E402
 from models.database import (  # noqa: E402
     Base,
     DiscoveredWallet,
+    MarketConfluenceSignal,
     TraderGroup,
     TraderGroupMember,
     TrackedWallet,
@@ -35,6 +39,143 @@ from services.smart_wallet_pool import (  # noqa: E402
 )
 from services.wallet_intelligence import ConfluenceDetector  # noqa: E402
 from tests.postgres_test_db import build_postgres_session_factory  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_deactivate_market_signals_persists_closed_market_state(tmp_path, monkeypatch):
+    engine, session_factory = await build_postgres_session_factory(Base, "confluence_closed_markets")
+    monkeypatch.setattr(wallet_intelligence_module, "AsyncSessionLocal", session_factory)
+
+    async with session_factory() as session:
+        session.add_all(
+            [
+                MarketConfluenceSignal(
+                    id="closed-active",
+                    market_id="0xclosed",
+                    signal_type="multi_wallet_buy",
+                    outcome="YES",
+                    is_active=True,
+                ),
+                MarketConfluenceSignal(
+                    id="closed-inactive",
+                    market_id="0xclosed",
+                    signal_type="multi_wallet_sell",
+                    outcome="NO",
+                    is_active=False,
+                ),
+                MarketConfluenceSignal(
+                    id="open-active",
+                    market_id="0xopen",
+                    signal_type="multi_wallet_buy",
+                    outcome="YES",
+                    is_active=True,
+                ),
+            ]
+        )
+        await session.commit()
+
+    detector = ConfluenceDetector()
+    deactivated = await detector.deactivate_market_signals([" 0xCLOSED ", "", "0xclosed"])
+
+    async with session_factory() as session:
+        closed_active = await session.get(MarketConfluenceSignal, "closed-active")
+        closed_inactive = await session.get(MarketConfluenceSignal, "closed-inactive")
+        open_active = await session.get(MarketConfluenceSignal, "open-active")
+
+    assert deactivated == 1
+    assert closed_active.is_active is False
+    assert closed_active.expired_at is not None
+    assert closed_inactive.is_active is False
+    assert open_active.is_active is True
+    assert open_active.expired_at is None
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_market_context_uses_fresh_metadata_for_tradability(monkeypatch):
+    detector = ConfluenceDetector()
+    market_id = "0xclosed"
+    lookup = AsyncMock(
+        return_value={
+            "question": "Closed market",
+            "slug": "closed-market",
+            "closed": True,
+            "active": False,
+            "accepting_orders": False,
+        }
+    )
+    monkeypatch.setattr(
+        wallet_intelligence_module.polymarket_client,
+        "get_market_by_condition_id",
+        lookup,
+    )
+
+    context = await detector._resolve_market_context(market_id)
+
+    lookup.assert_awaited_once_with(market_id, force_refresh=True)
+    assert context["tradability_confirmed"] is True
+    assert context["is_tradeable"] is False
+
+
+@pytest.mark.asyncio
+async def test_signal_upsert_does_not_reactivate_untradeable_market(monkeypatch):
+    engine, session_factory = await build_postgres_session_factory(Base, "confluence_upsert_tradability")
+    monkeypatch.setattr(wallet_intelligence_module, "AsyncSessionLocal", session_factory)
+    detector = ConfluenceDetector()
+
+    payload = {
+        "market_id": "0xclosed",
+        "market_question": "Closed market",
+        "market_slug": "closed-market",
+        "signal_type": "multi_wallet_buy",
+        "strength": 0.8,
+        "conviction_score": 80.0,
+        "tier": "HIGH",
+        "window_minutes": 15,
+        "wallet_count": 3,
+        "cluster_adjusted_wallet_count": 3,
+        "unique_core_wallets": 1,
+        "weighted_wallet_score": 0.8,
+        "wallets": ["0xa", "0xb", "0xc"],
+        "outcome": "YES",
+        "avg_entry_price": 0.5,
+        "total_size": 30.0,
+        "avg_wallet_rank": 0.7,
+        "net_notional": 15.0,
+        "conflicting_notional": 0.0,
+        "market_liquidity": 1000.0,
+        "market_volume_24h": 2000.0,
+        "is_tradeable": False,
+    }
+
+    await detector._batch_upsert_signals([payload])
+    async with session_factory() as session:
+        created = (
+            await session.execute(
+                wallet_intelligence_module.select(MarketConfluenceSignal).where(
+                    MarketConfluenceSignal.market_id == "0xclosed"
+                )
+            )
+        ).scalar_one()
+        assert created.is_active is False
+        assert created.expired_at is not None
+
+    active_payload = dict(payload, is_tradeable=True)
+    await detector._batch_upsert_signals([active_payload])
+    await detector._batch_upsert_signals([payload])
+    async with session_factory() as session:
+        refreshed = (
+            await session.execute(
+                wallet_intelligence_module.select(MarketConfluenceSignal).where(
+                    MarketConfluenceSignal.market_id == "0xclosed"
+                )
+            )
+        ).scalar_one()
+        assert refreshed.is_active is False
+        assert refreshed.expired_at is not None
+
+    await engine.dispose()
 
 
 def _wallet(
@@ -114,6 +255,153 @@ class TestWalletActivityRollupIdentity:
         second = {**first, "size": 11.0}
 
         assert svc._build_wallet_activity_rollup_id(first) != svc._build_wallet_activity_rollup_id(second)
+
+    def test_event_record_preserves_current_data_api_instrument_identity(self):
+        svc = SmartWalletPoolService()
+        traded_at = utcnow()
+
+        record = svc._event_record(
+            wallet="0xabc",
+            market_id="0x" + "1" * 64,
+            side="BUY",
+            size=15.0,
+            price=0.82,
+            traded_at=traded_at,
+            source="wallet_trades_api",
+            tx_hash="0xtrade",
+            token_id="24674095336808547940535196874152354815560124295320806027794449038192128385578",
+            outcome="Down",
+            outcome_index=1,
+        )
+
+        assert record["market_id"] == "0x" + "1" * 64
+        assert record["token_id"].startswith("246740")
+        assert record["outcome"] == "Down"
+        assert record["outcome_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_wallet_trade_collector_preserves_current_data_api_fields():
+    svc = SmartWalletPoolService()
+
+    async def _get_wallet_trades(_address, *, limit):
+        assert limit == 25
+        return [
+            {
+                "proxyWallet": "0xabc",
+                "side": "BUY",
+                "asset": "123456789",
+                "conditionId": "0x" + "2" * 64,
+                "size": 12.5,
+                "price": 0.31,
+                "timestamp": 1_786_327_509,
+                "outcome": "Away Team",
+                "outcomeIndex": 1,
+                "transactionHash": "0xwallettrade",
+            }
+        ]
+
+    svc.client = SimpleNamespace(get_wallet_trades=_get_wallet_trades)
+    candidates = defaultdict(lambda: defaultdict(bool))
+    events: list[dict] = []
+
+    await svc._collect_wallet_trade_candidates(
+        candidates,
+        events,
+        wallet_addresses=["0xABC"],
+        per_wallet_limit=25,
+    )
+
+    assert len(events) == 1
+    assert events[0]["market_id"] == "0x" + "2" * 64
+    assert events[0]["token_id"] == "123456789"
+    assert events[0]["outcome"] == "Away Team"
+    assert events[0]["outcome_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_market_trade_collector_accepts_proxy_wallet_current_contract():
+    svc = SmartWalletPoolService()
+
+    async def _get_markets(**_kwargs):
+        return [SimpleNamespace(condition_id="0x" + "3" * 64, liquidity=100.0, volume=200.0)]
+
+    async def _get_market_trades(_market_id, *, limit):
+        assert limit == 20
+        return [
+            {
+                "proxyWallet": "0xfeed",
+                "side": "SELL",
+                "asset": "987654321",
+                "conditionId": "0x" + "3" * 64,
+                "size": 4.0,
+                "price": 0.7,
+                "timestamp": 1_786_327_509,
+                "outcome": "Home Team",
+                "outcomeIndex": 0,
+                "transactionHash": "0xmarkettrade",
+            }
+        ]
+
+    svc.client = SimpleNamespace(get_markets=_get_markets, get_market_trades=_get_market_trades)
+    candidates = defaultdict(lambda: defaultdict(bool))
+    events: list[dict] = []
+
+    await svc._collect_market_trade_candidates(
+        candidates,
+        events,
+        max_markets=1,
+        max_trades_per_market=20,
+    )
+
+    assert len(events) == 1
+    assert events[0]["wallet_address"] == "0xfeed"
+    assert events[0]["side"] == "SELL"
+    assert events[0]["token_id"] == "987654321"
+    assert events[0]["outcome_index"] == 0
+
+
+@pytest.mark.asyncio
+async def test_rollup_upsert_replaces_placeholder_outcome_index_with_confirmed_binary_index(
+    tmp_path,
+    monkeypatch,
+):
+    engine, session_factory = await build_postgres_session_factory(Base, "rollup_outcome_index_enrichment")
+    monkeypatch.setattr(smart_wallet_pool_module, "AsyncSessionLocal", session_factory)
+
+    traded_at = utcnow()
+    common = {
+        "wallet": "0xabc",
+        "market_id": "0x" + "5" * 64,
+        "side": "BUY",
+        "size": 5.0,
+        "price": 0.4,
+        "traded_at": traded_at,
+        "source": "wallet_trades_api",
+        "tx_hash": "0xenrich",
+        "token_id": "555",
+        "outcome": "Away",
+    }
+    first_service = SmartWalletPoolService()
+    first_event = first_service._event_record(**common, outcome_index=999)
+    await first_service._persist_activity_events([first_event])
+
+    # A later authoritative observation of the same event can correct the
+    # API's placeholder index without inventing a value from BUY/SELL.
+    second_service = SmartWalletPoolService()
+    second_event = second_service._event_record(**common, outcome_index=1)
+    await second_service._persist_activity_events([second_event])
+
+    rollup_id = second_service._build_wallet_activity_rollup_id(second_event)
+    async with session_factory() as session:
+        row = await session.get(WalletActivityRollup, rollup_id)
+
+    assert row is not None
+    assert row.token_id == "555"
+    assert row.outcome == "Away"
+    assert row.outcome_index == 1
+
+    await engine.dispose()
 
 
 class TestSmartWalletPoolScoring:
@@ -402,6 +690,38 @@ class TestSmartWalletPoolChurnGuard:
 
 
 class TestConfluenceDetectorThresholds:
+    @pytest.mark.parametrize(
+        ("side", "outcome", "outcome_index", "expected"),
+        [
+            ("BUY", "Up", 0, "YES"),
+            ("BUY", "Down", 1, "NO"),
+            ("SELL", "Up", 0, "NO"),
+            ("SELL", "Down", 1, "YES"),
+        ],
+    )
+    def test_effective_outcome_uses_trade_side_and_token_outcome_index(
+        self,
+        side,
+        outcome,
+        outcome_index,
+        expected,
+    ):
+        detector = ConfluenceDetector()
+
+        assert detector._resolve_effective_outcome(side, outcome, outcome_index) == expected
+
+    def test_effective_outcome_rejects_legacy_rows_without_outcome_identity(self):
+        detector = ConfluenceDetector()
+
+        assert detector._resolve_effective_outcome("BUY", None, None) is None
+        assert detector._resolve_effective_outcome("SELL", None, None) is None
+
+    def test_sell_entry_price_is_converted_to_opposite_binary_outcome(self):
+        detector = ConfluenceDetector()
+
+        assert detector._canonical_entry_price("BUY", 0.72) == pytest.approx(0.72)
+        assert detector._canonical_entry_price("SELL", 0.72) == pytest.approx(0.28)
+
     def test_tier_thresholds_follow_watch_high_extreme(self):
         detector = ConfluenceDetector()
         assert detector._tier_for_count(3) == "WATCH"
@@ -509,5 +829,142 @@ async def test_confluence_qualifying_wallets_only_include_recent_activity_candid
     assert "group_recent" in addresses
     assert "stale_ranked" not in addresses
     assert "tracked_stale" not in addresses
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_confluence_groups_by_effective_binary_outcome_not_raw_buy_sell(tmp_path, monkeypatch):
+    engine, session_factory = await build_postgres_session_factory(Base, "confluence_effective_outcomes")
+    monkeypatch.setattr(wallet_intelligence_module, "AsyncSessionLocal", session_factory)
+
+    now = utcnow()
+    market_id = "0x" + "4" * 64
+    wallets = ["buy_yes", "sell_no", "buy_no", "sell_yes", "legacy_buy_1", "legacy_buy_2"]
+    async with session_factory() as session:
+        session.add_all(
+            [
+                DiscoveredWallet(
+                    address=address,
+                    rank_score=0.9,
+                    composite_score=0.8,
+                    anomaly_score=0.0,
+                )
+                for address in wallets
+            ]
+        )
+        session.add_all(
+            [
+                WalletActivityRollup(
+                    id="buy-yes",
+                    wallet_address="buy_yes",
+                    market_id=market_id,
+                    side="BUY",
+                    token_id="yes-token",
+                    outcome="Home",
+                    outcome_index=0,
+                    price=0.72,
+                    size=10,
+                    notional=7.2,
+                    traded_at=now - timedelta(minutes=2),
+                    source="unit_test",
+                ),
+                WalletActivityRollup(
+                    id="sell-no",
+                    wallet_address="sell_no",
+                    market_id=market_id,
+                    side="SELL",
+                    token_id="no-token",
+                    outcome="Away",
+                    outcome_index=1,
+                    price=0.28,
+                    size=10,
+                    notional=2.8,
+                    traded_at=now - timedelta(minutes=3),
+                    source="unit_test",
+                ),
+                WalletActivityRollup(
+                    id="buy-no",
+                    wallet_address="buy_no",
+                    market_id=market_id,
+                    side="BUY",
+                    token_id="no-token",
+                    outcome="Away",
+                    outcome_index=1,
+                    price=0.31,
+                    size=10,
+                    notional=3.1,
+                    traded_at=now - timedelta(minutes=4),
+                    source="unit_test",
+                ),
+                WalletActivityRollup(
+                    id="sell-yes",
+                    wallet_address="sell_yes",
+                    market_id=market_id,
+                    side="SELL",
+                    token_id="yes-token",
+                    outcome="Home",
+                    outcome_index=0,
+                    price=0.69,
+                    size=10,
+                    notional=6.9,
+                    traded_at=now - timedelta(minutes=5),
+                    source="unit_test",
+                ),
+                # Legacy rows have no token outcome identity.  They must not
+                # be guessed as YES merely because their raw side is BUY.
+                WalletActivityRollup(
+                    id="legacy-1",
+                    wallet_address="legacy_buy_1",
+                    market_id=market_id,
+                    side="BUY",
+                    price=0.5,
+                    size=100,
+                    notional=50,
+                    traded_at=now - timedelta(minutes=6),
+                    source="unit_test",
+                ),
+                WalletActivityRollup(
+                    id="legacy-2",
+                    wallet_address="legacy_buy_2",
+                    market_id=market_id,
+                    side="BUY",
+                    price=0.5,
+                    size=100,
+                    notional=50,
+                    traded_at=now - timedelta(minutes=7),
+                    source="unit_test",
+                ),
+            ]
+        )
+        await session.commit()
+
+    detector = ConfluenceDetector()
+
+    async def _market_contexts(market_ids):
+        assert market_ids == [market_id]
+        return {
+            market_id: {
+                "question": "Home vs Away",
+                "market_slug": "home-vs-away",
+                "liquidity": 10_000.0,
+                "volume_24h": 20_000.0,
+                "tradability_confirmed": True,
+                "is_tradeable": True,
+            }
+        }
+
+    monkeypatch.setattr(detector, "_batch_resolve_market_context", _market_contexts)
+
+    signals = await detector.scan_for_confluence()
+    by_outcome = {row["outcome"]: row for row in signals}
+
+    assert set(by_outcome) == {"YES", "NO"}
+    assert set(by_outcome["YES"]["wallets"]) == {"buy_yes", "sell_no"}
+    assert set(by_outcome["NO"]["wallets"]) == {"buy_no", "sell_yes"}
+    assert by_outcome["YES"]["avg_entry_price"] == pytest.approx(0.72)
+    assert by_outcome["NO"]["avg_entry_price"] == pytest.approx(0.31)
+    assert by_outcome["YES"]["net_notional"] == pytest.approx(14.4)
+    assert by_outcome["NO"]["net_notional"] == pytest.approx(6.2)
 
     await engine.dispose()

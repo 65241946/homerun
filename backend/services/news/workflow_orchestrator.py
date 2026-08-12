@@ -18,7 +18,7 @@ import logging
 import math
 import re
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from utils.utcnow import utcnow
@@ -37,7 +37,9 @@ logger = logging.getLogger(__name__)
 
 # Single-thread executor for CPU-bound embedding/index work.
 _EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="news_wf")
+_MARKET_INDEX_REBUILD_FUTURE: Future[int] | None = None
 _MAX_WORKFLOW_CYCLE_SECONDS = 90.0
+_MARKET_UNIVERSE_FETCH_TIMEOUT_SECONDS = 30.0
 _DB_DISCONNECT_MARKERS = (
     "connection is closed",
     "underlying connection is closed",
@@ -469,19 +471,18 @@ class WorkflowOrchestrator:
                 for m in market_infos
             ]
 
-            loop = asyncio.get_running_loop()
-            try:
-                if not market_watcher_index._initialized:
-                    await asyncio.wait_for(
-                        loop.run_in_executor(_EMBED_EXECUTOR, market_watcher_index.initialize),
-                        timeout=30,
-                    )
-                await asyncio.wait_for(
-                    loop.run_in_executor(_EMBED_EXECUTOR, market_watcher_index.rebuild, indexed_markets),
-                    timeout=30,
+            market_watcher_index.rebuild_keywords(indexed_markets)
+            global _MARKET_INDEX_REBUILD_FUTURE
+            if _MARKET_INDEX_REBUILD_FUTURE is None or _MARKET_INDEX_REBUILD_FUTURE.done():
+                if _MARKET_INDEX_REBUILD_FUTURE is not None:
+                    try:
+                        _MARKET_INDEX_REBUILD_FUTURE.result()
+                    except Exception as exc:
+                        logger.warning("Background market index rebuild failed", exc_info=exc)
+                _MARKET_INDEX_REBUILD_FUTURE = _EMBED_EXECUTOR.submit(
+                    market_watcher_index.rebuild,
+                    indexed_markets,
                 )
-            except Exception as exc:
-                logger.warning("Market watcher index init/rebuild failed (continuing without ML): %s", exc, exc_info=exc)
 
             # 4) Budget guardrails (global LLM accounting + cycle/hour caps).
             llm_manager = None
@@ -611,7 +612,9 @@ class WorkflowOrchestrator:
 
             all_findings: list[WorkflowFinding] = []
             market_sources_seen: dict[str, set[str]] = defaultdict(set)
-            cycle_deadline = started_at + timedelta(
+            # Feed sync and market-index setup have their own bounds. Give the
+            # cluster-processing stage its full configured budget.
+            cycle_deadline = datetime.now(timezone.utc) + timedelta(
                 seconds=float(
                     wf_settings.get("max_cycle_seconds", _MAX_WORKFLOW_CYCLE_SECONDS) or _MAX_WORKFLOW_CYCLE_SECONDS
                 )
@@ -1028,22 +1031,27 @@ class WorkflowOrchestrator:
         min_liquidity: float = 500.0,
         max_days_to_resolution: int = 365,
     ) -> list[dict]:
-        """Build market info from live markets with scanner fallback."""
-        try:
-            infos = await self._build_market_infos_from_polymarket(
-                min_liquidity=min_liquidity,
-                max_days_to_resolution=max_days_to_resolution,
-            )
-            if infos:
-                return infos
-        except Exception as exc:
-            logger.warning("Live market universe build failed: %s", exc)
-        logger.warning("Falling back to scanner snapshot for market universe")
-        return await self._build_market_infos_from_scanner(
+        """Build market info from the worker-owned catalog with live bootstrap fallback."""
+        infos = await self._build_market_infos_from_scanner(
             session,
             min_liquidity=min_liquidity,
             max_days_to_resolution=max_days_to_resolution,
         )
+        if infos:
+            return infos
+
+        logger.warning("Persisted scanner catalog is empty; falling back to live market bootstrap")
+        try:
+            return await asyncio.wait_for(
+                self._build_market_infos_from_polymarket(
+                    min_liquidity=min_liquidity,
+                    max_days_to_resolution=max_days_to_resolution,
+                ),
+                timeout=_MARKET_UNIVERSE_FETCH_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning("Live market universe build failed: %s", exc)
+            return []
 
     async def _build_market_infos_from_polymarket(
         self,
@@ -1150,8 +1158,104 @@ class WorkflowOrchestrator:
         min_liquidity: float,
         max_days_to_resolution: int,
     ) -> list[dict]:
-        """Fallback market universe from scanner DB snapshot opportunities."""
+        """Build the market universe from the scanner's persisted DB catalog."""
         from services import shared_state as scanner_state
+
+        try:
+            events, markets, _metadata = await scanner_state.read_market_catalog(session)
+        except Exception as exc:
+            logger.warning("Persisted scanner market catalog read failed: %s", exc)
+            events, markets = [], []
+
+        if markets:
+            event_by_slug: dict[str, dict[str, Any]] = {}
+            market_to_event: dict[str, dict[str, Any]] = {}
+            for event in events:
+                event_slug = str(getattr(event, "slug", "") or "").strip()
+                event_meta = {
+                    "event_slug": event_slug,
+                    "event_title": str(getattr(event, "title", "") or "").strip(),
+                    "category": str(getattr(event, "category", "") or "").strip(),
+                    "tags": self._normalize_tags(getattr(event, "tags", []) or []),
+                }
+                if event_slug:
+                    event_by_slug[event_slug] = event_meta
+                for event_market in getattr(event, "markets", []) or []:
+                    for market_key in (
+                        str(getattr(event_market, "id", "") or "").strip(),
+                        str(getattr(event_market, "condition_id", "") or "").strip(),
+                    ):
+                        if market_key:
+                            market_to_event[market_key] = event_meta
+
+            catalog_infos: list[dict[str, Any]] = []
+            seen_catalog_markets: set[str] = set()
+            now = datetime.now(timezone.utc)
+            for market in markets:
+                if not bool(getattr(market, "active", True)) or bool(getattr(market, "closed", False)):
+                    continue
+                question = str(getattr(market, "question", "") or "").strip()
+                if len(question) < 20:
+                    continue
+                liquidity = float(getattr(market, "liquidity", 0.0) or 0.0)
+                if liquidity < min_liquidity:
+                    continue
+                market_end = self._coerce_datetime(getattr(market, "end_date", None))
+                if market_end is not None:
+                    if market_end < now:
+                        continue
+                    if max_days_to_resolution > 0 and (market_end - now) > timedelta(
+                        days=max_days_to_resolution
+                    ):
+                        continue
+                market_id = str(getattr(market, "id", "") or "").strip()
+                condition_id = str(getattr(market, "condition_id", "") or "").strip()
+                market_id = market_id or condition_id
+                if not market_id or market_id in seen_catalog_markets:
+                    continue
+                seen_catalog_markets.add(market_id)
+
+                event_slug = str(getattr(market, "event_slug", "") or "").strip()
+                event_meta = (
+                    event_by_slug.get(event_slug)
+                    or market_to_event.get(market_id)
+                    or market_to_event.get(condition_id)
+                    or {}
+                )
+                yes_price_raw = getattr(market, "yes_price", None)
+                no_price_raw = getattr(market, "no_price", None)
+                catalog_infos.append(
+                    {
+                        "market_id": market_id,
+                        "condition_id": condition_id,
+                        "question": question,
+                        "event_title": str(event_meta.get("event_title") or ""),
+                        "event_slug": event_slug or event_meta.get("event_slug"),
+                        "event_ticker": None,
+                        "platform": str(getattr(market, "platform", "polymarket") or "polymarket"),
+                        "category": str(event_meta.get("category") or ""),
+                        "yes_price": float(yes_price_raw if yes_price_raw is not None else 0.5),
+                        "no_price": float(no_price_raw if no_price_raw is not None else 0.5),
+                        "liquidity": liquidity,
+                        "slug": str(getattr(market, "slug", "") or ""),
+                        "token_ids": [
+                            str(token_id)
+                            for token_id in (getattr(market, "clob_token_ids", []) or [])
+                            if token_id
+                        ],
+                        "end_date": market_end.isoformat() if market_end else None,
+                        "tags": self._normalize_tags(
+                            list(getattr(market, "tags", []) or [])
+                            + list(event_meta.get("tags", []) or [])
+                        ),
+                    }
+                )
+            if catalog_infos:
+                logger.info(
+                    "Built news market universe from persisted scanner catalog: %d markets",
+                    len(catalog_infos),
+                )
+                return catalog_infos
 
         opportunities = await scanner_state.get_opportunities_from_db(session, None)
         if not opportunities:

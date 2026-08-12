@@ -715,7 +715,7 @@ class TradersConfluenceStrategy(BaseStrategy):
         signals = await StrategySDK.get_trader_firehose_signals(
             limit=250,
             include_filtered=True,
-            include_source_context=False,
+            include_source_context=True,
         )
         if not signals:
             return []

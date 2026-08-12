@@ -12,6 +12,13 @@ import models.database as database_module
 from workers import host
 
 
+def test_detection_plane_loads_sports_market_refresh_strategies():
+    source_keys = host._PLANE_CONFIGS["detection"]["strategy_source_keys"]
+
+    assert "scanner" in source_keys
+    assert "sports" in source_keys
+
+
 def test_should_suppress_asyncio_exception_for_asyncpg_backend_pid_noise():
     exc = AttributeError("'NoneType' object has no attribute 'backend_pid'")
 

@@ -1429,15 +1429,24 @@ class StrategySDK:
 
     @staticmethod
     def infer_trader_side(signal: dict[str, Any]) -> str:
-        raw_direction = StrategySDK.normalize_trader_side(signal.get("direction"), default="")
-        if raw_direction:
-            return raw_direction
-        raw_outcome = StrategySDK.normalize_trader_side(signal.get("outcome"), default="")
-        if raw_outcome:
-            return raw_outcome
-        raw_signal_type = StrategySDK.normalize_trader_side(signal.get("signal_type"), default="")
-        if raw_signal_type:
-            return raw_signal_type
+        for key in ("side", "direction"):
+            raw = str(signal.get(key) or "").strip().lower()
+            if raw in {"buy", "yes", "long"}:
+                return "buy"
+            if raw in {"sell", "no", "short"}:
+                return "sell"
+
+        outcome = str(signal.get("outcome") or "").strip().lower()
+        if outcome == "yes":
+            return "buy"
+        if outcome == "no":
+            return "sell"
+
+        signal_type = str(signal.get("signal_type") or "").strip().lower()
+        if "buy" in signal_type or "accumulation" in signal_type:
+            return "buy"
+        if "sell" in signal_type or "distribution" in signal_type:
+            return "sell"
         return "all"
 
     @staticmethod

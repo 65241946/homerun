@@ -10,6 +10,10 @@ from sqlalchemy.exc import OperationalError
 from models.database import AsyncSessionLocal, init_database, recover_pool
 from services.ctf_execution import ctf_execution_service
 from services.live_execution_service import live_execution_service
+from services.live_settlement import (
+    apply_redeemer_state_updates,
+    record_redeemer_lifecycle_event,
+)
 from services.polymarket_collateral import collateral_registry
 from services.worker_state import (
     _is_retryable_db_error,
@@ -68,7 +72,17 @@ async def _verify_boot_invariants() -> str | None:
 
 async def _run_redeem_cycle(*, dry_run: bool) -> dict[str, Any]:
     if not await live_execution_service.ensure_initialized():
+        init_error = (
+            live_execution_service.get_last_init_error()
+            or "trading_service_not_initialized"
+        )
+        status = (
+            "not_configured"
+            if init_error == "missing_polymarket_credentials"
+            else "unavailable"
+        )
         return {
+            "status": status,
             "wallet_address": "",
             "positions_scanned": 0,
             "conditions_checked": 0,
@@ -76,9 +90,28 @@ async def _run_redeem_cycle(*, dry_run: bool) -> dict[str, Any]:
             "redeemed": 0,
             "failed": 0,
             "dry_run": bool(dry_run),
-            "errors": ["trading_service_not_initialized"],
+            "errors": [init_error],
         }
-    return await ctf_execution_service.redeem_resolved_wallet_positions(dry_run=dry_run)
+    summary = await ctf_execution_service.redeem_resolved_wallet_positions(
+        dry_run=dry_run,
+        status_callback=(None if dry_run else record_redeemer_lifecycle_event),
+    )
+    if dry_run:
+        return summary
+
+    # The callback records state before/after the chain transaction.  This
+    # completed-cycle reconciliation is an idempotent second line of defence
+    # for process restarts and callback delivery failures.
+    writeback = await apply_redeemer_state_updates(summary)
+    summary["settlement_writeback"] = writeback
+    writeback_errors = list(writeback.get("errors") or [])
+    if writeback_errors:
+        summary["status"] = "degraded"
+        summary["settlement_state_errors"] = writeback_errors
+        summary["failed"] = int(summary.get("failed") or 0) + len(writeback_errors)
+    else:
+        summary.setdefault("status", "ok")
+    return summary
 
 
 async def run_worker_loop() -> None:
@@ -205,8 +238,11 @@ async def run_worker_loop() -> None:
                             "timed_out": True,
                         },
                     )
-            except Exception:
-                pass
+            except Exception as snapshot_exc:  # noqa: BLE001 - preserve worker loop
+                logger.warning(
+                    "Redeemer timeout snapshot write failed",
+                    exc_info=snapshot_exc,
+                )
             await asyncio.sleep(_IDLE_SLEEP_SECONDS)
         except OperationalError as exc:
             if not _is_retryable_db_error(exc):
@@ -223,7 +259,7 @@ async def run_worker_loop() -> None:
                 logger.warning("Recovered DB connection pool after redeemer worker disconnects")
             await asyncio.sleep(_IDLE_SLEEP_SECONDS)
         except Exception as exc:
-            logger.exception("Redeemer worker cycle failed: %s", exc)
+            logger.exception("Redeemer worker cycle failed")
             try:
                 async with AsyncSessionLocal() as session:
                     await write_worker_snapshot(
@@ -235,8 +271,11 @@ async def run_worker_loop() -> None:
                         interval_seconds=interval_seconds,
                         last_error=str(exc),
                     )
-            except Exception:
-                pass
+            except Exception as snapshot_exc:  # noqa: BLE001 - preserve worker loop
+                logger.warning(
+                    "Redeemer error snapshot write failed",
+                    exc_info=snapshot_exc,
+                )
             await asyncio.sleep(_IDLE_SLEEP_SECONDS)
 
 

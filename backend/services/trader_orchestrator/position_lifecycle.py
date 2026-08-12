@@ -11,7 +11,16 @@ from sqlalchemy import bindparam, func, inspect, or_, select, text as _sa_text, 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
-from models.database import AsyncSessionLocal, LiveTradingOrder, LiveTradingPosition, TradeSignal, TraderOrder, release_conn
+from models.database import (
+    AsyncSessionLocal,
+    LiveTradingOrder,
+    LiveTradingPosition,
+    OnlineMarketResolution,
+    SimulationAccount,
+    TradeSignal,
+    TraderOrder,
+    release_conn,
+)
 from services.polymarket import polymarket_client
 from services.runtime_signal_queue import publish_signal_batch
 from services.signal_bus import make_dedupe_key, upsert_trade_signal
@@ -4598,7 +4607,7 @@ async def reconcile_shadow_positions(
     max_age_hours: Optional[int] = None,
     order_ids: Optional[list[str]] = None,
     reason: str = "shadow_position_lifecycle",
-    enable_simulation_ledger: bool = False,
+    enable_simulation_ledger: bool = True,
 ) -> dict[str, Any]:
     params = dict(trader_params or {})
     mode_key = "shadow"
@@ -4650,6 +4659,79 @@ async def reconcile_shadow_positions(
         ]
     candidates = _dedupe_live_authority_rows(candidates)
 
+    simulation_account_id_by_order: dict[str, str] = {}
+    referenced_account_ids: set[str] = set()
+    if enable_simulation_ledger:
+        for candidate in candidates:
+            candidate_payload = candidate.payload_json if isinstance(candidate.payload_json, dict) else {}
+            ledger_reference = candidate_payload.get("simulation_ledger")
+            if not isinstance(ledger_reference, dict):
+                continue
+            account_id = str(ledger_reference.get("account_id") or "").strip()
+            if not account_id:
+                continue
+            order_id = str(candidate.id or "").strip()
+            simulation_account_id_by_order[order_id] = account_id
+            referenced_account_ids.add(account_id)
+
+    v2_account_ids: set[str] = set()
+    if referenced_account_ids:
+        account_rows = (
+            await session.execute(
+                select(SimulationAccount.id, SimulationAccount.ledger_version).where(
+                    SimulationAccount.id.in_(tuple(referenced_account_ids))
+                )
+            )
+        ).all()
+        v2_account_ids = {
+            str(row.id)
+            for row in account_rows
+            if int(row.ledger_version or 1) >= 2
+        }
+    v2_order_ids = {
+        order_id
+        for order_id, account_id in simulation_account_id_by_order.items()
+        if account_id in v2_account_ids
+    }
+
+    v2_resolution_by_order_id: dict[str, OnlineMarketResolution] = {}
+    v2_identity_keys = {
+        (
+            str(candidate.venue or "polymarket").strip().lower(),
+            str(candidate.condition_id or "").strip(),
+        )
+        for candidate in candidates
+        if str(candidate.id or "") in v2_order_ids
+        and str(candidate.condition_id or "").strip()
+    }
+    if v2_identity_keys:
+        condition_ids = tuple(sorted({condition_id for _venue, condition_id in v2_identity_keys}))
+        resolution_rows = (
+            await session.execute(
+                select(OnlineMarketResolution).where(
+                    OnlineMarketResolution.condition_id.in_(condition_ids)
+                )
+            )
+        ).scalars().all()
+        resolution_by_identity = {
+            (
+                str(resolution.venue or "").strip().lower(),
+                str(resolution.condition_id or "").strip(),
+            ): resolution
+            for resolution in resolution_rows
+        }
+        for candidate in candidates:
+            order_id = str(candidate.id or "")
+            if order_id not in v2_order_ids:
+                continue
+            identity_key = (
+                str(candidate.venue or "polymarket").strip().lower(),
+                str(candidate.condition_id or "").strip(),
+            )
+            resolution = resolution_by_identity.get(identity_key)
+            if resolution is not None:
+                v2_resolution_by_order_id[order_id] = resolution
+
     signal_ids = [str(row.signal_id) for row in candidates if row.signal_id]
     signal_payloads: dict[str, dict[str, Any]] = {}
     if signal_ids:
@@ -4660,10 +4742,13 @@ async def reconcile_shadow_positions(
         ).all()
         signal_payloads = {str(row.id): dict(row.payload_json or {}) for row in signal_rows}
 
-    from models.database import release_conn
-
-    async with release_conn(session):
-        market_info_by_id = await load_market_info_for_orders(candidates)
+    v2_candidates = [row for row in candidates if str(row.id or "") in v2_order_ids]
+    legacy_candidates = [row for row in candidates if str(row.id or "") not in v2_order_ids]
+    v2_market_info_by_id = _fallback_market_info_for_orders(v2_candidates)
+    market_info_by_id: dict[str, Optional[dict[str, Any]]] = {}
+    if legacy_candidates:
+        async with release_conn(session):
+            market_info_by_id = await load_market_info_for_orders(legacy_candidates)
 
     now = utcnow()
     would_close = 0
@@ -4675,14 +4760,62 @@ async def reconcile_shadow_positions(
     skipped_reasons: dict[str, int] = {}
     details: list[dict[str, Any]] = []
     state_updates = 0
+    settlement_pending = 0
     reverse_signal_ids_by_source: dict[str, list[str]] = {}
 
     for row in candidates:
+        order_id = str(row.id or "")
+        v2_resolution = v2_resolution_by_order_id.get(order_id)
+        v2_resolution_state = str(getattr(v2_resolution, "state", "") or "").strip().lower()
+        if v2_resolution is not None and v2_resolution_state in {"final", "conflicted"}:
+            payload = dict(row.payload_json or {})
+            prior_pending = payload.get("settlement_pending")
+            prior_pending = dict(prior_pending) if isinstance(prior_pending, dict) else {}
+            pending_status = (
+                "awaiting_settlement_coordinator"
+                if v2_resolution_state == "final"
+                else "manual_review_required"
+            )
+            next_pending = {
+                "status": pending_status,
+                "source": "online_market_resolution",
+                "online_market_resolution_id": str(v2_resolution.id),
+                "resolution_state": v2_resolution_state,
+                "resolution_fact_version": int(v2_resolution.fact_version or 1),
+                "resolution_evidence_hash": str(v2_resolution.evidence_hash or ""),
+                "winning_token_id": str(v2_resolution.winning_token_id or "") or None,
+                "first_detected_at": (
+                    str(prior_pending.get("first_detected_at") or "").strip()
+                    or _iso_utc(now)
+                ),
+            }
+            settlement_pending += 1
+            held += 1
+            details.append(
+                {
+                    "order_id": row.id,
+                    "market_id": row.market_id,
+                    "reason": "v2_settlement_coordinator_required",
+                    "settlement_pending": next_pending,
+                }
+            )
+            if not dry_run and prior_pending != next_pending:
+                payload["settlement_pending"] = next_pending
+                row.payload_json = payload
+                row.updated_at = now
+                state_updates += 1
+            continue
+
+        is_v2_order = order_id in v2_order_ids
         entry_price = safe_float(row.effective_price)
         if entry_price is None or entry_price <= 0:
             entry_price = safe_float(row.entry_price)
         notional = safe_float(row.notional_usd) or 0.0
-        row_market_info = market_info_by_id.get(str(row.market_id or ""))
+        row_market_info = (
+            v2_market_info_by_id.get(str(row.market_id or ""))
+            if is_v2_order
+            else market_info_by_id.get(str(row.market_id or ""))
+        )
         row_payload_for_idx = dict(row.payload_json or {})
         row_token_id_for_idx = _extract_leg_token_id(row_payload_for_idx)
         outcome_idx = _direction_outcome_index(
@@ -4755,13 +4888,17 @@ async def reconcile_shadow_positions(
             continue
 
         signal_payload = signal_payloads.get(str(row.signal_id), {})
-        market_info = market_info_by_id.get(str(row.market_id or ""))
+        market_info = (
+            v2_market_info_by_id.get(str(row.market_id or ""))
+            if is_v2_order
+            else market_info_by_id.get(str(row.market_id or ""))
+        )
         market_tradable = polymarket_client.is_market_tradable(market_info, now=now)
         market_seconds_left = _market_seconds_left(market_info, now)
         market_end_time = _market_end_time_iso(market_info)
-        winning_idx = _extract_winning_outcome_index(market_info)
+        winning_idx = None if is_v2_order else _extract_winning_outcome_index(market_info)
         winning_idx_inferred = False
-        if winning_idx is None and resolution_infer_from_prices:
+        if not is_v2_order and winning_idx is None and resolution_infer_from_prices:
             inferred_idx = _extract_winning_outcome_index_from_prices(
                 market_info,
                 market_tradable=market_tradable,
@@ -5238,6 +5375,7 @@ async def reconcile_shadow_positions(
         "held": held,
         "skipped": skipped,
         "state_updates": state_updates,
+        "settlement_pending": settlement_pending,
         "total_realized_pnl": total_realized_pnl,
         "by_status": by_status,
         "skipped_reasons": skipped_reasons,

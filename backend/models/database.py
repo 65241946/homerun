@@ -10,6 +10,8 @@ from sqlalchemy import (
     Enum as SQLEnum,
     Index,
     UniqueConstraint,
+    CheckConstraint,
+    Numeric,
     event as _sa_event,
     text,
     DDL,
@@ -731,6 +733,17 @@ class SimulationAccount(Base):
     total_trades = Column(Integer, nullable=False, default=0)
     winning_trades = Column(Integer, nullable=False, default=0)
     losing_trades = Column(Integer, nullable=False, default=0)
+    # Proof-grade cash journals are opt-in for historical accounts. Existing
+    # rows remain ledger v1/legacy until an explicit checkpoint or a fresh v2
+    # account is created by SimulationService.
+    ledger_version = Column(Integer, nullable=False, default=1, server_default="1")
+    ledger_integrity_status = Column(
+        String,
+        nullable=False,
+        default="legacy",
+        server_default="legacy",
+    )
+    ledger_verified_at = Column(UTCDateTime, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -2912,7 +2925,13 @@ class WalletActivityRollup(Base):
     id = Column(String, primary_key=True)
     wallet_address = Column(String, nullable=False, index=True)
     market_id = Column(String, nullable=False, index=True)
-    side = Column(String, nullable=True)  # BUY/SELL/YES/NO
+    side = Column(String, nullable=True)  # Executed action: BUY/SELL
+    # Preserve the traded outcome token identity separately from action side.
+    # ``market_id`` is the condition ID; token/outcome fields identify which
+    # leg of that market the wallet actually traded.
+    token_id = Column(String, nullable=True)
+    outcome = Column(String, nullable=True)
+    outcome_index = Column(Integer, nullable=True)
     size = Column(Float, nullable=True)
     price = Column(Float, nullable=True)
     notional = Column(Float, nullable=True)
@@ -4327,6 +4346,15 @@ class TraderOrder(Base):
     strategy_key = Column(String, nullable=True, index=True)
     strategy_version = Column(Integer, nullable=True, index=True)
     market_id = Column(String, nullable=False, index=True)
+    # Typed market identity. ``market_id`` is retained for API/backward
+    # compatibility and is usually Gamma's numeric provider market id; it must
+    # never be guessed to be a token or condition id.
+    venue = Column(String, nullable=True)
+    provider_market_id = Column(String, nullable=True)
+    condition_id = Column(String, nullable=True)
+    token_id = Column(String, nullable=True)
+    outcome_index = Column(Integer, nullable=True)
+    identity_status = Column(String, nullable=True)
     market_question = Column(Text, nullable=True)
     direction = Column(String, nullable=True)
     event_id = Column(String, nullable=True, index=True)
@@ -4362,6 +4390,14 @@ class TraderOrder(Base):
         # Removing them here keeps create_all == migration-chain (roundtrip).
         Index("idx_trader_orders_status", "status"),
         Index("idx_trader_orders_trader_mode_status", "trader_id", "mode", "status"),
+        Index("idx_trader_orders_condition_id", "condition_id"),
+        Index("idx_trader_orders_token_id", "token_id"),
+        Index(
+            "idx_trader_orders_settlement_scan",
+            "mode",
+            "status",
+            "identity_status",
+        ),
     )
 
 
@@ -4561,13 +4597,12 @@ def _mirror_trader_order_to_verification(mapper, connection, target):  # noqa: A
         index_elements=["trader_order_id"],
         set_=update_set,
     )
-    try:
-        connection.execute(stmt)
-    except Exception:
-        # NEVER let a mirror failure abort the parent TraderOrder write.
-        # The side table is a derived view; any lost mirror update will
-        # be reconciled on the next TraderOrder write to the same row.
-        pass
+    # This mirror is part of the same financial transaction as the parent
+    # TraderOrder write.  A failure must abort that transaction: otherwise the
+    # order can appear cash-verified while the authoritative verification row
+    # still carries an older value.  The caller will observe/retry the database
+    # error instead of accepting a split-brain P&L state.
+    connection.execute(stmt)
 
 
 _sa_event.listen(TraderOrder, "after_insert", _mirror_trader_order_to_verification)
@@ -4606,6 +4641,291 @@ class TraderOrderVerificationEvent(Base):
     __table_args__ = (
         Index("idx_tove_order_created", "trader_order_id", "created_at"),
         Index("idx_tove_status_created", "verification_status", "created_at"),
+    )
+
+
+class OnlineMarketResolution(Base):
+    """Current normalized online resolution fact for one venue market."""
+
+    __tablename__ = "online_market_resolutions"
+
+    id = Column(String, primary_key=True)
+    venue = Column(String, nullable=False, default="polymarket")
+    provider = Column(String, nullable=False, default="gamma")
+    provider_market_id = Column(String, nullable=True)
+    condition_id = Column(String, nullable=False)
+    token_ids_json = Column(JSON, nullable=False, default=list)
+    outcomes_json = Column(JSON, nullable=False, default=list)
+    outcome_prices_json = Column(JSON, nullable=False, default=list)
+    state = Column(String, nullable=False, default="open")
+    winning_token_id = Column(String, nullable=True)
+    winning_outcome_index = Column(Integer, nullable=True)
+    winning_outcome = Column(String, nullable=True)
+    provider_resolved_at = Column(UTCDateTime, nullable=True)
+    first_observed_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    last_observed_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    finalized_at = Column(UTCDateTime, nullable=True)
+    fact_version = Column(Integer, nullable=False, default=1)
+    evidence_hash = Column(String, nullable=False)
+    evidence_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    updated_at = Column(UTCDateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "condition_id",
+            name="uq_online_market_resolutions_venue_condition",
+        ),
+        CheckConstraint(
+            "state IN ('open', 'closed_pending', 'final', 'conflicted', 'invalid')",
+            name="ck_online_market_resolutions_state",
+        ),
+        Index("idx_online_market_resolutions_state", "state"),
+        Index("idx_online_market_resolutions_provider_market", "provider_market_id"),
+    )
+
+
+class OnlineMarketResolutionObservation(Base):
+    """Append-only normalized evidence observed from a resolution provider."""
+
+    __tablename__ = "online_market_resolution_observations"
+
+    id = Column(String, primary_key=True)
+    provider = Column(String, nullable=False)
+    venue = Column(String, nullable=False, default="polymarket")
+    provider_market_id = Column(String, nullable=True)
+    condition_id = Column(String, nullable=False)
+    token_ids_json = Column(JSON, nullable=False, default=list)
+    outcomes_json = Column(JSON, nullable=False, default=list)
+    outcome_prices_json = Column(JSON, nullable=False, default=list)
+    closed = Column(Boolean, nullable=True)
+    accepting_orders = Column(Boolean, nullable=True)
+    resolution_status = Column(String, nullable=True)
+    state = Column(String, nullable=False)
+    winning_token_id = Column(String, nullable=True)
+    winning_outcome_index = Column(Integer, nullable=True)
+    winning_outcome = Column(String, nullable=True)
+    provider_resolved_at = Column(UTCDateTime, nullable=True)
+    provider_updated_at = Column(UTCDateTime, nullable=True)
+    evidence_hash = Column(String, nullable=False)
+    evidence_json = Column(JSON, nullable=False, default=dict)
+    observed_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "condition_id",
+            "evidence_hash",
+            name="uq_online_resolution_observation_evidence",
+        ),
+        CheckConstraint(
+            "state IN ('open', 'closed_pending', 'final', 'invalid')",
+            name="ck_online_resolution_observations_state",
+        ),
+        Index(
+            "idx_online_resolution_observations_condition_observed",
+            "condition_id",
+            "observed_at",
+        ),
+    )
+
+
+class TraderOrderSettlement(Base):
+    """Idempotent order-level economic settlement certificate."""
+
+    __tablename__ = "trader_order_settlements"
+
+    id = Column(String, primary_key=True)
+    trader_order_id = Column(
+        String,
+        ForeignKey("trader_orders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    settlement_kind = Column(String, nullable=False)
+    mode = Column(String, nullable=False)
+    simulation_account_id = Column(
+        String,
+        ForeignKey("simulation_accounts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    simulation_trade_id = Column(
+        String,
+        ForeignKey("simulation_trades.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    simulation_position_id = Column(
+        String,
+        ForeignKey("simulation_positions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    online_market_resolution_id = Column(
+        String,
+        ForeignKey("online_market_resolutions.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    resolution_fact_version = Column(Integer, nullable=True)
+    held_token_id = Column(String, nullable=True)
+    winning_token_id = Column(String, nullable=True)
+    quantity = Column(Numeric(38, 18, asdecimal=True), nullable=True)
+    cost_basis_usdc = Column(Numeric(20, 6, asdecimal=True), nullable=True)
+    gross_payout_usdc = Column(Numeric(20, 6, asdecimal=True), nullable=True)
+    fee_usdc = Column(Numeric(20, 6, asdecimal=True), nullable=True)
+    net_payout_usdc = Column(Numeric(20, 6, asdecimal=True), nullable=True)
+    realized_pnl_usdc = Column(Numeric(20, 6, asdecimal=True), nullable=True)
+    status = Column(String, nullable=False, default="detected")
+    # Live settlement finality is intentionally orthogonal to the generic
+    # settlement status.  A market may be final while the wallet is not yet
+    # claimable, a redeem transaction may be confirmed while its USDC receipt
+    # is not yet attributable, and only cash_verified may populate verified
+    # realized P&L on the order.
+    live_state = Column(String, nullable=True)
+    live_state_version = Column(Integer, nullable=False, default=0)
+    live_evidence_hash = Column(String, nullable=True)
+    live_evidence_json = Column(JSON, nullable=False, default=dict)
+    claimable_at = Column(UTCDateTime, nullable=True)
+    redeem_submitted_at = Column(UTCDateTime, nullable=True)
+    redeem_confirmed_at = Column(UTCDateTime, nullable=True)
+    cash_verified_at = Column(UTCDateTime, nullable=True)
+    redeem_tx_hash = Column(String, nullable=True)
+    authority = Column(String, nullable=False)
+    evidence_hash = Column(String, nullable=False)
+    idempotency_key = Column(String, nullable=False)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    detected_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    applied_at = Column(UTCDateTime, nullable=True)
+    projected_at = Column(UTCDateTime, nullable=True)
+    verified_at = Column(UTCDateTime, nullable=True)
+    reversed_at = Column(UTCDateTime, nullable=True)
+    created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    updated_at = Column(UTCDateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "trader_order_id",
+            "settlement_kind",
+            name="uq_trader_order_settlements_order_kind",
+        ),
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_trader_order_settlements_idempotency",
+        ),
+        CheckConstraint(
+            "status IN ('detected', 'applied', 'projected', 'verified', "
+            "'manual_review', 'reversed', 'failed')",
+            name="ck_trader_order_settlements_status",
+        ),
+        CheckConstraint(
+            "live_state IS NULL OR live_state IN ('market_final', 'claimable', "
+            "'redeem_submitted', 'redeem_confirmed', 'cash_verified')",
+            name="ck_trader_order_settlements_live_state",
+        ),
+        Index("idx_trader_order_settlements_status", "status"),
+        Index("idx_trader_order_settlements_resolution", "online_market_resolution_id"),
+        Index("idx_trader_order_settlements_live_state", "live_state"),
+        Index("idx_trader_order_settlements_redeem_tx_hash", "redeem_tx_hash"),
+    )
+
+
+class ImmutableLedgerEntryError(RuntimeError):
+    """Raised when application code attempts to mutate an append-only cash row."""
+
+
+class SimulationCashLedgerEntry(Base):
+    """Immutable signed USDC journal entry for a simulation account."""
+
+    __tablename__ = "simulation_cash_ledger_entries"
+
+    id = Column(String, primary_key=True)
+    account_id = Column(
+        String,
+        ForeignKey("simulation_accounts.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    simulation_trade_id = Column(
+        String,
+        ForeignKey("simulation_trades.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    trader_order_id = Column(
+        String,
+        ForeignKey("trader_orders.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    trader_order_settlement_id = Column(
+        String,
+        ForeignKey("trader_order_settlements.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    ledger_sequence = Column(BigInteger, nullable=False)
+    entry_type = Column(String, nullable=False)
+    amount_usdc = Column(Numeric(20, 6, asdecimal=True), nullable=False)
+    currency = Column(String, nullable=False, default="USDC")
+    occurred_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    idempotency_key = Column(String, nullable=False)
+    reversal_of_entry_id = Column(
+        String,
+        ForeignKey("simulation_cash_ledger_entries.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    evidence_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_simulation_cash_ledger_idempotency",
+        ),
+        UniqueConstraint(
+            "account_id",
+            "ledger_sequence",
+            name="uq_simulation_cash_ledger_account_sequence",
+        ),
+        UniqueConstraint(
+            "reversal_of_entry_id",
+            name="uq_simulation_cash_ledger_reversal_once",
+        ),
+        CheckConstraint(
+            "entry_type IN ('opening_balance', 'entry_debit', 'settlement_credit', "
+            "'reversal', 'manual_adjustment')",
+            name="ck_simulation_cash_ledger_entry_type",
+        ),
+        CheckConstraint(
+            "(entry_type = 'reversal' AND reversal_of_entry_id IS NOT NULL) OR "
+            "(entry_type <> 'reversal' AND reversal_of_entry_id IS NULL)",
+            name="ck_simulation_cash_ledger_reversal_reference",
+        ),
+        CheckConstraint(
+            "entry_type <> 'entry_debit' OR amount_usdc < 0",
+            name="ck_simulation_cash_ledger_debit_negative",
+        ),
+        CheckConstraint(
+            "entry_type <> 'settlement_credit' OR amount_usdc >= 0",
+            name="ck_simulation_cash_ledger_credit_nonnegative",
+        ),
+        CheckConstraint(
+            "entry_type <> 'opening_balance' OR amount_usdc = 0",
+            name="ck_simulation_cash_ledger_opening_zero",
+        ),
+        CheckConstraint("currency = 'USDC'", name="ck_simulation_cash_ledger_currency"),
+        Index("idx_simulation_cash_ledger_account_occurred", "account_id", "occurred_at"),
+        Index("idx_simulation_cash_ledger_settlement", "trader_order_settlement_id"),
+    )
+
+
+@_sa_event.listens_for(SimulationCashLedgerEntry, "before_update", propagate=True)
+def _reject_simulation_cash_ledger_update(*_args, **_kwargs) -> None:
+    raise ImmutableLedgerEntryError(
+        "simulation cash ledger entries are append-only; append a reversal instead"
+    )
+
+
+@_sa_event.listens_for(SimulationCashLedgerEntry, "before_delete", propagate=True)
+def _reject_simulation_cash_ledger_delete(*_args, **_kwargs) -> None:
+    raise ImmutableLedgerEntryError(
+        "simulation cash ledger entries are append-only and cannot be deleted"
     )
 
 

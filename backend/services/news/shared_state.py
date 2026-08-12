@@ -44,6 +44,8 @@ async def write_news_snapshot(
     session: AsyncSession,
     status: dict[str, Any],
     stats: Optional[dict[str, Any]] = None,
+    *,
+    merge_stats: bool = False,
 ) -> None:
     has_last_scan = "last_scan" in status
     has_next_scan = "next_scan" in status
@@ -78,7 +80,14 @@ async def write_news_snapshot(
     row.degraded_mode = bool(status.get("degraded_mode", False))
     if has_budget_remaining:
         row.budget_remaining_usd = status.get("budget_remaining")
-    row.stats_json = stats if stats is not None else (status.get("stats") or {})
+    incoming_stats = stats if stats is not None else (status.get("stats") or {})
+    previous_stats = row.stats_json if isinstance(getattr(row, "stats_json", None), dict) else {}
+    resolved_stats = (
+        {**previous_stats, **incoming_stats}
+        if merge_stats
+        else dict(incoming_stats)
+    )
+    row.stats_json = resolved_stats
     await _commit_with_retry(session)
 
     # Publish news events so the broadcaster can relay immediately.
@@ -94,14 +103,13 @@ async def write_news_snapshot(
             "degraded_mode": bool(status.get("degraded_mode", False)),
         }
         await event_bus.publish("news_workflow_status", news_status_data)
-        resolved_stats = stats if stats is not None else (status.get("stats") or {})
         await event_bus.publish(
             "news_workflow_update",
             {
                 "status": news_status_data,
                 "findings": int(resolved_stats.get("findings", 0) or 0),
                 "intents": int(resolved_stats.get("intents", 0) or 0),
-                "pending_intents": 0,
+                "pending_intents": int(resolved_stats.get("pending_intents", 0) or 0),
             },
         )
     except Exception:

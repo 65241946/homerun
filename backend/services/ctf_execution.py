@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from config import settings
-from services.polymarket import polymarket_client
 from services.live_execution_service import live_execution_service
+from services.polymarket import polymarket_client
 from services.polymarket_collateral import (
     CTF_ADDRESS,
-    CollateralKind,
-    CollateralToken,
     PUSD_ADDRESS,
     USDC_E_ADDRESS,
     USDC_NATIVE_ADDRESS,
+    CollateralKind,
+    CollateralToken,
     collateral_registry,
 )
 from utils.converters import safe_float
@@ -71,6 +71,35 @@ class CTFExecutionResult:
     tx_hash: str | None
     error_message: str | None
     payload: dict[str, Any]
+
+
+RedeemerStatusCallback = Callable[[dict[str, Any]], Awaitable[Mapping[str, Any] | None]]
+
+
+async def _notify_redeemer_status(
+    callback: RedeemerStatusCallback | None,
+    event: dict[str, Any],
+    *,
+    fail_closed: bool,
+    audit_errors: list[str] | None = None,
+) -> None:
+    if callback is None:
+        return
+    try:
+        result = await callback(dict(event))
+        result_errors = list(result.get("errors") or []) if isinstance(result, Mapping) else []
+        if result_errors:
+            raise RuntimeError(f"redeemer state callback rejected event: {result_errors}")
+    except Exception as exc:
+        if fail_closed:
+            raise
+        if audit_errors is not None:
+            audit_errors.append(f"{type(exc).__name__}:{exc}")
+        logger.exception(
+            "Redeemer chain transaction succeeded but settlement state callback failed",
+            event_state=str(event.get("state") or ""),
+            tx_hash=str(event.get("tx_hash") or ""),
+        )
 
 
 class CTFExecutionService:
@@ -369,6 +398,9 @@ class CTFExecutionService:
         to_address: str,
         data: bytes,
         gas_limit: int,
+        status_callback: RedeemerStatusCallback | None = None,
+        audit_errors: list[str] | None = None,
+        receipt_metadata: dict[str, int] | None = None,
     ) -> str:
         chain_id = int(getattr(settings, "CHAIN_ID", 137) or 137)
 
@@ -387,11 +419,35 @@ class CTFExecutionService:
             }
             signed = await asyncio.to_thread(w3.eth.account.sign_transaction, tx, private_key)
             tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed.raw_transaction)
+            tx_hash_text = tx_hash.hex()
+            await _notify_redeemer_status(
+                status_callback,
+                {"state": "redeem_submitted", "tx_hash": tx_hash_text},
+                fail_closed=False,
+                audit_errors=audit_errors,
+            )
             receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, 120)
 
-        if int(getattr(receipt, "status", 0) or 0) != 1:
+        receipt_status = int(getattr(receipt, "status", 0) or 0)
+        block_number = int(getattr(receipt, "blockNumber", 0) or 0)
+        if receipt_status != 1:
             raise RuntimeError("On-chain transaction reverted")
-        return tx_hash.hex()
+        await _notify_redeemer_status(
+            status_callback,
+            {
+                "state": "redeem_confirmed",
+                "tx_hash": tx_hash_text,
+                "receipt_status": receipt_status,
+                "block_number": block_number,
+            },
+            fail_closed=False,
+            audit_errors=audit_errors,
+        )
+        if receipt_metadata is not None:
+            receipt_metadata.update(
+                {"receipt_status": receipt_status, "block_number": block_number}
+            )
+        return tx_hash_text
 
     async def _send_safe_call(
         self,
@@ -403,6 +459,9 @@ class CTFExecutionService:
         to_address: str,
         data: bytes,
         gas_limit: int,
+        status_callback: RedeemerStatusCallback | None = None,
+        audit_errors: list[str] | None = None,
+        receipt_metadata: dict[str, int] | None = None,
     ) -> str:
         chain_id = int(getattr(settings, "CHAIN_ID", 137) or 137)
         safe = w3.eth.contract(address=safe_address, abi=self._SAFE_ABI)
@@ -449,11 +508,35 @@ class CTFExecutionService:
             )
             signed = await asyncio.to_thread(w3.eth.account.sign_transaction, tx, private_key)
             tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed.raw_transaction)
+            tx_hash_text = tx_hash.hex()
+            await _notify_redeemer_status(
+                status_callback,
+                {"state": "redeem_submitted", "tx_hash": tx_hash_text},
+                fail_closed=False,
+                audit_errors=audit_errors,
+            )
             receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, 120)
 
-        if int(getattr(receipt, "status", 0) or 0) != 1:
+        receipt_status = int(getattr(receipt, "status", 0) or 0)
+        block_number = int(getattr(receipt, "blockNumber", 0) or 0)
+        if receipt_status != 1:
             raise RuntimeError("Safe transaction reverted")
-        return tx_hash.hex()
+        await _notify_redeemer_status(
+            status_callback,
+            {
+                "state": "redeem_confirmed",
+                "tx_hash": tx_hash_text,
+                "receipt_status": receipt_status,
+                "block_number": block_number,
+            },
+            fail_closed=False,
+            audit_errors=audit_errors,
+        )
+        if receipt_metadata is not None:
+            receipt_metadata.update(
+                {"receipt_status": receipt_status, "block_number": block_number}
+            )
+        return tx_hash_text
 
     async def _execute_contract_call(
         self,
@@ -462,6 +545,7 @@ class CTFExecutionService:
         data: bytes,
         gas_limit: int,
         action: str,
+        status_callback: RedeemerStatusCallback | None = None,
     ) -> CTFExecutionResult:
         try:
             wallet_ctx = await self._resolve_wallet_context()
@@ -470,6 +554,8 @@ class CTFExecutionService:
             eoa = w3.to_checksum_address(wallet_ctx["eoa_address"])
             to_address = w3.to_checksum_address(contract_address)
 
+            audit_errors: list[str] = []
+            receipt_metadata: dict[str, int] = {}
             if await self._is_safe_wallet(w3, execution_wallet):
                 tx_hash = await self._send_safe_call(
                     w3=w3,
@@ -479,6 +565,9 @@ class CTFExecutionService:
                     to_address=to_address,
                     data=data,
                     gas_limit=gas_limit,
+                    status_callback=status_callback,
+                    audit_errors=audit_errors,
+                    receipt_metadata=receipt_metadata,
                 )
             else:
                 tx_hash = await self._send_eoa_call(
@@ -488,6 +577,9 @@ class CTFExecutionService:
                     to_address=to_address,
                     data=data,
                     gas_limit=gas_limit,
+                    status_callback=status_callback,
+                    audit_errors=audit_errors,
+                    receipt_metadata=receipt_metadata,
                 )
             return CTFExecutionResult(
                 status="executed",
@@ -498,6 +590,9 @@ class CTFExecutionService:
                     "execution_wallet": wallet_ctx["execution_wallet"],
                     "eoa_address": wallet_ctx["eoa_address"],
                     "contract_address": contract_address,
+                    "receipt_status": int(receipt_metadata.get("receipt_status") or 0),
+                    "block_number": int(receipt_metadata.get("block_number") or 0),
+                    "settlement_audit_errors": audit_errors,
                 },
             )
         except Exception as exc:
@@ -889,6 +984,7 @@ class CTFExecutionService:
         collateral_address: str,
         condition_id: str,
         index_sets: list[int],
+        status_callback: RedeemerStatusCallback | None = None,
     ) -> CTFExecutionResult:
         ctf = w3.eth.contract(
             address=w3.to_checksum_address(self.CTF_ADDRESS),
@@ -905,6 +1001,7 @@ class CTFExecutionService:
             data=data,
             gas_limit=260_000,
             action="redeem",
+            status_callback=status_callback,
         )
         result.payload.update(
             {
@@ -923,6 +1020,7 @@ class CTFExecutionService:
         adapter_address: str,
         condition_id: str,
         amounts_yes_no_base_units: tuple[int, int],
+        status_callback: RedeemerStatusCallback | None = None,
     ) -> CTFExecutionResult:
         # The adapter pulls our WCOL positions via safeBatchTransferFrom,
         # so it must have setApprovalForAll on the CTF first.
@@ -949,6 +1047,7 @@ class CTFExecutionService:
             data=data,
             gas_limit=400_000,
             action="redeem",
+            status_callback=status_callback,
         )
         result.payload.update(
             {
@@ -1374,6 +1473,7 @@ class CTFExecutionService:
         *,
         wallet_address: str | None = None,
         dry_run: bool = False,
+        status_callback: RedeemerStatusCallback | None = None,
     ) -> dict[str, Any]:
         execution_wallet = (
             str(wallet_address or live_execution_service.get_execution_wallet_address() or "").strip().lower()
@@ -1392,6 +1492,7 @@ class CTFExecutionService:
                 "failed": 0,
                 "dry_run": bool(dry_run),
                 "errors": ["missing_execution_wallet"],
+                "condition_results": [],
             }
 
         positions = await polymarket_client.get_wallet_positions(execution_wallet)
@@ -1409,6 +1510,7 @@ class CTFExecutionService:
                 "failed": 0,
                 "dry_run": bool(dry_run),
                 "errors": [],
+                "condition_results": [],
             }
 
         # Group positions by conditionId, keeping per-token outcomeIndex so
@@ -1452,6 +1554,7 @@ class CTFExecutionService:
                 "failed": 0,
                 "dry_run": bool(dry_run),
                 "errors": [],
+                "condition_results": [],
             }
 
         w3 = await self._get_web3()
@@ -1478,6 +1581,7 @@ class CTFExecutionService:
                 "failed": 0,
                 "dry_run": bool(dry_run),
                 "errors": [f"collateral_invariants_violated:{exc}"],
+                "condition_results": [],
             }
 
         ctf = w3.eth.contract(address=w3.to_checksum_address(self.CTF_ADDRESS), abi=self._CTF_ABI)
@@ -1494,6 +1598,17 @@ class CTFExecutionService:
         # whole cycle (we can still redeem high-value winners).
         gas_price_gwei = await self._gas_price_gwei(w3) if max_gas_price_gwei > 0 else 0.0
         gas_too_hot = max_gas_price_gwei > 0 and gas_price_gwei > max_gas_price_gwei
+        chain_block_number = 0
+        if status_callback is not None:
+            try:
+                chain_block_number = int(
+                    await asyncio.to_thread(lambda: w3.eth.block_number)
+                )
+            except Exception:
+                # A real run with state writeback enabled will fail closed at
+                # the claimable transition if an auditable block cannot be
+                # obtained.  Dry-runs and legacy callers incur no extra RPC.
+                chain_block_number = 0
 
         redeemed = 0
         skipped_low_payout = 0
@@ -1503,6 +1618,7 @@ class CTFExecutionService:
         resolved = 0
         redeemable_value_usd = 0.0
         errors: list[str] = []
+        condition_results: list[dict[str, Any]] = []
         grouped_items = list(grouped.items())
         condition_budget = (
             _REDEEMER_DRY_RUN_CONDITION_BUDGET
@@ -1610,10 +1726,26 @@ class CTFExecutionService:
                 expected_payout_usd = breakdown["expected_payout_usd"]
                 total_shares = breakdown["total_shares"]
                 redeemable_value_usd += expected_payout_usd
+                condition_evidence: dict[str, Any] = {
+                    "condition_id": condition_id,
+                    "collateral": match.collateral.name,
+                    "collateral_address": match.collateral.address,
+                    "wallet_balance_shares": total_shares,
+                    "expected_payout_usdc": expected_payout_usd,
+                    "winning_shares": breakdown["winning_shares"],
+                    "losing_shares": breakdown["losing_shares"],
+                    "block_number": chain_block_number,
+                    "outcome_balances": {
+                        str(slot): value for slot, value in outcome_balances.items()
+                    },
+                }
 
                 # Wallets without dust shouldn't be on the list; if all
                 # balances are zero we already redeemed at some point.
                 if total_shares <= 1e-6:
+                    condition_results.append(
+                        {**condition_evidence, "status": "already_redeemed"}
+                    )
                     continue
 
                 # Decision matrix
@@ -1668,6 +1800,44 @@ class CTFExecutionService:
                         # In dry-run we still want the "would have redeemed"
                         # counter so operators see what a requested run will do.
                         redeemed += 1
+                    condition_results.append(
+                        {
+                            **condition_evidence,
+                            "status": "would_redeem" if will_redeem else "skipped",
+                            "skip_reason": skip_reason,
+                        }
+                    )
+                    continue
+
+                async def _condition_status_callback(
+                    event: dict[str, Any],
+                    *,
+                    base: dict[str, Any] = condition_evidence,
+                ) -> Mapping[str, Any] | None:
+                    if status_callback is None:
+                        return None
+                    return await status_callback({**base, **event})
+
+                try:
+                    await _notify_redeemer_status(
+                        _condition_status_callback,
+                        {**condition_evidence, "state": "claimable"},
+                        fail_closed=True,
+                    )
+                except Exception as exc:
+                    failed += 1
+                    state_error = (
+                        f"settlement_state_write_failed_before_redeem:"
+                        f"{condition_id}:{type(exc).__name__}:{exc}"
+                    )
+                    errors.append(state_error)
+                    condition_results.append(
+                        {
+                            **condition_evidence,
+                            "status": "state_write_failed",
+                            "error": state_error,
+                        }
+                    )
                     continue
 
                 # Dispatch redemption to the contract path that matches
@@ -1678,6 +1848,7 @@ class CTFExecutionService:
                         collateral_address=match.collateral.address,
                         condition_id=condition_id,
                         index_sets=[1, 2],
+                        status_callback=_condition_status_callback,
                     )
                 else:  # CollateralKind.NEGRISK_WRAPPED
                     adapter = match.collateral.adapter
@@ -1695,14 +1866,45 @@ class CTFExecutionService:
                             int(outcome_raw_balances.get(0, 0)),
                             int(outcome_raw_balances.get(1, 0)),
                         ),
+                        status_callback=_condition_status_callback,
                     )
 
                 if redeem_result.status == "executed":
                     redeemed += 1
+                    condition_results.append(
+                        {
+                            **condition_evidence,
+                            "status": "executed",
+                            "tx_hash": redeem_result.tx_hash,
+                            "receipt_status": int(
+                                redeem_result.payload.get("receipt_status") or 0
+                            ),
+                            "block_number": int(
+                                redeem_result.payload.get("block_number")
+                                or chain_block_number
+                            ),
+                            "redemption_path": redeem_result.payload.get(
+                                "redemption_path"
+                            ),
+                            "settlement_audit_errors": list(
+                                redeem_result.payload.get("settlement_audit_errors")
+                                or []
+                            ),
+                        }
+                    )
                 else:
                     failed += 1
-                    errors.append(
-                        str(redeem_result.error_message or f"redeem_failed:{condition_id}")
+                    redeem_error = str(
+                        redeem_result.error_message or f"redeem_failed:{condition_id}"
+                    )
+                    errors.append(redeem_error)
+                    condition_results.append(
+                        {
+                            **condition_evidence,
+                            "status": "failed",
+                            "tx_hash": redeem_result.tx_hash,
+                            "error": redeem_error,
+                        }
                     )
             except Exception as exc:
                 failed += 1
@@ -1728,6 +1930,7 @@ class CTFExecutionService:
             },
             "dry_run": bool(dry_run),
             "errors": errors,
+            "condition_results": condition_results,
         }
 
 

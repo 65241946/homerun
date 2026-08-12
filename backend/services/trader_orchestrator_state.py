@@ -48,6 +48,7 @@ from utils.logger import get_logger
 from services.event_bus import event_bus
 from services.market_roster import ensure_market_roster_payload
 from services.market_cache import CachedMarket
+from services.market_identity import resolve_market_identity
 from services.runtime_status import runtime_status
 from services.worker_state import (
     DB_RETRY_ATTEMPTS,
@@ -6448,6 +6449,13 @@ def build_trader_order_row(
     resolved_entry_price = entry_price if entry_price is not None else getattr(signal, "entry_price", None)
     resolved_edge_percent = edge_percent if edge_percent is not None else getattr(signal, "edge_percent", None)
     resolved_confidence = confidence if confidence is not None else getattr(signal, "confidence", None)
+    market_identity = resolve_market_identity(
+        market_id=resolved_market_id,
+        direction=resolved_direction,
+        payload=order_payload,
+        signal_payload=signal_payload,
+        legacy=False,
+    )
     verification_fields = derive_trader_order_verification(
         mode=mode,
         status=status,
@@ -6464,6 +6472,12 @@ def build_trader_order_row(
         strategy_key=str(strategy_key or "").strip().lower() or None,
         strategy_version=int(strategy_version) if strategy_version is not None else None,
         market_id=resolved_market_id,
+        venue=market_identity.venue,
+        provider_market_id=market_identity.provider_market_id,
+        condition_id=market_identity.condition_id,
+        token_id=market_identity.token_id,
+        outcome_index=market_identity.outcome_index,
+        identity_status=market_identity.status,
         market_question=resolved_market_question or None,
         direction=resolved_direction or None,
         mode=str(mode),

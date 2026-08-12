@@ -262,7 +262,11 @@ async def test_ollama_structured_output_uses_native_format_schema(monkeypatch):
 @pytest.mark.asyncio
 async def test_deepseek_structured_output_uses_json_object_response_format(monkeypatch):
     provider = DeepSeekProvider(api_key="test-key")
-    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+    }
     responses = [_FakeResponse(200, {"choices": [{"message": {"content": '{"ok": true}'}}]})]
     requests = []
 
@@ -295,4 +299,36 @@ async def test_deepseek_structured_output_uses_json_object_response_format(monke
     assert len(requests) == 1
     assert requests[0]["json"]["response_format"]["type"] == "json_object"
     assert "json_schema" not in requests[0]["json"]["response_format"]
+    assert json.dumps(schema) in requests[0]["json"]["messages"][0]["content"]
     assert result == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_deepseek_structured_output_rejects_schema_mismatch(monkeypatch):
+    provider = DeepSeekProvider(api_key="test-key")
+    schema = {
+        "type": "object",
+        "properties": {"probability_yes": {"type": "number"}},
+        "required": ["probability_yes"],
+    }
+    responses = [_FakeResponse(200, {"choices": [{"message": {"content": '{"probability": 0.5}'}}]})]
+
+    async def fake_retry(coro_factory, max_retries=3, base_delay=1.0):
+        return await coro_factory()
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def post(self, url, headers=None, json=None):
+            return responses.pop(0)
+
+    monkeypatch.setattr(llm_provider, "_retry_with_backoff", fake_retry)
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", FakeAsyncClient)
+
+    with pytest.raises(RuntimeError, match="does not match the requested schema"):
+        await provider.structured_output(
+            messages=[LLMMessage(role="user", content="Return JSON only.")],
+            schema=schema,
+            model="deepseek-chat",
+        )

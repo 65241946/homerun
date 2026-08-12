@@ -73,6 +73,72 @@ async def test_fetch_source_rows_handles_string_limit_without_name_error(monkeyp
     assert rows == []
 
 
+@pytest.mark.asyncio
+async def test_fetch_source_rows_filters_by_ingestion_time_not_article_publication(monkeypatch):
+    service = NewsFeedService()
+    source = SimpleNamespace(
+        id="stories_current_run_id",
+        slug="stories_current_run",
+        enabled=True,
+        config={"limit": 25},
+    )
+    run_started_at = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+    published_at = run_started_at - timedelta(days=2)
+    ingested_at = run_started_at + timedelta(seconds=1)
+    stale_ingested_at = run_started_at - timedelta(seconds=1)
+
+    class DummySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return source
+
+    async def _run_data_source(*_args, **_kwargs):
+        return {
+            "status": "success",
+            "records": [
+                {
+                    "external_id": "story-from-current-run",
+                    "title": "A previously published article fetched during this ingestion run",
+                    "summary": "The publication timestamp is business data and must not identify the ingestion run.",
+                    "source": "Example News",
+                    "url": "https://example.com/current-run-story",
+                    "observed_at": published_at,
+                    "ingested_at": ingested_at,
+                    "payload_json": {},
+                    "transformed_json": {},
+                    "tags_json": [],
+                },
+                {
+                    "external_id": "story-from-previous-run",
+                    "title": "A record ingested before the current source run",
+                    "summary": "This row must be excluded using ingestion time rather than publication time.",
+                    "source": "Example News",
+                    "url": "https://example.com/previous-run-story",
+                    "observed_at": run_started_at,
+                    "ingested_at": stale_ingested_at,
+                    "payload_json": {},
+                    "transformed_json": {},
+                    "tags_json": [],
+                },
+            ],
+        }
+
+    monkeypatch.setattr(feed_service_module, "AsyncSessionLocal", lambda: DummySession())
+    monkeypatch.setattr(feed_service_module, "run_data_source", _run_data_source)
+    monkeypatch.setattr(feed_service_module, "utcnow", lambda: run_started_at)
+
+    rows = await service._fetch_source_rows(source)
+
+    assert len(rows) == 1
+    assert rows[0]["external_id"] == "story-from-current-run"
+    assert rows[0]["observed_at"] == published_at.replace(tzinfo=None)
+
+
 def test_parse_datetime_normalizes_to_naive_utc():
     parsed = _parse_datetime("2026-02-21T00:29:13+00:00")
     assert parsed is not None

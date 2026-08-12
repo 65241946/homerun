@@ -69,7 +69,7 @@ type SortField = 'exposure' | 'unrealized' | 'pnl_percent' | 'cost_basis' | 'upd
 type SortDirection = 'asc' | 'desc'
 type ExposureFloor = 'all' | '100' | '500' | '1000' | '5000'
 
-const OPEN_PAPER_ORDER_STATUSES = new Set(['submitted', 'executed', 'open'])
+const OPEN_SHADOW_ORDER_STATUSES = new Set(['submitted', 'executed', 'open'])
 const OPEN_LIVE_MANAGED_ORDER_STATUSES = new Set([
   'pending',
   'submitted',
@@ -810,7 +810,7 @@ export default function PositionsPanel() {
     return keys
   }, [simulationPayload.positions])
 
-  const autotraderPaperRows = useMemo<PositionRow[]>(() => {
+  const autotraderShadowRows = useMemo<PositionRow[]>(() => {
     const buckets = new Map<string, {
       marketId: string
       marketQuestion: string
@@ -828,7 +828,7 @@ export default function PositionsPanel() {
     traderOrders.forEach((order) => {
       const mode = String(order.mode || '').toLowerCase()
       const status = String(order.status || '').toLowerCase()
-      if (mode !== 'paper' || !OPEN_PAPER_ORDER_STATUSES.has(status)) return
+      if (mode !== 'shadow' || !OPEN_SHADOW_ORDER_STATUSES.has(status)) return
 
       const marketId = readString(order.market_id) || ''
       if (!marketId) return
@@ -1041,10 +1041,10 @@ export default function PositionsPanel() {
   }, [kalshiLivePositions, kalshiLiveUpdatedAt, managedBotByTokenId])
 
   const baseRows = useMemo(() => {
-    if (viewMode === 'sandbox') return [...simulationRows, ...autotraderPaperRows]
+    if (viewMode === 'sandbox') return [...simulationRows, ...autotraderShadowRows]
     if (viewMode === 'live') return [...polymarketLiveRows, ...kalshiLiveRows]
-    return [...simulationRows, ...autotraderPaperRows, ...polymarketLiveRows, ...kalshiLiveRows]
-  }, [viewMode, simulationRows, autotraderPaperRows, polymarketLiveRows, kalshiLiveRows])
+    return [...simulationRows, ...autotraderShadowRows, ...polymarketLiveRows, ...kalshiLiveRows]
+  }, [viewMode, simulationRows, autotraderShadowRows, polymarketLiveRows, kalshiLiveRows])
 
   const accountOptions = useMemo(() => {
     return Array.from(new Set(baseRows.map((row) => row.accountLabel))).sort((left, right) => left.localeCompare(right))

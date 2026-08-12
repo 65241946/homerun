@@ -9,6 +9,7 @@ from typing import Any
 
 from services.daily_spend_tracker import check_daily_spend_cap, record_spend_usd
 from services.live_execution_adapter import execute_live_order
+from services.market_identity import resolve_market_identity
 from services.polymarket import polymarket_client
 from services.live_execution_service import live_execution_service
 from services.trader_orchestrator.hot_path import allow_polymarket_rest_call
@@ -889,6 +890,106 @@ async def submit_execution_leg(
             notional_usd=0.0,
         )
 
+    # Every regular outcome order must carry enough typed identity before any
+    # provider, balance, allowance, or book request. Token extraction here is
+    # the existing in-memory resolver only; the legacy REST fallback below is
+    # intentionally unreachable for newly submitted outcome orders. Basic
+    # price/slippage validation remains ahead of this gate to preserve its
+    # established error contract.
+    (
+        identity_token_id,
+        identity_token_source,
+        identity_token_attempts,
+    ) = _resolve_token_id_for_leg(
+        leg=leg,
+        payload=payload,
+        live_context=live_context,
+    )
+    identity_payload = dict(payload)
+    selected_identity_keys = (
+        "token_id",
+        "tokenId",
+        "selected_token_id",
+        "selectedTokenId",
+        "asset",
+        "selected_outcome_index",
+        "selectedOutcomeIndex",
+    )
+    for key in selected_identity_keys:
+        identity_payload.pop(key, None)
+    identity_live_market = dict(
+        identity_payload.get("live_market")
+        if isinstance(identity_payload.get("live_market"), dict)
+        else {}
+    )
+    for key in selected_identity_keys:
+        identity_live_market.pop(key, None)
+    leg_market_key = _normalize_id(leg.get("market_id"))
+    context_market_key = _normalize_id(
+        live_context.get("market_id")
+        or live_context.get("condition_id")
+        or live_context.get("conditionId")
+    )
+    context_matches_leg = not (
+        leg_market_key
+        and context_market_key
+        and leg_market_key != context_market_key
+    )
+    if isinstance(live_context, dict) and context_matches_leg:
+        for key, value in live_context.items():
+            if key not in selected_identity_keys and value not in (None, ""):
+                identity_live_market.setdefault(key, value)
+    if identity_live_market:
+        identity_payload["live_market"] = identity_live_market
+    identity_payload["leg"] = dict(leg)
+    if identity_token_id:
+        identity_payload["selected_token_id"] = identity_token_id
+    market_identity = resolve_market_identity(
+        market_id=(
+            leg.get("market_id")
+            or getattr(signal, "market_id", None)
+        ),
+        direction=(
+            leg.get("outcome")
+            or leg.get("direction")
+            or getattr(signal, "direction", None)
+        ),
+        payload=identity_payload,
+        legacy=False,
+    )
+    if market_identity.status != "complete":
+        rejection_reason = (
+            "missing_token_id"
+            if market_identity.reason == "missing_selected_token"
+            else f"market_identity_{market_identity.reason}"
+        )
+        return LegSubmitResult(
+            leg_id=leg_id,
+            status="failed" if mode_key == "live" else "skipped",
+            effective_price=price,
+            error_message=(
+                "Order rejected because market identity is not complete: "
+                f"{market_identity.reason} (token_id and outcome identity are required)."
+            ),
+            payload={
+                "mode": mode_key,
+                "submission": "rejected" if mode_key == "live" else "skipped",
+                "reason": rejection_reason,
+                "identity_status": market_identity.status,
+                "identity_reason": market_identity.reason,
+                "provider_market_id": market_identity.provider_market_id,
+                "condition_id": market_identity.condition_id,
+                "token_id": market_identity.token_id,
+                "outcome_index": market_identity.outcome_index,
+                "token_resolution_attempts": identity_token_attempts,
+                "leg": dict(leg),
+                "requested_notional_usd": float(max(0.0, notional)),
+                "effective_notional_usd": 0.0,
+            },
+            shares=None,
+            notional_usd=0.0,
+        )
+
     # Pre-trade daily-spend gate (per-trader risk_limits.max_daily_spend_usd).
     # Pure read; counter only advances after a successful fill (see post-fill
     # record_spend_usd call below). Soft-fail when Redis is unhealthy — the
@@ -942,11 +1043,9 @@ async def submit_execution_leg(
         shares = _MIN_LIVE_SHARES
     effective_notional = shares * price
 
-    token_id, token_source, token_attempts = _resolve_token_id_for_leg(
-        leg=leg,
-        payload=payload,
-        live_context=live_context,
-    )
+    token_id = identity_token_id
+    token_source = identity_token_source
+    token_attempts = list(identity_token_attempts)
     if not token_id:
         market_id_for_lookup = str(leg.get("market_id") or "").strip()
         outcome_for_lookup = str(leg.get("outcome") or "").strip()

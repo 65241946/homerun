@@ -26,7 +26,7 @@
 - Verify: `backend/services/trader_orchestrator/session_engine.py`
 - Modify: `progress.md`
 
-- [ ] 记录分支、HEAD、目标文件当前 diff、运行镜像和两个错误订单的只读基线。
+- [x] 记录分支、HEAD、目标文件当前 diff、运行镜像和两个错误订单的只读基线。
 
 ```powershell
 git status --short --branch
@@ -35,7 +35,7 @@ docker inspect homerun-backend --format '{{.Config.Image}} {{.Image}}'
 docker inspect homerun-frontend --format '{{.Config.Image}} {{.Image}}'
 ```
 
-- [ ] 用只读 SQL 固化主账户余额、两个旧订单、对应事件和 `simulation_ledger` 缺失；不执行 UPDATE/DELETE。
+- [x] 用只读 SQL 固化主账户余额、两个旧订单、对应事件和 `simulation_ledger` 缺失；不执行 UPDATE/DELETE。
 
 **Gate:** 目标生产文件无本任务外未识别 hunk；历史数据数量和余额基线可复查。
 
@@ -51,9 +51,9 @@ docker inspect homerun-frontend --format '{{.Config.Image}} {{.Image}}'
 - Consumes: `TraderManualBuyRequest`、trader `ScannerSnapshot` opportunity。
 - Produces: `_resolve_manual_buy_opportunity(...)` 和 `_build_manual_runtime_signal(...)` 的可观察路由行为。
 
-- [ ] 新增 PostgreSQL 路由集成测试：当前钱包机会含 `token_id` 和 `outcome=NO`，客户端空 token 时服务端仍必须从同一 opportunity 重建 `buy_no`；当前实现应因不存在该权威解析行为而失败。
-- [ ] 新增身份冲突测试：客户端 token/outcome 与快照不一致时，执行引擎 mock 必须零调用、订单/decision/账本为零。
-- [ ] 新增 stale opportunity 测试：当前快照不存在 `opportunity_id` 时返回 404，不能使用客户端字段继续下单。
+- [x] 新增 PostgreSQL 路由集成测试：当前钱包机会含 `token_id` 和 `outcome=NO`，客户端空 token 时服务端仍必须从同一 opportunity 重建 `buy_no`；当前实现应因不存在该权威解析行为而失败。
+- [x] 新增身份冲突测试：客户端 token/outcome 与快照不一致时，执行引擎 mock 必须零调用、订单/decision/账本为零。
+- [x] 新增 stale opportunity 测试：当前快照不存在 `opportunity_id` 时返回 404，不能使用客户端字段继续下单。
 
 ```powershell
 py -3.12 -m pytest backend/tests/test_routes_trader_manual_buy.py -k "identity or stale" -q
@@ -69,11 +69,11 @@ py -3.12 -m pytest backend/tests/test_routes_trader_manual_buy.py -k "identity o
 - Modify: `backend/api/routes_traders.py`
 - Verify: `backend/tests/test_routes_trader_manual_buy.py`
 
-- [ ] 给请求增加 `client_request_id`、`order_type` 和可选规范 `direction`；金额、价格和 ID 保留严格长度/范围校验。
-- [ ] 从 `scanner_shared_state.read_traders_snapshot` 和 `read_scanner_snapshot` 查找当前 opportunity；只接受当前快照中的 positions。
-- [ ] 按 token/market/outcome 校验客户端声明；从 `positions_to_take`、market `condition_id/tokens` 构造规范 `buy_yes/buy_no`、typed token 和 execution plan。
-- [ ] 拒绝真实 SELL/平仓和 Shadow resting limit；不猜 token，不把 outcome 展示名称拼进 direction。
-- [ ] 运行 Task 1 测试直到 GREEN。
+- [x] 给请求增加 `client_request_id`、`order_type` 和可选规范 `direction`；金额、价格和 ID 保留严格长度/范围校验。
+- [x] 从 `scanner_shared_state.read_traders_snapshot` 和 `read_scanner_snapshot` 查找当前 opportunity；只接受当前快照中的 positions。
+- [x] 按 token/market/outcome 校验客户端声明；从 `positions_to_take`、market `condition_id/tokens` 构造规范 `buy_yes/buy_no`、typed token 和 execution plan。
+- [x] 拒绝真实 SELL/平仓和 Shadow resting limit；不猜 token，不把 outcome 展示名称拼进 direction。
+- [x] 运行 Task 1 测试直到 GREEN。
 
 ```powershell
 py -3.12 -m pytest backend/tests/test_routes_trader_manual_buy.py -k "identity or stale" -q
@@ -87,10 +87,10 @@ py -3.12 -m pytest backend/tests/test_routes_trader_manual_buy.py -k "identity o
 - Modify: `backend/tests/test_routes_trader_manual_buy.py`
 - Modify later: `backend/api/routes_traders.py`
 
-- [ ] 新增测试：相同 `client_request_id + trader_id` 连续调用两次，ExecutionSessionEngine 只执行一次，返回同一 decision/session/order。
-- [ ] 新增测试：相同幂等键但金额或机会不同返回 409，执行引擎不再次调用。
-- [ ] 新增测试：trader disabled/paused/block_new_orders、orchestrator paused/kill switch 时在 durable reservation 和执行前拒绝。
-- [ ] 新增测试：engine `skipped/failed/orders_written=0` 时 API 不返回 success，账户不变。
+- [x] 新增测试：相同 `client_request_id + trader_id` 连续调用两次，ExecutionSessionEngine 只执行一次，返回同一 decision/session/order。
+- [x] 新增测试：相同幂等键但金额或机会不同返回 409，执行引擎不再次调用。
+- [x] 新增测试：trader disabled/paused/block_new_orders、orchestrator paused/kill switch 时在 durable reservation 和执行前拒绝。
+- [x] 新增测试：engine `skipped/failed/orders_written=0` 时 API 不返回 success，账户不变。
 
 ```powershell
 py -3.12 -m pytest backend/tests/test_routes_trader_manual_buy.py -k "idempotent or gate or no_fill" -q
@@ -106,11 +106,11 @@ py -3.12 -m pytest backend/tests/test_routes_trader_manual_buy.py -k "idempotent
 - Modify: `backend/api/routes_traders.py`
 - Verify: `backend/tests/test_routes_trader_manual_buy.py`
 
-- [ ] 用 `client_request_id + trader_id` 派生固定 decision id，在任何执行前提交 `selected` manual decision，并保存请求指纹。
-- [ ] 重复请求先读取 decision；指纹一致返回已有 session/order，冲突返回 409，禁止重复 provider/Shadow submit。
-- [ ] 调用 `ExecutionSessionEngine.execute_signal`，传所选 trader 的 mode/risk limits、manual runtime signal 和 Shadow account id。
-- [ ] 把 engine status 映射到 decision；Shadow 仅在 `orders_written > 0` 且订单带 `simulation_ledger` 时返回 success，Live 仅在既有 provider 订单进入可识别成交/工作状态时返回 success，否则返回明确 HTTP error。
-- [ ] 删除旧路由直接构造 `TraderOrder` 和直接调用 `live_execution_service.place_order` 的旁路。
+- [x] 用 `client_request_id + trader_id` 派生固定 decision id，在任何执行前提交 `selected` manual decision，并保存请求指纹。
+- [x] 重复请求先读取 decision；指纹一致返回已有 session/order，冲突返回 409，禁止重复 provider/Shadow submit。
+- [x] 调用 `ExecutionSessionEngine.execute_signal`，传所选 trader 的 mode/risk limits、manual runtime signal 和 Shadow account id。
+- [x] 把 engine status 映射到 decision；Shadow 仅在 `orders_written > 0` 且订单带 `simulation_ledger` 时返回 success，Live 仅在既有 provider 订单进入可识别成交/工作状态时返回 success，否则返回明确 HTTP error。
+- [x] 删除旧路由直接构造 `TraderOrder` 和直接调用 `live_execution_service.place_order` 的旁路。
 
 ```powershell
 py -3.12 -m pytest backend/tests/test_routes_trader_manual_buy.py -q
@@ -128,10 +128,10 @@ py -3.12 -m pytest backend/tests/test_routes_trader_manual_buy.py -q
 - Consumes: `ExecutionSessionEngine.execute_signal(..., shadow_account_id: str | None = None)`。
 - Produces: 每个实际 Shadow fill 的 `TraderOrder.payload_json.simulation_ledger`。
 
-- [ ] PostgreSQL RED：传入有效 v2 account 和一个 executed Shadow leg，返回前账户从 1000 精确扣除实际成交 notional+fee，订单/SimulationTrade/SimulationPosition/CashLedger/TraderPosition 均为一条且相互引用。
-- [ ] RED：余额不足时 engine 不得返回成功；最终订单和所有经济表为零，账户仍为 1000。
-- [ ] RED：Shadow leg skipped/no fill 时余额和经济表为零。
-- [ ] 回归：不传 `shadow_account_id` 的既有自动 Shadow 测试行为保持不变，避免本次无意迁移全部自动链。
+- [x] PostgreSQL RED：传入有效 v2 account 和一个 executed Shadow leg，返回前账户从 1000 精确扣除实际成交 notional+fee，订单/SimulationTrade/SimulationPosition/CashLedger/TraderPosition 均为一条且相互引用。
+- [x] RED：余额不足时 engine 不得返回成功；最终订单和所有经济表为零，账户仍为 1000。
+- [x] RED：Shadow leg skipped/no fill 时余额和经济表为零。
+- [x] 回归：不传 `shadow_account_id` 的既有自动 Shadow 测试行为保持不变，避免本次无意迁移全部自动链。
 
 ```powershell
 py -3.12 -m pytest backend/tests/test_execution_session_engine.py -k "inline_shadow_ledger" -q
@@ -147,11 +147,11 @@ py -3.12 -m pytest backend/tests/test_execution_session_engine.py -k "inline_sha
 - Modify: `backend/services/trader_orchestrator/session_engine.py`
 - Verify: `backend/tests/test_execution_session_engine.py`
 
-- [ ] 给 `execute_signal` 增加向后兼容的 `shadow_account_id: str | None = None`。
-- [ ] 最终 projection 在 TraderOrder flush 后，只对 `mode=shadow`、正成交 notional、无 ledger marker 的订单调用 `simulation_service.record_orchestrator_shadow_fill(..., session=self.db, commit=False)`。
-- [ ] 从 order payload 读取 fee/slippage/token，传规范 direction；把 ledger result 重新赋给 `order.payload_json`。
-- [ ] ledger 完成后复用现有 `sync_trader_position_inventory(commit=False)`，最后由原 projection 单次 commit。
-- [ ] 任何 ledger/commit 异常向上抛出且不返回成功；保留 durable session 供现有 reconciliation 收口。
+- [x] 给 `execute_signal` 增加向后兼容的 `shadow_account_id: str | None = None`。
+- [x] 最终 projection 在 TraderOrder flush 后，只对 `mode=shadow`、正成交 notional、无 ledger marker 的订单调用 `simulation_service.record_orchestrator_shadow_fill(..., session=self.db, commit=False)`。
+- [x] 从 order payload 读取 fee/slippage/token，传规范 direction；把 ledger result 重新赋给 `order.payload_json`。
+- [x] ledger 完成后复用现有 `sync_trader_position_inventory(commit=False)`，最后由原 projection 单次 commit。
+- [x] 任何 ledger/commit 异常向上抛出且不返回成功；保留 durable session 供现有 reconciliation 收口。
 
 ```powershell
 py -3.12 -m pytest backend/tests/test_execution_session_engine.py -k "inline_shadow_ledger" -q
@@ -167,11 +167,11 @@ py -3.12 -m pytest backend/tests/test_execution_session_engine.py -k "inline_sha
 - Modify: `frontend/src/components/BuyButton.tsx`
 - Modify: `frontend/src/services/apiTraders.ts`
 
-- [ ] 先新增一个无框架的 TypeScript contract check，验证钱包 NO position 保留 token 和 `buy_no`、成功缓存 key 包含 `simulation-accounts/positions-panel/accounts-panel`；在生产实现前运行并观察失败。
-- [ ] `UnifiedTraderSignal` 保留当前 opportunity 的 execution positions，而不是只保留展示方向；请求仍由服务端权威校验。
-- [ ] modal 生命周期生成并复用一个 `client_request_id`；响应丢失后的 retry 使用同一 key，关闭后再生成新 key。
-- [ ] Shadow 禁用误导性的 resting limit；Market 文案对应现有 marketable-limit/即时撮合语义。
-- [ ] success 仅识别 `data.status === 'success'`，并失效真实查询 key；显示后端具体拒绝原因。
+- [x] 先新增一个无框架的 TypeScript contract check，验证钱包 NO position 保留 token 和 `buy_no`、成功缓存 key 包含 `simulation-accounts/positions-panel/accounts-panel`；在生产实现前运行并观察失败。
+- [x] `UnifiedTraderSignal` 保留当前 opportunity 的 execution positions，而不是只保留展示方向；请求仍由服务端权威校验。
+- [x] modal 生命周期生成并复用一个 `client_request_id`；响应丢失后的 retry 使用同一 key，关闭后再生成新 key。
+- [x] Shadow 禁用误导性的 resting limit；Market 文案对应现有 marketable-limit/即时撮合语义。
+- [x] success 仅识别 `data.status === 'success'`，并失效真实查询 key；显示后端具体拒绝原因。
 
 ```powershell
 npm --prefix frontend run build
@@ -186,13 +186,13 @@ npm --prefix frontend run build
 **Files:**
 - Verify only
 
-- [ ] 运行手动路由、session engine、现金账本、Shadow backfill、position inventory 和 Live cancel 回归。
+- [x] 运行手动路由、session engine、现金账本、Shadow backfill、position inventory 和 Live cancel 回归。
 
 ```powershell
 py -3.12 -m pytest backend/tests/test_routes_trader_manual_buy.py backend/tests/test_execution_session_engine.py backend/tests/test_simulation_cash_ledger.py backend/tests/test_trader_orchestrator_shadow_backfill.py backend/tests/test_trader_order_manager_live.py -q
 ```
 
-- [ ] 编译和差异检查。
+- [x] 编译和差异检查。
 
 ```powershell
 py -3.12 -m py_compile backend/api/routes_traders.py backend/services/trader_orchestrator/session_engine.py backend/tests/test_routes_trader_manual_buy.py backend/tests/test_execution_session_engine.py
@@ -208,12 +208,12 @@ git diff -- backend/api/routes_traders.py backend/services/trader_orchestrator/s
 - Modify: `progress.md`
 - Runtime evidence only: `data/runtime/wallet-manual-execution-*`
 
-- [ ] 从当前固定源码构建新的 backend/frontend 唯一标签，核对镜像内目标文件 SHA-256；不使用 `latest`。
-- [ ] 保持 Live credentials absent，先只切换 backend/frontend；数据库和 Redis 不重建。
-- [ ] 创建或复用隔离验证账户，通过真实 HTTP API 执行一个当前、可交易的钱包机会。
-- [ ] 下单前后核对 API、TraderDecision、ExecutionSession、TraderOrder、SimulationTrade、SimulationPosition、SimulationCashLedgerEntry、SimulationAccount 和 TraderPosition。
-- [ ] 使用同一 `client_request_id` 重放，证明订单数、trade 数、ledger 数和余额均不再变化。
-- [ ] 注入余额不足或无成交样本，证明 API 明确失败且经济表不变化。
+- [x] 从当前固定源码构建新的 backend/frontend 唯一标签，核对镜像内目标文件 SHA-256；不使用 `latest`。
+- [x] 保持 Live credentials absent，同时切换 backend、全部 Python worker 与 frontend；数据库和 Redis 不重建。
+- [x] 复用隔离验证账户，通过真实 HTTP API 执行一个当前、可交易的钱包机会。
+- [x] 下单前后核对 API、TraderDecision、ExecutionSession、TraderOrder、SimulationTrade、SimulationPosition、SimulationCashLedgerEntry、SimulationAccount 和 TraderPosition。
+- [x] 使用同一 `client_request_id` 重放，证明订单数、trade 数、ledger 数和余额均不再变化。
+- [x] 注入宽价差无成交样本，证明 API 明确失败且经济表不变化。
 
 **Gate:** 隔离账户形成一次成功原子成交和一次幂等重放证据后，才允许用户用主 Shadow 账户手动验证。
 

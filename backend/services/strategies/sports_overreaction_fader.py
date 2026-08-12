@@ -24,6 +24,7 @@ Risk: directional single-leg position.  Low per-trade risk because:
 from __future__ import annotations
 
 import math
+import re
 from collections import deque
 from datetime import timezone
 from typing import Any, Optional
@@ -67,7 +68,14 @@ SPORT_KEYWORDS: frozenset[str] = frozenset(
         "formula",
         "boxing",
         "rugby",
+        "sports",
     ]
+)
+SPORT_KEYWORD_PATTERN = re.compile(
+    r"(?<![a-z0-9])(?:"
+    + "|".join(re.escape(keyword) for keyword in sorted(SPORT_KEYWORDS, key=len, reverse=True))
+    + r")(?![a-z0-9])",
+    re.IGNORECASE,
 )
 
 SPORTS_OVERREACTION_DEFAULTS: dict[str, Any] = {
@@ -188,18 +196,27 @@ def validate_sports_overreaction_config(config: Any) -> dict[str, Any]:
     return StrategySDK.normalize_strategy_retention_config(cfg)
 
 
-def _is_sports_market(market: Market) -> bool:
-    """Check whether a market looks like a sports event."""
+def _is_sports_market(market: Market, event: Optional[Event] = None) -> bool:
+    """Check structured sports fields first, then whole-keyword text matches."""
+    if getattr(market, "sports_market_type", None) or getattr(market, "game_start_time", None):
+        return True
+
     text_parts: list[str] = []
-    for attr in ("question", "slug", "category", "event_slug", "group_item_title"):
-        val = getattr(market, attr, None)
-        if val:
-            text_parts.append(str(val))
-    tags = getattr(market, "tags", None)
-    if isinstance(tags, (list, tuple)):
-        text_parts.extend(str(t) for t in tags)
-    text = " ".join(text_parts).lower()
-    return any(kw in text for kw in SPORT_KEYWORDS)
+    for source, attributes in (
+        (market, ("question", "slug", "category", "event_slug", "group_item_title")),
+        (event, ("title", "slug", "category", "description")),
+    ):
+        if source is None:
+            continue
+        for attr in attributes:
+            value = getattr(source, attr, None)
+            if value:
+                text_parts.append(str(value))
+        tags = getattr(source, "tags", None)
+        if isinstance(tags, (list, tuple)):
+            text_parts.extend(str(tag) for tag in tags)
+
+    return SPORT_KEYWORD_PATTERN.search(" ".join(text_parts)) is not None
 
 
 class SportsOverreactionFaderStrategy(BaseStrategy):
@@ -306,6 +323,19 @@ class SportsOverreactionFaderStrategy(BaseStrategy):
         flow_lookback = max(30.0, to_float(cfg.get("flow_lookback_seconds"), 600.0))
         min_flow_volume = max(0.0, to_float(cfg.get("min_flow_volume_usd"), 50.0))
         max_opportunities = max(1, int(to_float(cfg.get("max_opportunities"), 50)))
+        diagnostics = {
+            "markets_scanned": len(markets),
+            "sports_markets": 0,
+            "markets_after_static_filters": 0,
+            "outcomes_checked": 0,
+            "moves_detected": 0,
+            "flow_checks_with_data": 0,
+            "flow_checks_without_data": 0,
+        }
+        rejection_counts: dict[str, int] = {}
+
+        def reject(reason: str) -> None:
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
 
         event_by_market: dict[str, Event] = {}
         for event in events:
@@ -318,28 +348,39 @@ class SportsOverreactionFaderStrategy(BaseStrategy):
         candidates: list[tuple[float, Opportunity]] = []
 
         for market in markets:
+            event = event_by_market.get(str(market.id))
             if market.closed or not market.active:
+                reject("inactive_or_closed")
                 continue
-            if not _is_sports_market(market):
+            if not _is_sports_market(market, event):
+                reject("not_sports")
                 continue
+            diagnostics["sports_markets"] += 1
             if to_float(getattr(market, "liquidity", 0.0), 0.0) < min_liquidity:
+                reject("low_liquidity")
                 continue
 
             token_ids = list(getattr(market, "clob_token_ids", []) or [])
             outcome_prices = list(getattr(market, "outcome_prices", []) or [])
             if len(token_ids) < 2 and len(outcome_prices) < 2:
+                reject("missing_outcome_prices")
                 continue
 
             end_date = make_aware(getattr(market, "end_date", None))
             if end_date is None:
+                reject("missing_resolution_time")
                 continue
             hours_to_resolution = (end_date - now).total_seconds() / 3600.0
             if hours_to_resolution < min_hours or hours_to_resolution > max_hours:
+                reject("outside_resolution_window")
                 continue
+            diagnostics["markets_after_static_filters"] += 1
 
             for outcome in ("YES", "NO"):
+                diagnostics["outcomes_checked"] += 1
                 current_price = to_float(StrategySDK.get_live_price(market, prices, side=outcome), 0.0)
                 if current_price <= 0.01 or current_price >= 0.99:
+                    reject("invalid_price")
                     continue
 
                 # We care about the market-level favorite probability
@@ -349,12 +390,15 @@ class SportsOverreactionFaderStrategy(BaseStrategy):
                 )
                 fav_prob = max(current_price, opposite_price)
                 if fav_prob < min_favorite_prob or fav_prob > max_favorite_prob:
+                    reject("outside_favorite_band")
                     continue
 
                 spread_bps = StrategySDK.get_spread_bps(market, prices, side=outcome)
                 if spread_bps is None and require_spread and trade_tape_available:
+                    reject("missing_required_spread")
                     continue
                 if spread_bps is not None and spread_bps > max_spread_bps:
+                    reject("wide_spread")
                     continue
 
                 token_id = self._token_for_side(market, outcome)
@@ -394,12 +438,15 @@ class SportsOverreactionFaderStrategy(BaseStrategy):
 
                 abs_move = abs(move_pct)
                 if abs_move < min_move_pct or abs_move > max_move_pct:
+                    reject("outside_move_band")
                     continue
+                diagnostics["moves_detected"] += 1
 
                 # Determine fade direction: we buy the side that DROPPED
                 # If this outcome's price dropped (move_pct < 0) → buy this side
                 # If this outcome's price rose  (move_pct > 0) → skip (the OTHER side dropped)
                 if move_pct >= 0:
+                    reject("not_fade_direction")
                     continue  # Price went up for this side — the overreaction to fade is on the other side
 
                 # Price dropped for this outcome → this is the fading opportunity
@@ -407,24 +454,41 @@ class SportsOverreactionFaderStrategy(BaseStrategy):
                 reversion_target = current_price + (move_magnitude * reversion_fraction)
                 reversion_edge = reversion_target - current_price
                 if reversion_edge < min_reversion_edge:
+                    reject("insufficient_reversion_edge")
                     continue
 
                 # Flow data (confirmatory, not required)
                 flow_imbalance = 0.0
                 recent_volume = 0.0
-                flow_data_available = bool(token_id) and trade_tape_available
+                flow_data_available = False
 
-                if flow_data_available:
-                    flow_imbalance = clamp(
-                        to_float(StrategySDK.get_buy_sell_imbalance(token_id, lookback_seconds=flow_lookback), 0.0),
-                        -1.0,
-                        1.0,
-                    )
+                if token_id and trade_tape_available:
                     vol_payload = StrategySDK.get_trade_volume(token_id, lookback_seconds=flow_lookback)
                     if isinstance(vol_payload, dict):
                         recent_volume = max(0.0, to_float(vol_payload.get("total"), 0.0))
+                        trade_count = max(0, int(to_float(vol_payload.get("trade_count"), 0.0)))
+                        flow_data_available = trade_count > 0 or recent_volume > 0.0
+
+                    if flow_data_available:
+                        flow_imbalance = clamp(
+                            to_float(
+                                StrategySDK.get_buy_sell_imbalance(
+                                    token_id,
+                                    lookback_seconds=flow_lookback,
+                                ),
+                                0.0,
+                            ),
+                            -1.0,
+                            1.0,
+                        )
+
+                if flow_data_available:
+                    diagnostics["flow_checks_with_data"] += 1
+                else:
+                    diagnostics["flow_checks_without_data"] += 1
 
                 if flow_data_available and recent_volume < min_flow_volume:
+                    reject("low_flow_volume")
                     continue
 
                 # Surprise metric (Choi & Hui 2014): how surprising is this move?
@@ -491,13 +555,14 @@ class SportsOverreactionFaderStrategy(BaseStrategy):
                     expected_payout=reversion_target,
                     markets=[market],
                     positions=positions,
-                    event=event_by_market.get(str(market.id)),
+                    event=event,
                     is_guaranteed=False,
                     min_liquidity_hard=min_liquidity,
                     min_position_size=max(settings.MIN_POSITION_SIZE, 5.0),
                     confidence=confidence,
                 )
                 if opportunity is None:
+                    reject("opportunity_construction")
                     continue
 
                 # Risk score
@@ -547,21 +612,38 @@ class SportsOverreactionFaderStrategy(BaseStrategy):
                 strength = reversion_edge * confidence * max(0.01, 1.0 - opportunity.risk_score)
                 candidates.append((strength, opportunity))
 
-        if not candidates:
-            return []
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
         selected: list[Opportunity] = []
-        seen_markets: set[str] = set()
-        for _, opportunity in candidates:
-            market_payload = (opportunity.markets or [{}])[0]
-            market_id = str((market_payload or {}).get("id") or "")
-            if not market_id or market_id in seen_markets:
-                continue
-            seen_markets.add(market_id)
-            selected.append(opportunity)
-            if len(selected) >= max_opportunities:
-                break
+        if candidates:
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            seen_markets: set[str] = set()
+            for _, opportunity in candidates:
+                market_payload = (opportunity.markets or [{}])[0]
+                market_id = str((market_payload or {}).get("id") or "")
+                if not market_id or market_id in seen_markets:
+                    continue
+                seen_markets.add(market_id)
+                selected.append(opportunity)
+                if len(selected) >= max_opportunities:
+                    break
+
+        diagnostics["signals_emitted"] = len(selected)
+        top_rejections = sorted(rejection_counts.items(), key=lambda item: item[1], reverse=True)[:4]
+        message = (
+            f"Sports scan: {diagnostics['sports_markets']}/{diagnostics['markets_scanned']} sports markets, "
+            f"{diagnostics['moves_detected']} qualifying moves, {len(selected)} signals"
+        )
+        if top_rejections:
+            message += " — rejected: " + ", ".join(
+                f"{count} {reason}" for reason, count in top_rejections
+            )
+        self._filter_diagnostics = {
+            "strategy_key": self.strategy_type,
+            "scanned_at": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            **diagnostics,
+            "rejections": rejection_counts,
+            "message": message,
+            "summary": dict(diagnostics),
+        }
         return selected
 
     def custom_checks(self, signal: Any, context: dict, params: dict, payload: dict) -> list[DecisionCheck]:

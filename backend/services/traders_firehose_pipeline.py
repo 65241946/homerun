@@ -189,7 +189,7 @@ async def get_strategy_filtered_trader_opportunities(
     firehose_rows = await StrategySDK.get_trader_firehose_signals(
         limit=firehose_scan_limit,
         include_filtered=include_filtered,
-        include_source_context=False,
+        include_source_context=True,
     )
     return await apply_traders_firehose_strategy(
         firehose_rows,

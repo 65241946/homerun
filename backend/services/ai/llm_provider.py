@@ -48,6 +48,7 @@ from enum import Enum
 from typing import Any, AsyncGenerator, Optional
 
 import httpx
+import jsonschema
 from sqlalchemy import case, func, select
 
 from models.database import AppSettings, AsyncSessionLocal, LLMModelCache, LLMUsageLog
@@ -945,9 +946,17 @@ class OpenAIProvider(BaseLLMProvider):
         Returns:
             Parsed JSON dict conforming to the schema.
         """
-        # Add system instruction for JSON output
-        # Keep prompt overhead small; schema is already enforced via response_format.
-        json_instruction = "You MUST respond with valid JSON only. Do not include any text outside the JSON object."
+        # json_schema-capable providers enforce the schema server-side. Providers
+        # limited to json_object/text still need the schema in the prompt.
+        if self._structured_output_format == "json_schema":
+            json_instruction = "You MUST respond with valid JSON only. Do not include any text outside the JSON object."
+        else:
+            json_instruction = (
+                "You MUST respond with valid JSON matching this schema. "
+                "Do not include any text outside the JSON object. "
+                "Do not use markdown code fences.\n"
+                f"Schema: {json.dumps(schema)}"
+            )
 
         augmented_messages = list(messages)
         if augmented_messages and augmented_messages[0].role == "system":
@@ -982,10 +991,18 @@ class OpenAIProvider(BaseLLMProvider):
         content = _message_content_text(message, provider_label="OpenAI API")
 
         try:
-            return _parse_structured_json_content(content)
+            parsed = _parse_structured_json_content(content)
         except RuntimeError:
             logger.error("Failed to parse structured output as JSON: %s", str(content)[:500])
             raise
+
+        try:
+            jsonschema.validate(instance=parsed, schema=schema)
+        except jsonschema.ValidationError as exc:
+            raise RuntimeError(
+                f"Structured output does not match the requested schema: {exc.message}"
+            ) from exc
+        return parsed
 
 
 # ==================== ANTHROPIC PROVIDER ====================

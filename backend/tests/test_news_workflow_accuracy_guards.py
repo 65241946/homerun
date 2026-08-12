@@ -3,6 +3,9 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
@@ -11,9 +14,10 @@ if str(BACKEND_ROOT) not in sys.path:
 from services.news.edge_estimator import EdgeEstimator
 from services.news.event_extractor import ExtractedEvent
 from services.news.hybrid_retriever import HybridRetriever
-from services.news.market_watcher_index import IndexedMarket, SearchResult
+from services.news.market_watcher_index import IndexedMarket, MarketWatcherIndex, SearchResult
 from services.news.reranker import RerankedCandidate
 from services.news.workflow_orchestrator import WorkflowOrchestrator
+from models.market import Event, Market
 
 
 def test_alignment_gate_requires_entity_overlap():
@@ -49,6 +53,188 @@ def test_alignment_gate_requires_entity_overlap():
     assert orchestrator._has_event_market_alignment(event, unaligned_candidate) is False
 
 
+@pytest.mark.asyncio
+async def test_market_universe_prefers_persisted_scanner_catalog(monkeypatch):
+    orchestrator = WorkflowOrchestrator()
+
+    persisted = AsyncMock(return_value=[{"market_id": "cached-market"}])
+    live = AsyncMock(return_value=[{"market_id": "live-market"}])
+    monkeypatch.setattr(orchestrator, "_build_market_infos_from_scanner", persisted)
+    monkeypatch.setattr(orchestrator, "_build_market_infos_from_polymarket", live)
+
+    result = await asyncio.wait_for(
+        orchestrator._build_market_infos(object(), min_liquidity=500.0, max_days_to_resolution=365),
+        timeout=0.2,
+    )
+
+    assert result == [{"market_id": "cached-market"}]
+    persisted.assert_awaited_once()
+    live.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_market_universe_uses_bounded_live_fetch_when_catalog_is_empty(monkeypatch):
+    orchestrator = WorkflowOrchestrator()
+
+    async def _slow_live_market_fetch(**kwargs):
+        await asyncio.sleep(1.0)
+        return []
+
+    persisted = AsyncMock(return_value=[])
+    monkeypatch.setattr(orchestrator, "_build_market_infos_from_scanner", persisted)
+    monkeypatch.setattr(orchestrator, "_build_market_infos_from_polymarket", _slow_live_market_fetch)
+    monkeypatch.setattr(
+        "services.news.workflow_orchestrator._MARKET_UNIVERSE_FETCH_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+
+    result = await asyncio.wait_for(
+        orchestrator._build_market_infos(object(), min_liquidity=500.0, max_days_to_resolution=365),
+        timeout=0.2,
+    )
+
+    assert result == []
+    persisted.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scanner_fallback_reads_full_persisted_market_catalog(monkeypatch):
+    orchestrator = WorkflowOrchestrator()
+    market = Market(
+        id="market-1",
+        condition_id="condition-1",
+        question="Will this persisted market remain available for news matching?",
+        slug="persisted-market",
+        event_slug="event-1",
+        clob_token_ids=["yes-token", "no-token"],
+        outcome_prices=[0.4, 0.6],
+        active=True,
+        closed=False,
+        liquidity=2500.0,
+        end_date=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    event = Event(
+        id="event-1",
+        slug="event-1",
+        title="Persisted event",
+        category="politics",
+        tags=["election"],
+        markets=[market],
+    )
+
+    from services import shared_state as scanner_state
+
+    read_catalog = AsyncMock(return_value=([event], [market], {"market_count": 1}))
+    opportunity_fallback = AsyncMock(return_value=[])
+    monkeypatch.setattr(scanner_state, "read_market_catalog", read_catalog)
+    monkeypatch.setattr(scanner_state, "get_opportunities_from_db", opportunity_fallback)
+
+    result = await orchestrator._build_market_infos_from_scanner(
+        object(),
+        min_liquidity=500.0,
+        max_days_to_resolution=365,
+    )
+
+    assert len(result) == 1
+    assert result[0]["market_id"] == "market-1"
+    assert result[0]["event_title"] == "Persisted event"
+    assert result[0]["token_ids"] == ["yes-token", "no-token"]
+    opportunity_fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_news_processing_budget_starts_after_cycle_setup(monkeypatch):
+    import services.ai as ai_service
+    import services.news.article_clusterer as clusterer_module
+    import services.news.event_extractor as extractor_module
+    import services.news.feed_service as feed_module
+    import services.news.intent_generator as intent_module
+    import services.news.market_watcher_index as index_module
+    import services.news.workflow_orchestrator as workflow_module
+
+    cycle_started_at = datetime(2026, 8, 10, 0, 0, tzinfo=timezone.utc)
+
+    class _SetupDelayedClock(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            value = cycle_started_at if cls.calls == 1 else cycle_started_at + timedelta(seconds=91)
+            return value if tz is not None else value.replace(tzinfo=None)
+
+    article = SimpleNamespace(
+        title="Central bank announces an unexpected policy decision",
+        summary="The decision may affect an active prediction market.",
+        source="Example Wire",
+        url="https://example.test/policy",
+        published=cycle_started_at,
+        fetched_at=cycle_started_at,
+    )
+    cluster = SimpleNamespace(
+        representative=article,
+        headline=article.title,
+        summary=article.summary,
+        merged_text=article.summary,
+        primary_source=article.source,
+        newest_ts=cycle_started_at,
+        source_list=[article.source],
+        article_count=1,
+    )
+    market_infos = [
+        {
+            "market_id": "market-1",
+            "condition_id": "condition-1",
+            "question": "Will the central bank change its policy before year end?",
+            "event_title": "Central bank policy decision",
+            "category": "economics",
+            "yes_price": 0.5,
+            "no_price": 0.5,
+            "liquidity": 10_000.0,
+            "slug": "central-bank-policy",
+            "tags": ["economics"],
+        }
+    ]
+
+    monkeypatch.setattr(workflow_module, "datetime", _SetupDelayedClock)
+    monkeypatch.setattr(
+        workflow_module.shared_state,
+        "get_news_settings",
+        AsyncMock(return_value={"cycle_llm_call_cap": 30, "orchestrator_enabled": True}),
+    )
+    monkeypatch.setattr(feed_module.news_feed_service, "fetch_all", AsyncMock(return_value=[]))
+    monkeypatch.setattr(feed_module.news_feed_service, "get_articles", lambda **_kwargs: [article])
+    monkeypatch.setattr(clusterer_module.article_clusterer, "cluster", lambda *_args, **_kwargs: [cluster])
+    extract = AsyncMock(return_value=ExtractedEvent(event_type="policy", confidence=0.1))
+    monkeypatch.setattr(extractor_module.event_extractor, "extract", extract)
+    monkeypatch.setattr(intent_module.intent_generator, "generate", AsyncMock(return_value=[]))
+    monkeypatch.setattr(index_module.market_watcher_index, "rebuild_keywords", lambda _markets: None)
+    monkeypatch.setattr(
+        workflow_module,
+        "_MARKET_INDEX_REBUILD_FUTURE",
+        SimpleNamespace(done=lambda: False),
+    )
+    monkeypatch.setattr(
+        ai_service,
+        "get_llm_manager",
+        lambda: SimpleNamespace(is_available=lambda: False),
+    )
+
+    orchestrator = WorkflowOrchestrator()
+    monkeypatch.setattr(orchestrator, "_release_session_connection", AsyncMock())
+    monkeypatch.setattr(orchestrator, "_build_market_infos", AsyncMock(return_value=market_infos))
+    monkeypatch.setattr(orchestrator, "_hourly_news_spend_usd", AsyncMock(return_value=0.0))
+    monkeypatch.setattr(orchestrator, "_persist_findings", AsyncMock())
+    monkeypatch.setattr(orchestrator, "_persist_intents", AsyncMock())
+
+    result = await orchestrator.run_cycle(object())
+
+    assert result["status"] == "completed"
+    assert result["stats"]["time_budget_exhausted"] is False
+    extract.assert_awaited_once()
+
+
 def test_alignment_gate_ignores_source_like_entities():
     orchestrator = WorkflowOrchestrator()
     event = ExtractedEvent(
@@ -74,6 +260,7 @@ def test_alignment_gate_ignores_source_like_entities():
 def test_hybrid_retriever_filters_category_only_false_positives():
     class _FakeIndex:
         is_ml_mode = False
+        has_embeddings = False
 
         def search(
             self,
@@ -126,6 +313,45 @@ def test_hybrid_retriever_filters_category_only_false_positives():
     # Weak semantic/category-only candidate should be removed.
     assert len(out) == 1
     assert out[0].semantic_score >= 0.2
+
+
+def test_hybrid_retriever_keeps_text_aligned_candidate_without_semantic_embeddings():
+    index = MarketWatcherIndex()
+    index.rebuild_keywords(
+        [
+            IndexedMarket(
+                market_id="bitcoin-70k",
+                question="Will Bitcoin reach $70,000 by December 31, 2026?",
+                event_title="What price will Bitcoin hit in 2026?",
+                category="Bitcoin",
+                yes_price=0.4,
+                no_price=0.6,
+                liquidity=96_000.0,
+                slug="bitcoin-70000-before-2027",
+                tags=["Bitcoin", "Crypto Prices", "Crypto"],
+            )
+        ]
+    )
+    event = ExtractedEvent(
+        event_type="crypto_market",
+        action="Bitcoin slips below $65,000 as ETF inflows offset fork concerns",
+        keywords=["bitcoin", "etf", "inflows", "fork", "concerns", "below"],
+        confidence=0.3,
+    )
+
+    candidates = HybridRetriever(index).retrieve(
+        event=event,
+        article_text=event.action,
+        top_k=20,
+        keyword_weight=0.25,
+        semantic_weight=0.45,
+        event_weight=0.30,
+        similarity_threshold=0.20,
+        min_keyword_signal=0.04,
+        min_semantic_signal=0.05,
+    )
+
+    assert [candidate.market_id for candidate in candidates] == ["bitcoin-70k"]
 
 
 def test_temporal_guard_rejects_market_that_ended_before_article():

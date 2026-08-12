@@ -23,6 +23,7 @@ from services.opportunity_strategy_catalog import ensure_all_strategies_seeded
 from services.strategy_runtime import refresh_strategy_runtime_if_needed
 from services.live_execution_service import live_execution_service
 from services.live_pressure import db_pressure_snapshot, is_db_pressure_active
+from services.online_settlement_cycle import run_online_settlement_cycle
 from services.trader_orchestrator.position_lifecycle import (
     reconcile_live_positions,
     register_open_orders as register_exit_orders,
@@ -165,6 +166,14 @@ _TRADER_RECONCILE_TIMEOUT_SECONDS = 30.0
 # timed-out cycle is still finishing" cascade.  180s gives 40s of
 # margin for the trailing book-keeping.
 _RECONCILIATION_CYCLE_TIMEOUT_SECONDS = 180.0
+_ONLINE_SETTLEMENT_CYCLE_TIMEOUT_SECONDS = 240.0
+_ONLINE_SETTLEMENT_INTERVAL_SECONDS = 60.0
+_ONLINE_SETTLEMENT_ERROR_LOG_INTERVAL_SECONDS = 300.0
+_online_settlement_last_log_signature = ""
+_online_settlement_last_log_at = 0.0
+_online_settlement_cycle_task: asyncio.Task | None = None
+_online_settlement_last_started_at = 0.0
+_online_settlement_last_stats: dict[str, Any] | None = None
 _MAX_TRIGGER_DRAIN_PER_CYCLE = 128
 _TIMEOUT_CANCEL_GRACE_SECONDS = 5.0
 _STARTUP_INTER_TRADER_SLEEP_SECONDS = 0.0
@@ -235,6 +244,181 @@ def _should_emit_reconcile_timeout_warning(trader_id: str) -> tuple[bool, int]:
         _reconcile_timeout_suppressed_count.get(trader_id, 0) + 1
     )
     return False, 0
+
+
+def _should_log_online_settlement_status(signature: str) -> bool:
+    global _online_settlement_last_log_signature, _online_settlement_last_log_at
+    now_mono = time.monotonic()
+    if (
+        signature != _online_settlement_last_log_signature
+        or now_mono - _online_settlement_last_log_at
+        >= _ONLINE_SETTLEMENT_ERROR_LOG_INTERVAL_SECONDS
+    ):
+        _online_settlement_last_log_signature = signature
+        _online_settlement_last_log_at = now_mono
+        return True
+    return False
+
+
+def _settlement_failure_stats(*, error_code: str, error: str) -> dict[str, Any]:
+    return {
+        "mode": "unknown",
+        "health": "degraded",
+        "live_status": "unknown",
+        "candidates": 0,
+        "observed": 0,
+        "observation_inserted": 0,
+        "final": 0,
+        "would_settle": 0,
+        "applied": 0,
+        "idempotent_replays": 0,
+        "manual_review": 0,
+        "conflicted": 0,
+        "blocked": 0,
+        "network_errors": 0,
+        "persistence_errors": 0,
+        "apply_errors": 0,
+        "claim_busy": 0,
+        "duration_ms": 0,
+        "error_code": error_code,
+        "errors": [{"error_type": error_code, "error": error}],
+    }
+
+
+async def _run_online_settlement_post_cycle() -> dict[str, Any]:
+    """Run the independently bounded settlement cycle on the cold plane only."""
+
+    if not _IS_COLD_RECONCILE_PLANE:
+        return {
+            **_settlement_failure_stats(error_code="plane_disabled", error=""),
+            "health": "plane_disabled",
+            "errors": [],
+        }
+
+    try:
+        result = await asyncio.wait_for(
+            run_online_settlement_cycle(),
+            timeout=_ONLINE_SETTLEMENT_CYCLE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        signature = "cycle_timeout"
+        if _should_log_online_settlement_status(signature):
+            logger.warning(
+                "Online settlement cycle timed out after %.1fs",
+                _ONLINE_SETTLEMENT_CYCLE_TIMEOUT_SECONDS,
+            )
+        return _settlement_failure_stats(
+            error_code=signature,
+            error=(
+                "Online settlement cycle exceeded "
+                f"{_ONLINE_SETTLEMENT_CYCLE_TIMEOUT_SECONDS:.1f}s"
+            ),
+        )
+    except Exception as exc:
+        signature = f"cycle_error:{type(exc).__name__}:{exc}"
+        if _should_log_online_settlement_status(signature):
+            logger.warning("Online settlement cycle failed", exc_info=exc)
+        return _settlement_failure_stats(
+            error_code="cycle_error",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    health = str(result.get("health") or "unknown")
+    if health in {"not_configured", "readiness_blocked", "degraded", "attention"}:
+        signature = (
+            f"{health}:{result.get('live_status')}:{result.get('network_errors')}:"
+            f"{result.get('persistence_errors')}:{result.get('apply_errors')}"
+        )
+        if _should_log_online_settlement_status(signature):
+            log_method = logger.info if health == "not_configured" else logger.warning
+            log_method(
+                "Online settlement cycle status=%s mode=%s live_status=%s "
+                "observed=%s final=%s applied=%s blocked=%s",
+                health,
+                result.get("mode"),
+                result.get("live_status"),
+                result.get("observed"),
+                result.get("final"),
+                result.get("applied"),
+                result.get("blocked"),
+            )
+    return result
+
+
+def _schedule_online_settlement_post_cycle() -> dict[str, Any]:
+    """Start/harvest one cold-plane cycle without blocking worker heartbeats."""
+
+    global _online_settlement_cycle_task
+    global _online_settlement_last_started_at
+    global _online_settlement_last_stats
+
+    if not _IS_COLD_RECONCILE_PLANE:
+        return {
+            **_settlement_failure_stats(error_code="plane_disabled", error=""),
+            "health": "plane_disabled",
+            "errors": [],
+            "in_progress": False,
+        }
+
+    task = _online_settlement_cycle_task
+    if task is not None and task.done():
+        try:
+            _online_settlement_last_stats = task.result()
+        except asyncio.CancelledError:
+            _online_settlement_last_stats = _settlement_failure_stats(
+                error_code="cycle_cancelled",
+                error="Online settlement cycle was cancelled",
+            )
+        except Exception as exc:
+            _online_settlement_last_stats = _settlement_failure_stats(
+                error_code="task_result_error",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        _online_settlement_last_started_at = time.monotonic()
+        _online_settlement_cycle_task = None
+        task = None
+
+    if task is not None:
+        current = dict(
+            _online_settlement_last_stats
+            or _settlement_failure_stats(error_code="cycle_running", error="")
+        )
+        if _online_settlement_last_stats is None:
+            current["health"] = "running"
+            current["errors"] = []
+        current["in_progress"] = True
+        return current
+
+    now_mono = time.monotonic()
+    due = (
+        _online_settlement_last_stats is None
+        or now_mono - _online_settlement_last_started_at
+        >= _ONLINE_SETTLEMENT_INTERVAL_SECONDS
+    )
+    if due:
+        _online_settlement_last_started_at = now_mono
+        _online_settlement_cycle_task = asyncio.create_task(
+            _run_online_settlement_post_cycle(),
+            name="online-settlement-cycle",
+        )
+        current = dict(
+            _online_settlement_last_stats
+            or _settlement_failure_stats(error_code="cycle_running", error="")
+        )
+        if _online_settlement_last_stats is None:
+            current["health"] = "running"
+            current["errors"] = []
+        current["in_progress"] = True
+        return current
+
+    current = dict(_online_settlement_last_stats)
+    current["in_progress"] = False
+    current["next_due_in_seconds"] = max(
+        0.0,
+        _ONLINE_SETTLEMENT_INTERVAL_SECONDS
+        - (now_mono - _online_settlement_last_started_at),
+    )
+    return current
 
 
 class _TimedTaskStillRunningError(RuntimeError):
@@ -1927,6 +2111,10 @@ async def run_worker_loop() -> None:
     except Exception as exc:
         logger.warning("Startup full reconciliation failed", exc_info=exc)
 
+    startup_settlement_summary: dict[str, Any] | None = None
+    if _IS_COLD_RECONCILE_PLANE:
+        startup_settlement_summary = _schedule_online_settlement_post_cycle()
+
     try:
         async with AsyncSessionLocal() as session:
             await write_worker_snapshot(
@@ -1942,6 +2130,11 @@ async def run_worker_loop() -> None:
                 last_run_at=utcnow(),
                 stats={
                     **startup_summary,
+                    **(
+                        {"online_settlement": startup_settlement_summary}
+                        if startup_settlement_summary is not None
+                        else {}
+                    ),
                     **_wallet_monitor_snapshot_stats(),
                     "cycle_reason": "startup",
                     "provider_pass": True,
@@ -2096,6 +2289,11 @@ async def run_worker_loop() -> None:
                     )
                     cycle_summary = _empty_cycle_summary()
                 consecutive_db_failures = 0
+
+                if _IS_COLD_RECONCILE_PLANE:
+                    cycle_summary["online_settlement"] = (
+                        _schedule_online_settlement_post_cycle()
+                    )
 
                 # Mandatory cooldown after each cycle to release DB pool pressure
                 # and let the trader orchestrator process signals uncontested.
@@ -2260,6 +2458,13 @@ async def run_worker_loop() -> None:
     finally:
         for event_type in sorted(_RECONCILE_TRIGGER_EVENTS):
             event_bus.unsubscribe(event_type, _on_runtime_event)
+        settlement_task = _online_settlement_cycle_task
+        if settlement_task is not None and not settlement_task.done():
+            settlement_task.cancel()
+            try:
+                await settlement_task
+            except asyncio.CancelledError:
+                logger.info("Online settlement cycle cancelled during worker shutdown")
         # Stop the wallet-cache reseeder cleanly so it doesn't outlive
         # the worker process.  The signal is idempotent.
         wallet_cache_reseeder_stop.set()

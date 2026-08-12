@@ -11,6 +11,7 @@ if str(BACKEND_ROOT) not in sys.path:
 import services.trader_data_access as trader_data_access
 import services.traders_firehose_pipeline as traders_firehose_pipeline
 from services.strategy_sdk import StrategySDK
+from services.strategies.traders_confluence import TradersConfluenceStrategy
 from services.traders_sdk import TradersSDK
 
 
@@ -31,6 +32,95 @@ async def test_trader_data_access_strategy_filtered_signals_delegates_pipeline(m
 
     loader.assert_awaited_once_with(limit=23, include_filtered=True)
     assert result == rows
+
+
+@pytest.mark.asyncio
+async def test_strategy_pipeline_loads_source_context_before_filtering(monkeypatch):
+    loader = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        traders_firehose_pipeline.StrategySDK,
+        "get_trader_firehose_signals",
+        loader,
+    )
+
+    result = await traders_firehose_pipeline.get_strategy_filtered_trader_opportunities(
+        limit=10,
+        include_filtered=False,
+    )
+
+    loader.assert_awaited_once_with(
+        limit=250,
+        include_filtered=False,
+        include_source_context=True,
+    )
+    assert result == []
+
+
+@pytest.mark.parametrize(
+    ("signal", "expected"),
+    [
+        ({"side": "BUY"}, "buy"),
+        ({"direction": "SELL"}, "sell"),
+        ({"outcome": "YES"}, "buy"),
+        ({"outcome": "NO"}, "sell"),
+        ({"signal_type": "multi_wallet_buy"}, "buy"),
+        ({"signal_type": "multi_wallet_sell"}, "sell"),
+    ],
+)
+def test_infer_trader_side_accepts_canonical_confluence_fields(signal, expected):
+    assert StrategySDK.infer_trader_side(signal) == expected
+
+
+def test_traders_confluence_opportunity_preserves_cached_execution_tokens():
+    strategy = TradersConfluenceStrategy()
+    rows = [
+        {
+            "id": "signal-with-tokens",
+            "market_id": "0xmarket",
+            "market_question": "Will both teams score?",
+            "market_slug": "both-teams-score",
+            "signal_type": "multi_wallet_buy",
+            "outcome": "YES",
+            "side": "buy",
+            "tier": "high",
+            "strength": 0.7,
+            "conviction_score": 70.0,
+            "wallet_count": 3,
+            "cluster_adjusted_wallet_count": 3,
+            "avg_entry_price": 0.42,
+            "is_active": True,
+            "is_tradeable": True,
+            "wallets": ["0xa", "0xb", "0xc"],
+            "source_flags": {"from_pool": True, "qualified": True},
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+            "outcome_labels": ["Yes", "No"],
+        }
+    ]
+
+    opportunities = strategy.build_opportunities_from_firehose(rows)
+
+    assert len(opportunities) == 1
+    opportunity = opportunities[0]
+    assert opportunity.markets[0]["clob_token_ids"] == ["yes-token", "no-token"]
+    assert opportunity.positions_to_take[0]["token_id"] == "yes-token"
+    assert opportunity.execution_plan is not None
+    assert opportunity.execution_plan.legs[0].token_id == "yes-token"
+
+
+@pytest.mark.asyncio
+async def test_traders_confluence_detect_async_loads_source_context(monkeypatch):
+    loader = AsyncMock(return_value=[])
+    monkeypatch.setattr(StrategySDK, "get_trader_firehose_signals", loader)
+
+    result = await TradersConfluenceStrategy().detect_async([], [], {})
+
+    loader.assert_awaited_once_with(
+        limit=250,
+        include_filtered=True,
+        include_source_context=True,
+    )
+    assert result == []
 
 
 @pytest.mark.asyncio

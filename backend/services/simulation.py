@@ -16,6 +16,14 @@ from models.database import (
     AsyncSessionLocal,
 )
 from models.opportunity import Opportunity
+from services.simulation_ledger import (
+    LedgerIdempotencyConflict,
+    calculate_shadow_close_economics,
+    initialize_new_v2_account,
+    quantize_usdc,
+    record_entry_debit,
+    record_settlement_credit,
+)
 from utils.logger import get_logger
 from utils.retry import is_retryable_db_error as _is_retryable_db_error
 from utils.utcnow import utcnow
@@ -139,10 +147,13 @@ class SimulationService:
                         name=name,
                         initial_capital=initial_capital,
                         current_capital=initial_capital,
+                        ledger_version=2,
+                        ledger_integrity_status="complete",
                         max_position_size_pct=max_position_pct,
                         max_open_positions=max_positions,
                     )
                     session.add(account)
+                    initialize_new_v2_account(session, account)
                     await session.commit()
                     await session.refresh(account)
 
@@ -218,10 +229,20 @@ class SimulationService:
     async def delete_account(self, account_id: str) -> bool:
         """Delete a simulation account and all related records"""
         async with AsyncSessionLocal() as session:
-            # Check if account exists
-            account = await session.get(SimulationAccount, account_id)
+            account = (
+                await session.execute(
+                    select(SimulationAccount)
+                    .where(SimulationAccount.id == account_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if not account:
                 return False
+            if int(account.ledger_version or 1) >= 2:
+                raise ValueError(
+                    f"v2 ledger account {account_id} cannot be deleted; "
+                    "its append-only cash history must be retained"
+                )
 
             # Delete related positions
             await session.execute(select(SimulationPosition).where(SimulationPosition.account_id == account_id))
@@ -255,10 +276,20 @@ class SimulationService:
     ) -> SimulationTrade:
         """Execute an arbitrage opportunity in simulation"""
         async with AsyncSessionLocal() as session:
-            # Get account
-            account = await session.get(SimulationAccount, account_id)
+            account = (
+                await session.execute(
+                    select(SimulationAccount)
+                    .where(SimulationAccount.id == account_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if not account:
                 raise ValueError(f"Account not found: {account_id}")
+            if int(account.ledger_version or 1) >= 2:
+                raise ValueError(
+                    f"v2 ledger account {account_id} cannot use legacy manual execute; "
+                    "submit the order through the orchestrator Shadow flow"
+                )
 
             # Calculate position size
             if position_size is None:
@@ -369,7 +400,13 @@ class SimulationService:
             if normalized_entry_price <= 0:
                 raise ValueError("Shadow fill entry price must be greater than 0.")
 
-            account = await session.get(SimulationAccount, account_id)
+            account = (
+                await session.execute(
+                    select(SimulationAccount)
+                    .where(SimulationAccount.id == account_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if account is None:
                 raise ValueError(f"Shadow account not found: {account_id}")
 
@@ -453,7 +490,38 @@ class SimulationService:
             )
             session.add(position)
 
-            account.current_capital = float(account.current_capital or 0.0) - required_capital
+            cash_ledger_entry_id: Optional[str] = None
+            if int(account.ledger_version or 1) >= 2:
+                # The cash entry references the just-created trade, so flush
+                # both trade and position first inside the caller transaction.
+                await session.flush()
+                cash_result = await record_entry_debit(
+                    session,
+                    account_id=account_id,
+                    simulation_trade_id=trade_id,
+                    entry_cost_usdc=required_capital,
+                    trader_order_id=(
+                        str(payload.get("trader_order_id") or "").strip() or None
+                        if isinstance(payload, dict)
+                        else None
+                    ),
+                    evidence={
+                        "kind": "orchestrator_shadow_open",
+                        "signal_id": str(signal_id or ""),
+                        "trader_id": str(trader_id or ""),
+                        "market_id": market_id_value,
+                        "entry_notional_usdc": f"{quantize_usdc(normalized_notional):.6f}",
+                        "entry_fee_usdc": f"{quantize_usdc(normalized_entry_fee):.6f}",
+                    },
+                    occurred_at=now,
+                )
+                if not cash_result.inserted:
+                    raise LedgerIdempotencyConflict(
+                        f"Cash debit already existed while creating new trade {trade_id}"
+                    )
+                cash_ledger_entry_id = str(cash_result.entry.id)
+            else:
+                account.current_capital = float(account.current_capital or 0.0) - required_capital
             account.total_trades = int(account.total_trades or 0) + 1
 
             if commit:
@@ -474,6 +542,8 @@ class SimulationService:
                 "entry_cost": required_capital,
                 "quantity": quantity,
                 "opened_at": now.isoformat() + "Z",
+                "cash_ledger_entry_id": cash_ledger_entry_id,
+                "ledger_version": int(account.ledger_version or 1),
             }
 
     async def close_orchestrator_shadow_fill(
@@ -487,6 +557,8 @@ class SimulationService:
         price_source: Optional[str] = None,
         reason: Optional[str] = None,
         close_fee_usd: Optional[float] = None,
+        trader_order_id: Optional[str] = None,
+        trader_order_settlement_id: Optional[str] = None,
         session: AsyncSession = None,
         commit: bool = True,
     ) -> dict[str, Any]:
@@ -498,15 +570,33 @@ class SimulationService:
 
             normalized_close_price = max(0.0, float(close_price or 0.0))
 
-            account = await session.get(SimulationAccount, account_id)
+            account = (
+                await session.execute(
+                    select(SimulationAccount)
+                    .where(SimulationAccount.id == account_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if account is None:
                 raise ValueError(f"Shadow account not found: {account_id}")
 
-            trade = await session.get(SimulationTrade, trade_id)
+            trade = (
+                await session.execute(
+                    select(SimulationTrade)
+                    .where(SimulationTrade.id == trade_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if trade is None or str(trade.account_id) != str(account_id):
                 raise ValueError(f"Simulation trade not found for account: {trade_id}")
 
-            position = await session.get(SimulationPosition, position_id)
+            position = (
+                await session.execute(
+                    select(SimulationPosition)
+                    .where(SimulationPosition.id == position_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if position is None or str(position.account_id) != str(account_id):
                 raise ValueError(f"Simulation position not found for account: {position_id}")
 
@@ -529,6 +619,23 @@ class SimulationService:
             total_close_fee = explicit_close_fee + winner_fee
             proceeds = max(0.0, gross_proceeds - total_close_fee)
             pnl = proceeds - entry_cost
+            is_v2_ledger = int(account.ledger_version or 1) >= 2
+            if is_v2_ledger:
+                economics = calculate_shadow_close_economics(
+                    quantity=position.quantity or 0.0,
+                    entry_cost_usdc=entry_cost,
+                    close_price=normalized_close_price,
+                    explicit_close_fee_usdc=explicit_close_fee,
+                    winner_fee_rate=self.POLYMARKET_FEE,
+                )
+                entry_cost = float(economics.cost_basis_usdc)
+                gross_proceeds = float(economics.gross_payout_usdc)
+                gross_pnl = float(economics.gross_pnl_usdc)
+                explicit_close_fee = float(economics.explicit_close_fee_usdc)
+                winner_fee = float(economics.winner_fee_usdc)
+                total_close_fee = float(economics.total_fee_usdc)
+                proceeds = float(economics.net_payout_usdc)
+                pnl = float(economics.realized_pnl_usdc)
             close_trigger_key = str(close_trigger or "").strip().lower()
             is_resolution = close_trigger_key in {"resolution", "resolution_inferred"}
             terminal_status = (
@@ -574,12 +681,46 @@ class SimulationService:
             position.current_price = normalized_close_price
             position.unrealized_pnl = 0.0
 
-            account.current_capital = float(account.current_capital or 0.0) + proceeds
-            account.total_pnl = float(account.total_pnl or 0.0) + pnl
-            if pnl >= 0:
-                account.winning_trades = int(account.winning_trades or 0) + 1
+            cash_ledger_entry_id: Optional[str] = None
+            if is_v2_ledger:
+                settlement_key = (
+                    f"shadow-settlement:{trader_order_settlement_id}"
+                    if trader_order_settlement_id
+                    else f"shadow-close:{trade_id}"
+                )
+                cash_result = await record_settlement_credit(
+                    session,
+                    account_id=account_id,
+                    idempotency_key=settlement_key,
+                    payout_usdc=proceeds,
+                    realized_pnl_usdc=pnl,
+                    won=pnl >= 0,
+                    simulation_trade_id=trade_id,
+                    trader_order_id=trader_order_id,
+                    trader_order_settlement_id=trader_order_settlement_id,
+                    evidence={
+                        "kind": "orchestrator_shadow_close",
+                        "close_trigger": str(close_trigger or ""),
+                        "price_source": str(price_source or ""),
+                        "close_price": normalized_close_price,
+                        "gross_payout_usdc": f"{quantize_usdc(gross_proceeds):.6f}",
+                        "total_close_fee_usdc": f"{quantize_usdc(total_close_fee):.6f}",
+                        "reason": str(reason or ""),
+                    },
+                    occurred_at=now,
+                )
+                if not cash_result.inserted:
+                    raise LedgerIdempotencyConflict(
+                        f"Cash credit already existed while trade {trade_id} remained open"
+                    )
+                cash_ledger_entry_id = str(cash_result.entry.id)
             else:
-                account.losing_trades = int(account.losing_trades or 0) + 1
+                account.current_capital = float(account.current_capital or 0.0) + proceeds
+                account.total_pnl = float(account.total_pnl or 0.0) + pnl
+                if pnl >= 0:
+                    account.winning_trades = int(account.winning_trades or 0) + 1
+                else:
+                    account.losing_trades = int(account.losing_trades or 0) + 1
 
             if commit:
                 await session.commit()
@@ -602,6 +743,8 @@ class SimulationService:
                 "price_source": str(price_source or ""),
                 "reason": str(reason or ""),
                 "resolved_at": now.isoformat() + "Z",
+                "cash_ledger_entry_id": cash_ledger_entry_id,
+                "ledger_version": int(account.ledger_version or 1),
             }
 
     async def resolve_trade(
@@ -615,14 +758,39 @@ class SimulationService:
             if session is None:
                 session = await stack.enter_async_context(AsyncSessionLocal())
 
-            trade = await session.get(SimulationTrade, trade_id)
-            if not trade:
+            account_id = await session.scalar(
+                select(SimulationTrade.account_id).where(SimulationTrade.id == trade_id)
+            )
+            if account_id is None:
+                raise ValueError(f"Trade not found: {trade_id}")
+
+            account = (
+                await session.execute(
+                    select(SimulationAccount)
+                    .where(SimulationAccount.id == account_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if account is None:
+                raise ValueError(f"Account not found for trade: {trade_id}")
+            if int(account.ledger_version or 1) >= 2:
+                raise ValueError(
+                    f"v2 ledger account {account.id} cannot use legacy resolve_trade; "
+                    "settlement must be applied by the settlement coordinator"
+                )
+
+            trade = (
+                await session.execute(
+                    select(SimulationTrade)
+                    .where(SimulationTrade.id == trade_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if trade is None:
                 raise ValueError(f"Trade not found: {trade_id}")
 
             if trade.status != TradeStatus.OPEN:
                 raise ValueError(f"Trade already resolved: {trade.status}")
-
-            account = await session.get(SimulationAccount, trade.account_id)
 
             # Calculate payout
             payout = 0.0
@@ -704,12 +872,27 @@ class SimulationService:
             if not account:
                 return None
 
-            # Calculate additional stats
-            win_rate = account.winning_trades / account.total_trades * 100 if account.total_trades > 0 else 0
-            roi = (account.current_capital - account.initial_capital) / account.initial_capital * 100
-
-            # Get open positions count
+            # Get open positions before computing equity.  current_capital is
+            # deployable cash, so treating a cash-to-position conversion as a
+            # loss would make every newly opened trade report a negative ROI.
             positions = await self.get_open_positions(account_id)
+            market_value = sum(
+                float(position.quantity or 0.0)
+                * float(
+                    position.current_price
+                    if position.current_price is not None
+                    else position.entry_price or 0.0
+                )
+                for position in positions
+            )
+            equity_value = float(account.current_capital or 0.0) + market_value
+            initial_capital = float(account.initial_capital or 0.0)
+            roi = (
+                ((equity_value - initial_capital) / initial_capital) * 100.0
+                if initial_capital > 0.0
+                else 0.0
+            )
+            win_rate = account.winning_trades / account.total_trades * 100 if account.total_trades > 0 else 0
 
             return {
                 "account_id": account.id,

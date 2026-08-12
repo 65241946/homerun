@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     CLOB_API_URL: str = "https://clob.polymarket.com"
     DATA_API_URL: str = "https://data-api.polymarket.com"
 
+    # Online market-final observation and settlement.  This is the single
+    # deployment gate for the cold reconciliation plane.  ``observe`` persists
+    # official facts but never changes order economics; Shadow/Live activation
+    # must be explicit.
+    HOMERUN_SETTLEMENT_RUNTIME_MODE: str = "observe"
+    # Historical settlement repair is a separate operator gate.  Preview and
+    # ledger-integrity reads stay available while apply remains fail-closed.
+    HOMERUN_SETTLEMENT_REPAIR_APPLY_ENABLED: bool = False
+
     # WebSocket URLs
     CLOB_WS_URL: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     KALSHI_WS_URL: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
@@ -749,6 +758,18 @@ class Settings(BaseSettings):
         if not normalized and value is None:
             return value
         return normalized
+
+    @field_validator("HOMERUN_SETTLEMENT_RUNTIME_MODE", mode="before")
+    @classmethod
+    def _normalize_settlement_runtime_mode(cls, value: object) -> str:
+        mode = str(value or "").strip().lower()
+        allowed = {"off", "observe", "shadow", "live"}
+        if mode not in allowed:
+            raise ValueError(
+                "HOMERUN_SETTLEMENT_RUNTIME_MODE must be one of: "
+                "off, observe, shadow, live"
+            )
+        return mode
 
     model_config = SettingsConfigDict()
 

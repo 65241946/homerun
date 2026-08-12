@@ -19,11 +19,16 @@ from models.database import (
     ExecutionSessionLeg,
     ExecutionSessionOrder,
     SimulationAccount,
+    SimulationCashLedgerEntry,
+    SimulationPosition,
+    SimulationTrade,
     Trader,
     TraderDecision,
     TraderOrder,
+    TraderPosition,
 )
 from services import intent_runtime as intent_runtime_module
+from services.simulation_ledger import initialize_new_v2_account
 from services.trader_orchestrator import session_engine as session_engine_module
 from utils.utcnow import utcnow
 
@@ -514,6 +519,108 @@ async def test_execute_signal_flushes_new_trader_orders_before_execution_orders(
     assert len(trader_rows) == 1
     assert len(execution_rows) == 1
     assert str(execution_rows[0].trader_order_id or "") == str(trader_rows[0].id or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_inline_shadow_ledger_no_fill_writes_no_economics(monkeypatch):
+    db = _FailureProjectionDb()
+    engine = session_engine_module.ExecutionSessionEngine(db)
+    plan = {"policy": "SINGLE_LEG", "plan_id": "plan-shadow-no-fill"}
+    legs = [
+        {
+            "leg_id": "leg-shadow-no-fill-1",
+            "market_id": "market-shadow-no-fill-1",
+            "market_question": "Will the Shadow order fill?",
+            "token_id": "token-shadow-no-fill-1",
+            "side": "buy",
+            "outcome": "yes",
+            "requested_notional_usd": 10.0,
+            "requested_shares": 20.0,
+            "limit_price": 0.5,
+            "price_policy": "taker_limit",
+            "time_in_force": "IOC",
+            "post_only": False,
+        }
+    ]
+    constraints = {"max_unhedged_notional_usd": 0.0, "hedge_timeout_seconds": 20}
+    ledger_mock = AsyncMock()
+    monkeypatch.setattr(engine, "_build_plan", lambda *args, **kwargs: (plan, legs, constraints))
+    monkeypatch.setattr(session_engine_module, "supports_reprice", lambda _policy: False)
+    monkeypatch.setattr(
+        session_engine_module,
+        "execution_waves",
+        lambda _policy, leg_rows: [leg_rows],
+    )
+    monkeypatch.setattr(
+        session_engine_module,
+        "requires_pair_lock",
+        lambda _policy, _constraints: False,
+    )
+    monkeypatch.setattr(session_engine_module, "set_trade_signal_status", AsyncMock(return_value=True))
+    monkeypatch.setattr(session_engine_module, "sync_trader_position_inventory", AsyncMock(return_value={}))
+    monkeypatch.setattr(session_engine_module.event_bus, "publish", AsyncMock(return_value=None))
+    monkeypatch.setattr(engine, "_publish_hot_signal_status", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        session_engine_module.simulation_service,
+        "record_orchestrator_shadow_fill",
+        ledger_mock,
+    )
+    monkeypatch.setattr(
+        session_engine_module,
+        "submit_execution_wave",
+        AsyncMock(
+            return_value=[
+                _leg_result(
+                    leg_id="leg-shadow-no-fill-1",
+                    status="skipped",
+                    notional_usd=0.0,
+                    shares=0.0,
+                    effective_price=0.5,
+                    error_message="Shadow execution did not fill.",
+                    payload={
+                        "mode": "shadow",
+                        "token_id": "token-shadow-no-fill-1",
+                        "filled_notional_usd": 0.0,
+                        "shadow_simulation": {"filled": False},
+                    },
+                )
+            ]
+        ),
+    )
+    signal = SimpleNamespace(
+        id="signal-shadow-no-fill",
+        source="traders",
+        trace_id="trace-shadow-no-fill",
+        strategy_type="traders_confluence",
+        strategy_context_json={},
+        payload_json={},
+        market_id="market-shadow-no-fill-1",
+        market_question="Will the Shadow order fill?",
+        direction="buy_yes",
+        entry_price=0.5,
+        edge_percent=4.0,
+        confidence=0.8,
+    )
+
+    result = await engine.execute_signal(
+        trader_id="trader-shadow-no-fill",
+        signal=signal,
+        decision_id="decision-shadow-no-fill",
+        strategy_key="manual_buy",
+        strategy_version=None,
+        strategy_params={},
+        risk_limits={},
+        mode="shadow",
+        size_usd=10.0,
+        reason="Operator confirmed wallet consensus",
+        execution_timeout_seconds=5.0,
+        shadow_account_id="shadow-account-unused",
+    )
+
+    assert result.status == "skipped"
+    assert result.orders_written == 0
+    assert ledger_mock.await_count == 0
+    assert db.persisted_rows_by_type.get("TraderOrder") in (None, [])
 
 
 @pytest.mark.asyncio
@@ -2851,4 +2958,418 @@ async def test_execute_signal_shadow_persists_with_commit_so_async_session_close
     assert len(execution_rows) == 1
     assert len(session_rows) == 1
     assert len([row for row in event_rows if str(row.event_type or "") == "session_created"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_inline_shadow_ledger_commits_order_cash_and_positions_atomically(monkeypatch):
+    managed_engine, session_factory = await build_postgres_session_factory(
+        Base,
+        "shadow_manual_account_projection",
+    )
+    trader_id = "trader-shadow-manual-account"
+    decision_id = "decision-shadow-manual-account"
+    signal_id = "signal-shadow-manual-account"
+    account_id = "account-shadow-manual-account"
+    market_id = "provider-market-shadow-manual-account"
+    condition_id = "0x" + ("1" * 64)
+    yes_token_id = "1" * 72
+    no_token_id = "2" * 72
+
+    try:
+        async with session_factory() as setup_db:
+            account = SimulationAccount(
+                id=account_id,
+                name="Shadow manual account",
+                initial_capital=1000.0,
+                current_capital=1000.0,
+            )
+            setup_db.add_all(
+                [
+                    Trader(
+                        id=trader_id,
+                        name="Shadow manual trader",
+                        mode="shadow",
+                        is_enabled=True,
+                    ),
+                    TraderDecision(
+                        id=decision_id,
+                        trader_id=trader_id,
+                        signal_id=signal_id,
+                        source="traders",
+                        strategy_key="manual_buy",
+                        decision="selected",
+                    ),
+                    account,
+                ]
+            )
+            initialize_new_v2_account(setup_db, account)
+            await setup_db.commit()
+
+        plan = {"policy": "SINGLE_LEG", "plan_id": "plan-shadow-manual-account"}
+        legs = [
+            {
+                "leg_id": "leg-shadow-manual-account-1",
+                "market_id": market_id,
+                "market_question": "Will the selected player win?",
+                "token_id": no_token_id,
+                "side": "buy",
+                "outcome": "no",
+                "requested_notional_usd": 25.0,
+                "requested_shares": 50.0,
+                "limit_price": 0.5,
+                "price_policy": "taker_limit",
+                "time_in_force": "IOC",
+                "post_only": False,
+            }
+        ]
+        constraints = {"max_unhedged_notional_usd": 0.0, "hedge_timeout_seconds": 20}
+        monkeypatch.setattr(session_engine_module, "supports_reprice", lambda _policy: False)
+        monkeypatch.setattr(
+            session_engine_module,
+            "execution_waves",
+            lambda _policy, leg_rows: [leg_rows],
+        )
+        monkeypatch.setattr(
+            session_engine_module,
+            "requires_pair_lock",
+            lambda _policy, _constraints: False,
+        )
+        monkeypatch.setattr(
+            session_engine_module,
+            "set_trade_signal_status",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            session_engine_module.event_bus,
+            "publish",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            session_engine_module,
+            "submit_execution_wave",
+            AsyncMock(
+                return_value=[
+                    _leg_result(
+                        leg_id="leg-shadow-manual-account-1",
+                        status="executed",
+                        notional_usd=25.0,
+                        shares=50.0,
+                        effective_price=0.5,
+                        payload={
+                            "mode": "shadow",
+                            "token_id": no_token_id,
+                            "filled_size": 50.0,
+                            "average_fill_price": 0.5,
+                            "filled_notional_usd": 25.0,
+                            "shadow_simulation": {
+                                "filled": True,
+                                "estimated_fee_usd": 0.25,
+                                "slippage_usd": 0.10,
+                            },
+                        },
+                    )
+                ]
+            ),
+        )
+
+        signal = SimpleNamespace(
+            id=signal_id,
+            source="traders",
+            trace_id="trace-shadow-manual-account",
+            strategy_type="traders_confluence",
+            strategy_context_json={},
+            payload_json={
+                "selected_token_id": no_token_id,
+                "market": {
+                    "id": market_id,
+                    "condition_id": condition_id,
+                    "token_ids": [yes_token_id, no_token_id],
+                    "outcomes": ["YES", "NO"],
+                },
+            },
+            market_id=market_id,
+            market_question="Will the selected player win?",
+            direction="buy_no",
+            entry_price=0.5,
+            edge_percent=4.0,
+            confidence=0.8,
+        )
+
+        async with session_factory() as execution_db:
+            engine = session_engine_module.ExecutionSessionEngine(execution_db)
+            monkeypatch.setattr(
+                engine,
+                "_build_plan",
+                lambda *args, **kwargs: (plan, legs, constraints),
+            )
+            monkeypatch.setattr(
+                engine,
+                "_publish_hot_signal_status",
+                AsyncMock(return_value=None),
+            )
+            result = await engine.execute_signal(
+                trader_id=trader_id,
+                signal=signal,
+                decision_id=decision_id,
+                strategy_key="manual_buy",
+                strategy_version=None,
+                strategy_params={},
+                risk_limits={},
+                mode="shadow",
+                size_usd=25.0,
+                reason="Operator confirmed wallet consensus",
+                execution_timeout_seconds=5.0,
+                shadow_account_id=account_id,
+            )
+
+        async with session_factory() as verify_db:
+            account = await verify_db.get(SimulationAccount, account_id)
+            orders = list((await verify_db.execute(select(TraderOrder))).scalars())
+            trades = list((await verify_db.execute(select(SimulationTrade))).scalars())
+            positions = list((await verify_db.execute(select(SimulationPosition))).scalars())
+            cash_entries = list(
+                (
+                    await verify_db.execute(
+                        select(SimulationCashLedgerEntry).order_by(
+                            SimulationCashLedgerEntry.ledger_sequence
+                        )
+                    )
+                ).scalars()
+            )
+            trader_positions = list(
+                (await verify_db.execute(select(TraderPosition))).scalars()
+            )
+
+        assert result.status == "completed"
+        assert result.orders_written == 1
+        assert account is not None
+        assert account.current_capital == pytest.approx(974.75, rel=1e-9)
+        assert account.total_trades == 1
+        assert len(orders) == 1
+        assert len(trades) == 1
+        assert len(positions) == 1
+        assert len(cash_entries) == 2
+        assert len(trader_positions) == 1
+        ledger = dict(orders[0].payload_json or {}).get("simulation_ledger")
+        assert isinstance(ledger, dict)
+        assert ledger["account_id"] == account_id
+        assert ledger["trade_id"] == trades[0].id
+        assert ledger["position_id"] == positions[0].id
+        assert ledger["cash_ledger_entry_id"] == cash_entries[-1].id
+        assert orders[0].direction == "buy_no"
+        assert orders[0].token_id == no_token_id
+        assert trades[0].total_cost == pytest.approx(25.25, rel=1e-9)
+        assert trades[0].fees_paid == pytest.approx(0.25, rel=1e-9)
+        assert trades[0].slippage == pytest.approx(0.10, rel=1e-9)
+        assert positions[0].quantity == pytest.approx(50.0, rel=1e-9)
+        assert trader_positions[0].total_notional_usd == pytest.approx(25.0, rel=1e-9)
+    finally:
+        await managed_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_inline_shadow_ledger_insufficient_capital_rolls_back_economics(monkeypatch):
+    managed_engine, session_factory = await build_postgres_session_factory(
+        Base,
+        "shadow_manual_account_insufficient",
+    )
+    trader_id = "trader-shadow-manual-insufficient"
+    decision_id = "decision-shadow-manual-insufficient"
+    signal_id = "signal-shadow-manual-insufficient"
+    account_id = "account-shadow-manual-insufficient"
+    market_id = "provider-market-shadow-manual-insufficient"
+    yes_token_id = "3" * 72
+    no_token_id = "4" * 72
+
+    try:
+        async with session_factory() as setup_db:
+            account = SimulationAccount(
+                id=account_id,
+                name="Insufficient Shadow account",
+                initial_capital=10.0,
+                current_capital=10.0,
+            )
+            setup_db.add_all(
+                [
+                    Trader(
+                        id=trader_id,
+                        name="Insufficient Shadow trader",
+                        mode="shadow",
+                        is_enabled=True,
+                    ),
+                    TraderDecision(
+                        id=decision_id,
+                        trader_id=trader_id,
+                        signal_id=signal_id,
+                        source="traders",
+                        strategy_key="manual_buy",
+                        decision="selected",
+                    ),
+                    account,
+                ]
+            )
+            initialize_new_v2_account(setup_db, account)
+            await setup_db.commit()
+
+        plan = {"policy": "SINGLE_LEG", "plan_id": "plan-shadow-manual-insufficient"}
+        legs = [
+            {
+                "leg_id": "leg-shadow-manual-insufficient-1",
+                "market_id": market_id,
+                "market_question": "Will the selected outcome win?",
+                "token_id": no_token_id,
+                "side": "buy",
+                "outcome": "no",
+                "requested_notional_usd": 25.0,
+                "requested_shares": 50.0,
+                "limit_price": 0.5,
+                "price_policy": "taker_limit",
+                "time_in_force": "IOC",
+                "post_only": False,
+            }
+        ]
+        constraints = {"max_unhedged_notional_usd": 0.0, "hedge_timeout_seconds": 20}
+        monkeypatch.setattr(session_engine_module, "supports_reprice", lambda _policy: False)
+        monkeypatch.setattr(
+            session_engine_module,
+            "execution_waves",
+            lambda _policy, leg_rows: [leg_rows],
+        )
+        monkeypatch.setattr(
+            session_engine_module,
+            "requires_pair_lock",
+            lambda _policy, _constraints: False,
+        )
+        monkeypatch.setattr(
+            session_engine_module,
+            "set_trade_signal_status",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            session_engine_module.event_bus,
+            "publish",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            session_engine_module,
+            "submit_execution_wave",
+            AsyncMock(
+                return_value=[
+                    _leg_result(
+                        leg_id="leg-shadow-manual-insufficient-1",
+                        status="executed",
+                        notional_usd=25.0,
+                        shares=50.0,
+                        effective_price=0.5,
+                        payload={
+                            "mode": "shadow",
+                            "token_id": no_token_id,
+                            "filled_size": 50.0,
+                            "average_fill_price": 0.5,
+                            "filled_notional_usd": 25.0,
+                            "shadow_simulation": {
+                                "filled": True,
+                                "estimated_fee_usd": 0.25,
+                                "slippage_usd": 0.10,
+                            },
+                        },
+                    )
+                ]
+            ),
+        )
+
+        signal = SimpleNamespace(
+            id=signal_id,
+            source="traders",
+            trace_id="trace-shadow-manual-insufficient",
+            strategy_type="traders_confluence",
+            strategy_context_json={},
+            payload_json={
+                "selected_token_id": no_token_id,
+                "market": {
+                    "id": market_id,
+                    "condition_id": "0x" + ("2" * 64),
+                    "token_ids": [yes_token_id, no_token_id],
+                    "outcomes": ["YES", "NO"],
+                },
+            },
+            market_id=market_id,
+            market_question="Will the selected outcome win?",
+            direction="buy_no",
+            entry_price=0.5,
+            edge_percent=4.0,
+            confidence=0.8,
+        )
+
+        async with session_factory() as execution_db:
+            engine = session_engine_module.ExecutionSessionEngine(execution_db)
+            monkeypatch.setattr(
+                engine,
+                "_build_plan",
+                lambda *args, **kwargs: (plan, legs, constraints),
+            )
+            monkeypatch.setattr(
+                engine,
+                "_publish_hot_signal_status",
+                AsyncMock(return_value=None),
+            )
+            with pytest.raises(ValueError, match="Insufficient shadow capital"):
+                await engine.execute_signal(
+                    trader_id=trader_id,
+                    signal=signal,
+                    decision_id=decision_id,
+                    strategy_key="manual_buy",
+                    strategy_version=None,
+                    strategy_params={},
+                    risk_limits={},
+                    mode="shadow",
+                    size_usd=25.0,
+                    reason="Operator confirmed wallet consensus",
+                    execution_timeout_seconds=5.0,
+                    shadow_account_id=account_id,
+                )
+
+        async with session_factory() as verify_db:
+            account = await verify_db.get(SimulationAccount, account_id)
+            order_count = int(
+                (await verify_db.execute(select(func.count()).select_from(TraderOrder))).scalar_one()
+            )
+            trade_count = int(
+                (await verify_db.execute(select(func.count()).select_from(SimulationTrade))).scalar_one()
+            )
+            position_count = int(
+                (await verify_db.execute(select(func.count()).select_from(SimulationPosition))).scalar_one()
+            )
+            trader_position_count = int(
+                (await verify_db.execute(select(func.count()).select_from(TraderPosition))).scalar_one()
+            )
+            cash_entries = list(
+                (
+                    await verify_db.execute(
+                        select(SimulationCashLedgerEntry).order_by(
+                            SimulationCashLedgerEntry.ledger_sequence
+                        )
+                    )
+                ).scalars()
+            )
+            durable_session = (
+                await verify_db.execute(
+                    select(ExecutionSession).where(
+                        ExecutionSession.decision_id == decision_id
+                    )
+                )
+            ).scalar_one_or_none()
+
+        assert account is not None
+        assert account.current_capital == pytest.approx(10.0, rel=1e-9)
+        assert account.total_trades == 0
+        assert order_count == 0
+        assert trade_count == 0
+        assert position_count == 0
+        assert trader_position_count == 0
+        assert len(cash_entries) == 1
+        assert cash_entries[0].entry_type == "opening_balance"
+        assert durable_session is not None
+    finally:
+        await managed_engine.dispose()
 

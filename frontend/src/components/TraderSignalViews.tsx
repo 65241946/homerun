@@ -37,8 +37,19 @@ import BuyButton from './BuyButton'
 
 // ─── Unified Type ──────────────────────────────────────────
 
+export interface UnifiedTraderExecutionPosition {
+  token_id: string
+  side: string
+  price: number
+  market_id: string
+  market_question: string
+  outcome: string
+  direction?: string
+}
+
 export interface UnifiedTraderSignal {
   id: string
+  opportunity_id?: string
   source: 'confluence' | 'insider'
   strategy_sdk?: string
   market_id: string
@@ -130,6 +141,7 @@ export interface UnifiedTraderSignal {
   is_tradeable: boolean
   validation_reasons: string[]
   source_coverage_score: number
+  execution_positions?: UnifiedTraderExecutionPosition[]
 }
 
 // ─── Normalization ─────────────────────────────────────────
@@ -304,6 +316,37 @@ function resolveTraderStrategySdk(candidates: unknown[], fallback = 'traders_con
   return fallback
 }
 
+function normalizeExecutionPositions(raw: unknown): UnifiedTraderExecutionPosition[] {
+  if (!Array.isArray(raw)) return []
+  const positions: UnifiedTraderExecutionPosition[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const position = item as Record<string, unknown>
+    const side = String(position.action || position.side || 'BUY').trim().toUpperCase() || 'BUY'
+    const outcome = String(position.outcome || '').trim()
+    const outcomeKey = outcome.toLowerCase()
+    const sideKey = side.toLowerCase()
+    const price = Number(position.price)
+    positions.push({
+      token_id: String(position.token_id || position.tokenId || '').trim(),
+      side,
+      price: Number.isFinite(price) ? price : 0.5,
+      market_id: String(position.market_id || position.marketId || '').trim(),
+      market_question: String(
+        position.market_question || position.market || position.question || '',
+      ).trim(),
+      outcome,
+      direction: (
+        (sideKey === 'buy' || sideKey === 'sell')
+        && (outcomeKey === 'yes' || outcomeKey === 'no')
+      )
+        ? `${sideKey}_${outcomeKey}`
+        : undefined,
+    })
+  }
+  return positions
+}
+
 export function normalizeConfluenceSignal(signal: TrackedTraderOpportunity): UnifiedTraderSignal {
   const direction = getConfluenceDirection(signal)
   const quality = normalizeSignalQualityFlags(signal)
@@ -323,6 +366,7 @@ export function normalizeConfluenceSignal(signal: TrackedTraderOpportunity): Uni
   ])
   return {
     id: signal.id,
+    opportunity_id: String(raw.opportunity_id || signal.id),
     source: 'confluence',
     strategy_sdk: strategySdk,
     market_id: signal.market_id,
@@ -366,6 +410,7 @@ export function normalizeConfluenceSignal(signal: TrackedTraderOpportunity): Uni
     is_tradeable: quality.isTradeable,
     validation_reasons: quality.reasons,
     source_coverage_score: quality.sourceCoverageScore,
+    execution_positions: normalizeExecutionPositions(raw.positions_to_take),
   }
 }
 
@@ -485,6 +530,7 @@ export function normalizeTraderOpportunity(opportunity: Opportunity): UnifiedTra
 
   return {
     id: opportunity.id,
+    opportunity_id: opportunity.id,
     source: 'confluence',
     strategy_sdk: strategySdk,
     market_id: String(market.id || ''),
@@ -529,6 +575,7 @@ export function normalizeTraderOpportunity(opportunity: Opportunity): UnifiedTra
     validation_reasons: validationReasons,
     source_coverage_score: normalizeSourceCoverageScore(normalizedSourceFlags),
     wallets: Array.isArray(firehose.wallets) ? (firehose.wallets as UnifiedTraderSignal['wallets']) : undefined,
+    execution_positions: normalizeExecutionPositions(opportunity.positions_to_take),
   }
 }
 

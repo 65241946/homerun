@@ -497,11 +497,12 @@ async def test_submit_execution_leg_live_does_not_fallback_to_market_id_token():
 
 
 @pytest.mark.asyncio
-async def test_submit_execution_leg_shadow_skips_without_executable_book(monkeypatch):
-    async def _no_token(*_args, **_kwargs):
-        return None
+async def test_submit_execution_leg_shadow_rejects_missing_identity_before_book_lookup(monkeypatch):
+    async def _book_lookup_must_not_run(*_args, **_kwargs):
+        raise AssertionError("missing token identity must block before any book lookup")
 
-    monkeypatch.setattr(order_manager, "_fetch_token_id_from_market", _no_token)
+    monkeypatch.setattr(order_manager, "_fetch_token_id_from_market", _book_lookup_must_not_run)
+    monkeypatch.setattr(order_manager, "_resolve_shadow_book_and_tape", _book_lookup_must_not_run)
     signal = SimpleNamespace(
         id="sig-3",
         market_id="m3",
@@ -526,10 +527,11 @@ async def test_submit_execution_leg_shadow_skips_without_executable_book(monkeyp
     )
 
     assert result.status == "skipped"
-    assert result.error_message == "No order book available for shadow execution leg."
+    assert "token_id" in str(result.error_message or "")
+    assert result.payload["reason"] == "missing_token_id"
+    assert result.payload["identity_reason"] == "missing_selected_token"
     assert result.payload["submission"] == "skipped"
     assert result.payload["mode"] == "shadow"
-    assert result.payload["reason"] == "missing_order_book"
     assert result.notional_usd == 0.0
 
 

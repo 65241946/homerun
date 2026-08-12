@@ -7,6 +7,7 @@ Builds strategy-owned trader opportunities and writes them to shared snapshot st
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import timedelta
 from typing import Any, Awaitable, Callable, TypeVar
 from sqlalchemy import select
@@ -423,6 +424,121 @@ async def _market_cache_hygiene_settings() -> dict:
     return config
 
 
+async def _apply_market_tradability_to_firehose(
+    firehose_rows: list[dict[str, Any]],
+) -> dict[str, bool]:
+    """Apply current market status and persist closed confluence signals."""
+    market_ids = sorted(
+        {
+            str(row.get("market_id") or "").strip().lower()
+            for row in firehose_rows
+            if isinstance(row, dict) and str(row.get("market_id") or "").strip()
+        }
+    )
+    if not market_ids:
+        return {}
+
+    tradability_map = await get_market_tradability_map(market_ids)
+    closed_market_ids: list[str] = []
+    for row in firehose_rows:
+        if not isinstance(row, dict):
+            continue
+        market_id = str(row.get("market_id") or "").strip().lower()
+        if market_id not in tradability_map:
+            continue
+        is_tradeable = bool(tradability_map[market_id])
+        row["is_tradeable"] = is_tradeable
+        if not is_tradeable:
+            row["is_active"] = False
+            closed_market_ids.append(market_id)
+
+    closed_market_ids = sorted(set(closed_market_ids))
+    if closed_market_ids:
+        deactivated = await wallet_intelligence.confluence.deactivate_market_signals(
+            closed_market_ids
+        )
+        logger.info(
+            "Closed confluence markets persisted inactive",
+            markets=len(closed_market_ids),
+            signals=deactivated,
+        )
+    return tradability_map
+
+
+def _coerce_market_metadata_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        return list(parsed) if isinstance(parsed, list) else []
+    return []
+
+
+async def _attach_cached_market_execution_metadata(
+    firehose_rows: list[dict[str, Any]],
+) -> int:
+    """Attach cached CLOB token identity to active executable firehose rows."""
+    market_info_by_id: dict[str, dict[str, Any] | None] = {}
+    attached = 0
+    for row in firehose_rows:
+        if not isinstance(row, dict):
+            continue
+        if not bool(row.get("is_active", True)) or not bool(row.get("is_tradeable", True)):
+            continue
+        market_id = str(row.get("market_id") or "").strip().lower()
+        if not market_id:
+            continue
+        if market_id not in market_info_by_id:
+            try:
+                cached = await market_cache_service.get_market(market_id)
+            except Exception:
+                cached = None
+            market_info_by_id[market_id] = cached if isinstance(cached, dict) else None
+        market_info = market_info_by_id[market_id]
+        if not market_info:
+            continue
+
+        raw_token_ids = (
+            market_info.get("token_ids")
+            if market_info.get("token_ids") is not None
+            else market_info.get("clob_token_ids", market_info.get("clobTokenIds"))
+        )
+        token_ids = [
+            str(token_id or "").strip().lower()
+            for token_id in _coerce_market_metadata_list(raw_token_ids)
+            if str(token_id or "").strip()
+        ]
+        if len(token_ids) < 2:
+            continue
+
+        row["market_token_ids"] = token_ids
+        row["yes_token_id"] = token_ids[0]
+        row["no_token_id"] = token_ids[1]
+
+        raw_outcomes = (
+            market_info.get("outcomes")
+            if market_info.get("outcomes") is not None
+            else market_info.get("outcome_labels", market_info.get("outcomeLabels"))
+        )
+        outcomes = [
+            str(outcome or "").strip()
+            for outcome in _coerce_market_metadata_list(raw_outcomes)
+            if str(outcome or "").strip()
+        ]
+        if len(outcomes) >= 2:
+            row["outcome_labels"] = outcomes
+        attached += 1
+    return attached
+
+
 async def _run_loop() -> None:
     worker_name = "tracked_traders"
     logger.info("Tracked-traders worker started")
@@ -653,7 +769,7 @@ async def _run_loop() -> None:
                 await _run_with_retryable_db_retries(
                     "confluence_scan",
                     lambda: _graceful_timeout(
-                        wallet_intelligence.confluence.scan_for_confluence(), timeout=45, label="confluence_scan"
+                        wallet_intelligence.confluence.scan_for_confluence(), timeout=75, label="confluence_scan"
                     ),
                 )
             except _TimedTaskStillRunningError:
@@ -661,7 +777,7 @@ async def _run_loop() -> None:
                 logger.warning("Tracked-traders confluence_scan skipped because prior run is still finishing")
             except asyncio.TimeoutError:
                 activity_labels.append("confluence_scan_timeout")
-                logger.warning("Tracked-traders confluence_scan timed out after 45s")
+                logger.warning("Tracked-traders confluence_scan timed out after 75s")
 
             trader_intent_settings = await _trader_opportunity_intent_settings()
 
@@ -674,24 +790,14 @@ async def _run_loop() -> None:
                 include_source_context=True,
             )
             if firehose_rows:
-                market_ids = [
-                    str(row.get("market_id") or "").strip().lower()
-                    for row in firehose_rows
-                    if isinstance(row, dict) and str(row.get("market_id") or "").strip()
-                ]
-                if market_ids:
-                    tradability_map = await get_market_tradability_map(market_ids)
-                    for row in firehose_rows:
-                        if not isinstance(row, dict):
-                            continue
-                        market_id = str(row.get("market_id") or "").strip().lower()
-                        if not market_id:
-                            continue
-                        if market_id in tradability_map:
-                            tradable = bool(tradability_map[market_id])
-                            row["is_tradeable"] = tradable
-                            if not tradable:
-                                row["is_active"] = False
+                await _apply_market_tradability_to_firehose(firehose_rows)
+                execution_metadata_attached = await _attach_cached_market_execution_metadata(
+                    firehose_rows
+                )
+                logger.info(
+                    "Trader firehose execution metadata attached",
+                    rows=execution_metadata_attached,
+                )
             confluence_scanned = len(firehose_rows)
             deduped_by_stable_id: dict[str, Any] = {}
             deduped_opportunities: list[Any] = []

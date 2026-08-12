@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from types import SimpleNamespace
 import time
 import uuid
 from datetime import datetime, timezone
@@ -12,10 +15,18 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
-from models.database import AsyncSessionLocal, TraderOrder, get_db_session
+from models.database import (
+    AsyncSessionLocal,
+    ExecutionSession,
+    SimulationAccount,
+    TraderDecision,
+    TraderOrder,
+    get_db_session,
+)
 from services.live_price_snapshot import normalize_binary_price_history
 from services.pause_state import global_pause_state
 from services import shared_state as scanner_shared_state
@@ -33,6 +44,7 @@ from services.trader_orchestrator_state import (
     adopt_live_wallet_position,
     cleanup_trader_open_orders,
     create_config_revision,
+    create_trader_decision,
     create_trader,
     create_trader_event,
     create_trader_from_template,
@@ -56,12 +68,10 @@ from services.trader_orchestrator_state import (
     sync_trader_position_inventory,
     transfer_open_trades,
     update_trader,
+    update_trader_decision,
 )
 from services.live_execution_service import (
     live_execution_service,
-    OrderSide,
-    OrderType,
-    OrderStatus,
 )
 from utils.converters import normalize_market_id, to_iso
 from utils.market_urls import infer_market_platform
@@ -282,12 +292,367 @@ class ManualBuyPosition(BaseModel):
     market_id: str = ""
     market_question: str = ""
     outcome: str = ""
+    direction: Optional[str] = None
 
 
 class TraderManualBuyRequest(BaseModel):
     positions: list[ManualBuyPosition] = Field(..., min_length=1)
     size_usd: float = Field(..., gt=0)
     opportunity_id: Optional[str] = None
+    client_request_id: str = Field(..., min_length=8, max_length=128)
+    order_type: str = Field(default="market", pattern="^(market|limit)$")
+
+
+def _manual_position_outcome_index(position: dict[str, Any], market: dict[str, Any]) -> int:
+    token_id = str(position.get("token_id") or "").strip()
+    tokens = market.get("tokens")
+    if isinstance(tokens, list):
+        for index, token in enumerate(tokens):
+            if not isinstance(token, dict):
+                continue
+            candidate = str(token.get("token_id") or token.get("tokenId") or "").strip()
+            if token_id and candidate == token_id:
+                return index
+
+    outcome = str(position.get("outcome") or "").strip().lower()
+    if outcome == "yes":
+        return 0
+    if outcome == "no":
+        return 1
+    raise HTTPException(
+        status_code=409,
+        detail="Opportunity position does not carry an unambiguous binary outcome identity.",
+    )
+
+
+def _build_manual_runtime_signal(
+    *,
+    opportunity: Any,
+    request: TraderManualBuyRequest,
+    trader_id: str,
+    request_fingerprint: str,
+) -> Any:
+    authoritative_positions = [
+        dict(position)
+        for position in list(getattr(opportunity, "positions_to_take", None) or [])
+        if isinstance(position, dict)
+    ]
+    if not authoritative_positions:
+        raise HTTPException(status_code=409, detail="Opportunity has no executable positions.")
+    if len(authoritative_positions) != len(request.positions):
+        raise HTTPException(status_code=409, detail="Opportunity position count changed; refresh before trading.")
+
+    markets = [
+        dict(market)
+        for market in list(getattr(opportunity, "markets", None) or [])
+        if isinstance(market, dict)
+    ]
+    markets_by_id: dict[str, dict[str, Any]] = {}
+    for market in markets:
+        for candidate in (market.get("id"), market.get("condition_id"), market.get("conditionId")):
+            key = str(candidate or "").strip()
+            if key:
+                markets_by_id[key] = market
+
+    legs: list[dict[str, Any]] = []
+    for index, (position, client_position) in enumerate(zip(authoritative_positions, request.positions, strict=True)):
+        action = str(position.get("action") or "BUY").strip().upper()
+        if action != "BUY":
+            raise HTTPException(
+                status_code=409,
+                detail="Manual buy does not execute SELL/close positions; use the position close workflow.",
+            )
+
+        token_id = str(position.get("token_id") or "").strip()
+        if not token_id:
+            raise HTTPException(status_code=409, detail="Opportunity is missing its executable token_id.")
+        client_token_id = str(client_position.token_id or "").strip()
+        if client_token_id and client_token_id != token_id:
+            raise HTTPException(status_code=409, detail="Opportunity token changed; refresh before trading.")
+
+        market_id = str(position.get("market_id") or "").strip()
+        market = markets_by_id.get(market_id)
+        if market is None and len(markets) == 1:
+            market = markets[0]
+        if market is None:
+            raise HTTPException(status_code=409, detail="Opportunity market identity is incomplete.")
+        resolved_market_id = str(market.get("id") or market_id or "").strip()
+        client_market_id = str(client_position.market_id or "").strip()
+        valid_market_ids = {
+            value
+            for value in (
+                resolved_market_id,
+                str(market.get("condition_id") or market.get("conditionId") or "").strip(),
+            )
+            if value
+        }
+        if client_market_id and client_market_id not in valid_market_ids:
+            raise HTTPException(status_code=409, detail="Opportunity market changed; refresh before trading.")
+
+        outcome_index = _manual_position_outcome_index(position, market)
+        if outcome_index not in {0, 1}:
+            raise HTTPException(status_code=409, detail="Only binary outcome positions are supported.")
+        canonical_direction = "buy_yes" if outcome_index == 0 else "buy_no"
+        requested_direction = str(client_position.direction or "").strip().lower()
+        if requested_direction and requested_direction != canonical_direction:
+            raise HTTPException(status_code=409, detail="Opportunity direction changed; refresh before trading.")
+
+        authoritative_price = float(position.get("price") or 0.0)
+        limit_price = float(client_position.price) if request.order_type == "limit" else authoritative_price
+        if not 0.01 <= limit_price <= 0.99:
+            raise HTTPException(status_code=409, detail="Opportunity price is outside the executable range.")
+        market_question = str(
+            position.get("market")
+            or market.get("question")
+            or getattr(opportunity, "title", "")
+            or resolved_market_id
+        ).strip()
+        condition_id = str(market.get("condition_id") or market.get("conditionId") or "").strip()
+        legs.append(
+            {
+                "leg_id": f"manual_leg_{index + 1}",
+                "market_id": resolved_market_id,
+                "market_question": market_question,
+                "token_id": token_id,
+                "side": "buy",
+                "outcome": "yes" if outcome_index == 0 else "no",
+                "direction": canonical_direction,
+                "limit_price": limit_price,
+                "price_policy": "maker_limit" if request.order_type == "limit" else "taker_limit",
+                "time_in_force": "GTC" if request.order_type == "limit" else "IOC",
+                "post_only": request.order_type == "limit",
+                "notional_weight": 1.0,
+                "min_fill_ratio": 0.0,
+                "metadata": {
+                    "condition_id": condition_id or None,
+                    "outcome_index": outcome_index,
+                    "manual_request_id": request.client_request_id,
+                },
+            }
+        )
+
+    first_leg = legs[0]
+    strategy_context = dict(getattr(opportunity, "strategy_context", None) or {})
+    source = str(strategy_context.get("source_key") or "scanner").strip().lower() or "scanner"
+    opportunity_payload = (
+        opportunity.model_dump(mode="json")
+        if hasattr(opportunity, "model_dump")
+        else {}
+    )
+    signal_payload = dict(opportunity_payload)
+    signal_payload.update(
+        {
+            "selected_token_id": first_leg["token_id"],
+            "selected_outcome_index": first_leg["metadata"]["outcome_index"],
+            "execution_plan": {
+                "plan_id": f"manual_{request.client_request_id}",
+                "policy": "PARALLEL_MAKER",
+                "time_in_force": first_leg["time_in_force"],
+                "legs": legs,
+                "metadata": {
+                    "manual": True,
+                    "manual_request_id": request.client_request_id,
+                    "trader_id": trader_id,
+                },
+            },
+            "manual_execution": {
+                "request_id": request.client_request_id,
+                "request_fingerprint": request_fingerprint,
+                "order_type": request.order_type,
+            },
+        }
+    )
+    return SimpleNamespace(
+        id=str(getattr(opportunity, "id", "") or request.opportunity_id or ""),
+        source=source,
+        signal_type="manual_buy",
+        strategy_type=str(getattr(opportunity, "strategy", "") or "manual_buy"),
+        market_id=str(first_leg["market_id"]),
+        market_question=str(first_leg["market_question"]),
+        direction=str(first_leg["direction"]),
+        entry_price=float(first_leg["limit_price"]),
+        effective_price=None,
+        edge_percent=getattr(opportunity, "edge_percent", None),
+        confidence=getattr(opportunity, "confidence", None),
+        payload_json=signal_payload,
+        strategy_context_json=strategy_context,
+        trace_id=None,
+    )
+
+
+def _manual_buy_request_fingerprint(trader_id: str, request: TraderManualBuyRequest) -> str:
+    payload = {
+        "trader_id": str(trader_id or "").strip(),
+        "opportunity_id": str(request.opportunity_id or "").strip(),
+        "client_request_id": str(request.client_request_id or "").strip(),
+        "order_type": str(request.order_type or "market").strip().lower(),
+        "size_usd": float(request.size_usd),
+        "positions": [position.model_dump(mode="json") for position in request.positions],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _manual_buy_decision_id(trader_id: str, client_request_id: str) -> str:
+    identity = f"homerun:manual-buy:{str(trader_id or '').strip()}:{str(client_request_id or '').strip()}"
+    return uuid.uuid5(uuid.NAMESPACE_URL, identity).hex
+
+
+async def _read_current_manual_opportunity(session: AsyncSession, opportunity_id: str) -> Any:
+    normalized_id = str(opportunity_id or "").strip()
+    if not normalized_id:
+        raise HTTPException(status_code=422, detail="opportunity_id is required for manual execution.")
+
+    trader_opportunities, _ = await scanner_shared_state.read_traders_snapshot(session)
+    for opportunity in trader_opportunities:
+        if str(getattr(opportunity, "id", "") or "").strip() == normalized_id:
+            return opportunity
+
+    market_opportunities, _ = await scanner_shared_state.read_scanner_snapshot(session)
+    for opportunity in market_opportunities:
+        if str(getattr(opportunity, "id", "") or "").strip() == normalized_id:
+            return opportunity
+    raise HTTPException(status_code=404, detail=f"Current opportunity not found: {normalized_id}")
+
+
+def _manual_shadow_account_id(control: dict[str, Any], trader: dict[str, Any]) -> str:
+    settings_payload = control.get("settings")
+    settings_payload = settings_payload if isinstance(settings_payload, dict) else {}
+    metadata_payload = trader.get("metadata")
+    metadata_payload = metadata_payload if isinstance(metadata_payload, dict) else {}
+    for candidate in (
+        settings_payload.get("shadow_account_id"),
+        metadata_payload.get("shadow_account_id"),
+    ):
+        account_id = str(candidate or "").strip()
+        if account_id:
+            return account_id
+    return ""
+
+
+def _serialize_manual_order(order: TraderOrder) -> dict[str, Any]:
+    payload = dict(order.payload_json or {})
+    effective_price = float(order.effective_price or order.entry_price or 0.0)
+    notional_usd = float(order.notional_usd or 0.0)
+    size_shares = notional_usd / effective_price if effective_price > 0.0 else 0.0
+    return {
+        "order_id": str(order.id),
+        "market_id": str(order.market_id or ""),
+        "market_question": str(order.market_question or ""),
+        "direction": str(order.direction or ""),
+        "status": str(order.status or ""),
+        "notional_usd": notional_usd,
+        "entry_price": float(order.entry_price or 0.0),
+        "effective_price": effective_price,
+        "size_shares": size_shares,
+        "error": order.error_message,
+        "simulation_ledger": (
+            dict(payload.get("simulation_ledger"))
+            if isinstance(payload.get("simulation_ledger"), dict)
+            else None
+        ),
+    }
+
+
+async def _manual_buy_response_for_decision(
+    session: AsyncSession,
+    *,
+    trader_id: str,
+    decision: TraderDecision,
+    request_fingerprint: str,
+    expected_mode: str,
+    expected_shadow_account_id: str | None,
+) -> dict[str, Any]:
+    decision_payload = dict(decision.payload_json or {})
+    manual_payload = decision_payload.get("manual_execution")
+    manual_payload = manual_payload if isinstance(manual_payload, dict) else {}
+    persisted_fingerprint = str(manual_payload.get("request_fingerprint") or "").strip()
+    if persisted_fingerprint and persisted_fingerprint != request_fingerprint:
+        raise HTTPException(status_code=409, detail="client_request_id was already used for a different request.")
+
+    order_rows = list(
+        (
+            await session.execute(
+                select(TraderOrder)
+                .where(TraderOrder.trader_id == trader_id, TraderOrder.decision_id == decision.id)
+                .order_by(TraderOrder.created_at.asc(), TraderOrder.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    serialized_orders = [_serialize_manual_order(order) for order in order_rows]
+    session_id = str(decision_payload.get("execution_session_id") or "").strip()
+    if not session_id:
+        session_id = str(
+            (
+                await session.execute(
+                    select(ExecutionSession.id)
+                    .where(ExecutionSession.decision_id == decision.id)
+                    .order_by(ExecutionSession.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            or ""
+        ).strip()
+
+    mode = str(expected_mode or "shadow").strip().lower()
+    if serialized_orders:
+        if mode == "shadow":
+            decision_shadow_account_id = str(
+                manual_payload.get("shadow_account_id")
+                or expected_shadow_account_id
+                or ""
+            ).strip()
+            ledger_rows = [
+                order.get("simulation_ledger")
+                for order in serialized_orders
+                if float(order.get("notional_usd") or 0.0) > 0.0
+            ]
+            if ledger_rows and all(isinstance(ledger, dict) and ledger.get("account_id") for ledger in ledger_rows):
+                ledger_account_ids = {
+                    str(ledger.get("account_id") or "").strip()
+                    for ledger in ledger_rows
+                    if isinstance(ledger, dict)
+                }
+                if len(ledger_account_ids) != 1 or (
+                    decision_shadow_account_id
+                    and ledger_account_ids != {decision_shadow_account_id}
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Manual execution ledger was recorded against a different Shadow account.",
+                    )
+                account_id = next(iter(ledger_account_ids))
+                return {
+                    "status": "success",
+                    "trader_id": trader_id,
+                    "mode": mode,
+                    "decision_id": str(decision.id),
+                    "session_id": session_id or None,
+                    "account_id": account_id or None,
+                    "orders": serialized_orders,
+                    "message": f"{len(serialized_orders)} shadow order(s) executed and recorded",
+                }
+        else:
+            live_success_statuses = {"executed", "open", "working", "submitted", "partially_filled", "placing"}
+            if any(str(order.get("status") or "").strip().lower() in live_success_statuses for order in serialized_orders):
+                return {
+                    "status": "success",
+                    "trader_id": trader_id,
+                    "mode": mode,
+                    "decision_id": str(decision.id),
+                    "session_id": session_id or None,
+                    "account_id": None,
+                    "orders": serialized_orders,
+                    "message": f"{len(serialized_orders)} live order(s) accepted by the execution session",
+                }
+
+    decision_status = str(decision.decision or "").strip().lower()
+    detail = str(decision.reason or "").strip() or "Manual execution has not produced a committed fill."
+    if decision_status in {"failed", "skipped", "blocked"}:
+        raise HTTPException(status_code=409, detail=detail)
+    raise HTTPException(status_code=409, detail="The same manual request is already in progress.")
 
 
 class TraderStartRequest(BaseModel):
@@ -2252,121 +2617,160 @@ async def manual_buy(
     trader = await get_trader(session, trader_id)
     if trader is None:
         raise HTTPException(status_code=404, detail="Trader not found")
+    if not bool(trader.get("is_enabled", False)):
+        raise HTTPException(status_code=409, detail="Selected trader is disabled.")
+    if bool(trader.get("is_paused", False)):
+        raise HTTPException(status_code=409, detail="Selected trader is paused.")
+    if bool(trader.get("block_new_orders", False)):
+        raise HTTPException(status_code=409, detail="Selected trader is blocking new orders.")
 
-    # ``get_trader`` returns a dict; previous ``.mode`` access was a bug
-    # that 500'd every manual-buy invocation.
-    mode = str((trader.get("mode") if isinstance(trader, dict) else getattr(trader, "mode", None)) or "shadow").strip().lower()
-    now = utcnow()
-    created_orders = []
+    mode = str(trader.get("mode") or "shadow").strip().lower()
+    if mode not in {"shadow", "live"}:
+        raise HTTPException(status_code=409, detail=f"Unsupported trader execution mode: {mode or 'unknown'}")
+    if mode == "shadow" and request.order_type == "limit":
+        raise HTTPException(
+            status_code=409,
+            detail="Shadow manual execution supports immediate marketable-limit matching only; resting limits are not simulated.",
+        )
 
-    per_position_usd = request.size_usd / len(request.positions)
+    control = await read_orchestrator_control(session, read_only=True)
+    if not bool(control.get("is_enabled", False)):
+        raise HTTPException(status_code=409, detail="Trader orchestrator is disabled.")
+    if bool(control.get("is_paused", False)):
+        raise HTTPException(status_code=409, detail="Trader orchestrator is paused.")
+    if bool(control.get("kill_switch", False)):
+        raise HTTPException(status_code=409, detail="Trader orchestrator kill switch is active.")
 
-    for pos in request.positions:
-        order_id = uuid.uuid4().hex
-        side_str = str(pos.side or "BUY").strip().upper()
-        size_shares = per_position_usd / pos.price if pos.price > 0 else 0.0
-        direction = f"buy_{pos.outcome.lower()}" if pos.outcome else f"buy_{side_str.lower()}"
+    request_fingerprint = _manual_buy_request_fingerprint(trader_id, request)
+    decision_id = _manual_buy_decision_id(trader_id, request.client_request_id)
+    shadow_account_id = _manual_shadow_account_id(control, trader) if mode == "shadow" else ""
+    if mode == "shadow":
+        if not shadow_account_id:
+            raise HTTPException(status_code=409, detail="No Shadow account is configured for manual execution.")
+        if await session.get(SimulationAccount, shadow_account_id) is None:
+            raise HTTPException(status_code=409, detail=f"Configured Shadow account was not found: {shadow_account_id}")
 
-        live_order_result = None
-        order_status = "submitted"
-        error_message = None
-
-        if mode == "live":
-            if not live_execution_service.is_ready():
-                raise HTTPException(status_code=400, detail="Live trading service not initialized")
-            try:
-                side = OrderSide(side_str)
-            except ValueError:
-                side = OrderSide.BUY
-            live_order = await live_execution_service.place_order(
-                token_id=pos.token_id,
-                side=side,
-                price=pos.price,
-                size=size_shares,
-                order_type=OrderType.GTC,
-                market_question=pos.market_question or None,
-            )
-            if live_order.status == OrderStatus.FAILED:
-                order_status = "failed"
-                error_message = live_order.error_message
-            else:
-                order_status = "executed"
-            live_order_result = {
-                "order_id": live_order.id,
-                "status": str(live_order.status),
-                "size": live_order.size,
-                "price": live_order.price,
-            }
-
-        row = TraderOrder(
-            id=order_id,
+    existing_decision = await session.get(TraderDecision, decision_id)
+    if existing_decision is not None:
+        return await _manual_buy_response_for_decision(
+            session,
             trader_id=trader_id,
-            signal_id=None,
-            decision_id=None,
-            source="manual",
+            decision=existing_decision,
+            request_fingerprint=request_fingerprint,
+            expected_mode=mode,
+            expected_shadow_account_id=shadow_account_id or None,
+        )
+
+    opportunity = await _read_current_manual_opportunity(session, str(request.opportunity_id or ""))
+    runtime_signal = _build_manual_runtime_signal(
+        opportunity=opportunity,
+        request=request,
+        trader_id=trader_id,
+        request_fingerprint=request_fingerprint,
+    )
+    decision_payload = {
+        "manual_execution": {
+            "request_id": request.client_request_id,
+            "request_fingerprint": request_fingerprint,
+            "opportunity_id": str(request.opportunity_id or ""),
+            "order_type": request.order_type,
+            "size_usd": float(request.size_usd),
+            "mode": mode,
+            "shadow_account_id": shadow_account_id or None,
+        }
+    }
+    try:
+        decision_row = await create_trader_decision(
+            session,
+            decision_id=decision_id,
+            trader_id=trader_id,
+            signal=runtime_signal,
             strategy_key="manual_buy",
             strategy_version=None,
-            market_id=pos.market_id or pos.token_id,
-            market_question=pos.market_question or None,
-            direction=direction,
-            event_id=None,
+            decision="selected",
+            reason="Operator confirmed manual opportunity execution.",
+            score=getattr(runtime_signal, "confidence", None),
+            checks_summary={"count": 0, "manual": True},
+            risk_snapshot=dict(trader.get("risk_limits") or {}),
+            payload=decision_payload,
             trace_id=None,
-            mode=mode,
-            status=order_status,
-            notional_usd=per_position_usd,
-            entry_price=pos.price,
-            effective_price=pos.price,
-            edge_percent=None,
-            confidence=None,
-            reason="Manual buy from UI",
-            payload_json={
-                "manual": True,
-                "opportunity_id": request.opportunity_id,
-                "token_id": pos.token_id,
-                "side": side_str,
-                "outcome": pos.outcome,
-                "size_shares": size_shares,
-                "live_order": live_order_result,
-            },
-            error_message=error_message,
-            created_at=now,
-            executed_at=now if order_status == "executed" else None,
         )
-        session.add(row)
-        created_orders.append({
-            "order_id": order_id,
-            "market_id": pos.market_id or pos.token_id,
-            "market_question": pos.market_question,
-            "direction": direction,
-            "status": order_status,
-            "notional_usd": per_position_usd,
-            "entry_price": pos.price,
-            "size_shares": size_shares,
-            "error": error_message,
-            "live_order": live_order_result,
-        })
+    except IntegrityError:
+        await session.rollback()
+        raced_decision = await session.get(TraderDecision, decision_id)
+        if raced_decision is None:
+            raise
+        return await _manual_buy_response_for_decision(
+            session,
+            trader_id=trader_id,
+            decision=raced_decision,
+            request_fingerprint=request_fingerprint,
+            expected_mode=mode,
+            expected_shadow_account_id=shadow_account_id or None,
+        )
 
-    await session.commit()
+    execution_engine = ExecutionSessionEngine(session)
+    try:
+        execution_result = await execution_engine.execute_signal(
+            trader_id=trader_id,
+            signal=runtime_signal,
+            decision_id=decision_row.id,
+            strategy_key="manual_buy",
+            strategy_version=None,
+            strategy_params={},
+            risk_limits=dict(trader.get("risk_limits") or {}),
+            mode=mode,
+            size_usd=float(request.size_usd),
+            reason="Manual buy from UI",
+            explicit_strategy_params={},
+            execution_timeout_seconds=8.0 if mode == "shadow" else None,
+            shadow_account_id=shadow_account_id or None,
+        )
+    except Exception as exc:
+        error_message = f"Manual execution failed: {type(exc).__name__}: {str(exc)[:240]}"
+        await update_trader_decision(
+            session,
+            decision_id=decision_row.id,
+            decision="failed",
+            reason=error_message,
+            payload_patch={"execution_status": "failed", "execution_error": error_message},
+        )
+        raise HTTPException(status_code=409, detail=error_message) from exc
 
-    await sync_trader_position_inventory(session, trader_id=trader_id, mode=mode)
-
-    await create_trader_event(
+    normalized_status = str(execution_result.status or "").strip().lower()
+    decision_status = "selected"
+    if normalized_status == "skipped":
+        decision_status = "skipped"
+    elif normalized_status in {"failed", "cancelled", "expired"}:
+        decision_status = "failed"
+    elif int(execution_result.orders_written or 0) <= 0:
+        decision_status = "failed"
+    result_reason = str(execution_result.error_message or "").strip() or (
+        "Manual execution completed."
+        if int(execution_result.orders_written or 0) > 0
+        else "Manual execution did not produce a committed order."
+    )
+    refreshed_decision = await update_trader_decision(
+        session,
+        decision_id=decision_row.id,
+        decision=decision_status,
+        reason=result_reason,
+        payload_patch={
+            "execution_status": normalized_status,
+            "execution_session_id": str(execution_result.session_id or ""),
+            "orders_written": int(execution_result.orders_written or 0),
+        },
+    )
+    if refreshed_decision is None:
+        raise HTTPException(status_code=500, detail="Manual decision disappeared after execution.")
+    return await _manual_buy_response_for_decision(
         session,
         trader_id=trader_id,
-        event_type="manual_buy",
-        source="operator",
-        message=f"Manual buy: {len(created_orders)} position(s), ${request.size_usd:.2f}",
-        payload={"orders": created_orders, "opportunity_id": request.opportunity_id},
+        decision=refreshed_decision,
+        request_fingerprint=request_fingerprint,
+        expected_mode=mode,
+        expected_shadow_account_id=shadow_account_id or None,
     )
-
-    failed = [o for o in created_orders if o["status"] == "failed"]
-    return {
-        "status": "partial_failure" if failed else "success",
-        "trader_id": trader_id,
-        "mode": mode,
-        "orders": created_orders,
-        "message": f"{len(failed)} of {len(created_orders)} orders failed" if failed else f"{len(created_orders)} order(s) placed",
-    }
 
 
 @router.post("/{trader_id}/run-once")

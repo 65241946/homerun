@@ -13,8 +13,17 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from models.database import Base, TradeSignal, Trader, TraderOrder, TraderOrderVerificationEvent
+from models.database import (
+    Base,
+    OnlineMarketResolution,
+    SimulationAccount,
+    TradeSignal,
+    Trader,
+    TraderOrder,
+    TraderOrderVerificationEvent,
+)
 from services.trader_orchestrator import position_lifecycle
+from services.trader_orchestrator.hot_path import hot_path_no_rest
 from services.strategies.base import ExitDecision
 from tests.postgres_test_db import build_postgres_session_factory
 
@@ -414,6 +423,253 @@ async def test_reconcile_infers_resolution_from_settled_prices_when_terminal(tmp
             assert order is not None
             assert order.status == "resolved_win"
             assert (order.payload_json or {}).get("position_close", {}).get("close_trigger") == "resolution_inferred"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shadow_reconcile_closes_linked_simulation_ledger_by_default(tmp_path, monkeypatch):
+    engine, session_factory = await _build_session_factory(tmp_path)
+    try:
+        async with session_factory() as session:
+            session.add(
+                SimulationAccount(
+                    id="shadow-1",
+                    name="Legacy lifecycle account",
+                    initial_capital=1_000.0,
+                    current_capital=1_000.0,
+                    ledger_version=1,
+                    ledger_integrity_status="legacy",
+                )
+            )
+            await _seed_order(
+                session,
+                direction="buy_yes",
+                payload_json={
+                    "simulation_ledger": {
+                        "account_id": "shadow-1",
+                        "trade_id": "trade-1",
+                        "position_id": "position-1",
+                    }
+                },
+            )
+            monkeypatch.setattr(
+                position_lifecycle,
+                "load_market_info_for_orders",
+                AsyncMock(
+                    return_value={
+                        "market-1": {
+                            "closed": True,
+                            "accepting_orders": False,
+                            "winner": 0,
+                            "outcome_prices": [1.0, 0.0],
+                        }
+                    }
+                ),
+            )
+            close_mock = AsyncMock(
+                return_value={
+                    "closed": True,
+                    "actual_payout": 100.0,
+                    "actual_pnl": 60.0,
+                    "trade_status": "closed_win",
+                }
+            )
+            monkeypatch.setattr(
+                position_lifecycle.simulation_service,
+                "close_orchestrator_shadow_fill",
+                close_mock,
+            )
+
+            result = await position_lifecycle.reconcile_shadow_positions(
+                session,
+                trader_id="trader-1",
+                trader_params={},
+                dry_run=False,
+            )
+
+            assert result["closed"] == 1
+            close_mock.assert_awaited_once()
+            assert close_mock.await_args.kwargs["account_id"] == "shadow-1"
+            assert close_mock.await_args.kwargs["trade_id"] == "trade-1"
+            assert close_mock.await_args.kwargs["position_id"] == "position-1"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shadow_reconcile_defers_v2_resolution_to_settlement_coordinator(tmp_path, monkeypatch):
+    engine, session_factory = await _build_session_factory(tmp_path)
+    try:
+        async with session_factory() as session:
+            session.add(
+                SimulationAccount(
+                    id="shadow-v2",
+                    name="V2 coordinator-owned account",
+                    initial_capital=1_000.0,
+                    current_capital=900.0,
+                    ledger_version=2,
+                    ledger_integrity_status="complete",
+                )
+            )
+            await _seed_order(
+                session,
+                direction="buy_yes",
+                payload_json={
+                    "simulation_ledger": {
+                        "account_id": "shadow-v2",
+                        "trade_id": "trade-v2",
+                        "position_id": "position-v2",
+                    }
+                },
+            )
+            order_to_type = await session.get(TraderOrder, "order-1")
+            assert order_to_type is not None
+            order_to_type.venue = "polymarket"
+            order_to_type.provider_market_id = "market-1"
+            order_to_type.condition_id = "condition-v2"
+            order_to_type.token_id = "token-v2-yes"
+            order_to_type.outcome_index = 0
+            order_to_type.identity_status = "complete"
+            now = datetime.now(timezone.utc)
+            session.add(
+                OnlineMarketResolution(
+                    id="resolution-v2",
+                    venue="polymarket",
+                    provider="gamma",
+                    provider_market_id="market-1",
+                    condition_id="condition-v2",
+                    token_ids_json=["token-v2-yes", "token-v2-no"],
+                    outcomes_json=["YES", "NO"],
+                    outcome_prices_json=["1", "0"],
+                    state="final",
+                    winning_token_id="token-v2-yes",
+                    winning_outcome_index=0,
+                    winning_outcome="YES",
+                    provider_resolved_at=now,
+                    first_observed_at=now,
+                    last_observed_at=now,
+                    finalized_at=now,
+                    fact_version=1,
+                    evidence_hash="v2-resolution-evidence",
+                    evidence_json={"state": "final"},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+            monkeypatch.setattr(
+                position_lifecycle,
+                "load_market_info_for_orders",
+                AsyncMock(side_effect=AssertionError("v2 resolution must not use the legacy REST loader")),
+            )
+            close_mock = AsyncMock(
+                side_effect=AssertionError("v2 resolution must not use the legacy simulation close")
+            )
+            monkeypatch.setattr(
+                position_lifecycle.simulation_service,
+                "close_orchestrator_shadow_fill",
+                close_mock,
+            )
+
+            with hot_path_no_rest():
+                result = await position_lifecycle.reconcile_shadow_positions(
+                    session,
+                    trader_id="trader-1",
+                    trader_params={},
+                    dry_run=False,
+                )
+            order = await session.get(TraderOrder, "order-1")
+
+            assert result["closed"] == 0
+            assert result["held"] == 1
+            assert result["settlement_pending"] == 1
+            assert order is not None
+            assert order.status == "executed"
+            assert order.actual_profit is None
+            pending = (order.payload_json or {}).get("settlement_pending", {})
+            assert pending["status"] == "awaiting_settlement_coordinator"
+            assert pending["source"] == "online_market_resolution"
+            assert pending["online_market_resolution_id"] == "resolution-v2"
+            assert pending["resolution_fact_version"] == 1
+            close_mock.assert_not_awaited()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shadow_reconcile_does_not_infer_v2_resolution_from_terminal_prices(tmp_path, monkeypatch):
+    engine, session_factory = await _build_session_factory(tmp_path)
+    try:
+        async with session_factory() as session:
+            session.add(
+                SimulationAccount(
+                    id="shadow-v2-unresolved",
+                    name="V2 unresolved account",
+                    initial_capital=1_000.0,
+                    current_capital=900.0,
+                    ledger_version=2,
+                    ledger_integrity_status="complete",
+                )
+            )
+            await _seed_order(
+                session,
+                direction="buy_yes",
+                payload_json={
+                    "simulation_ledger": {
+                        "account_id": "shadow-v2-unresolved",
+                        "trade_id": "trade-v2-unresolved",
+                        "position_id": "position-v2-unresolved",
+                    },
+                    "live_market": {
+                        "market_id": "market-1",
+                        "closed": True,
+                        "accepting_orders": False,
+                        "outcome_prices": [1.0, 0.0],
+                    },
+                },
+            )
+            order_to_type = await session.get(TraderOrder, "order-1")
+            assert order_to_type is not None
+            order_to_type.venue = "polymarket"
+            order_to_type.provider_market_id = "market-1"
+            order_to_type.condition_id = "condition-v2-unresolved"
+            order_to_type.token_id = "token-v2-unresolved-yes"
+            order_to_type.outcome_index = 0
+            order_to_type.identity_status = "complete"
+            await session.commit()
+
+            market_loader = AsyncMock(
+                side_effect=AssertionError("v2 orders must not use the legacy REST loader")
+            )
+            legacy_close = AsyncMock(
+                side_effect=AssertionError("terminal prices are not authoritative finality for v2 orders")
+            )
+            monkeypatch.setattr(position_lifecycle, "load_market_info_for_orders", market_loader)
+            monkeypatch.setattr(
+                position_lifecycle.simulation_service,
+                "close_orchestrator_shadow_fill",
+                legacy_close,
+            )
+
+            with hot_path_no_rest():
+                result = await position_lifecycle.reconcile_shadow_positions(
+                    session,
+                    trader_id="trader-1",
+                    trader_params={},
+                    dry_run=False,
+                )
+            order = await session.get(TraderOrder, "order-1")
+
+            assert result["closed"] == 0
+            assert result["held"] == 1
+            assert result["settlement_pending"] == 0
+            assert order is not None
+            assert order.status == "executed"
+            assert order.actual_profit is None
+            assert "position_close" not in (order.payload_json or {})
+            market_loader.assert_not_awaited()
+            legacy_close.assert_not_awaited()
     finally:
         await engine.dispose()
 

@@ -15,6 +15,7 @@ from services.event_bus import event_bus
 from services.live_execution_adapter import execute_live_order
 from services.live_execution_service import live_execution_service
 from services.signal_bus import set_trade_signal_status
+from services.simulation import simulation_service
 from services.strategy_sdk import StrategySDK
 from services.strategy_loader import strategy_loader
 from services.trader_order_verification import apply_trader_order_verification, derive_trader_order_verification
@@ -778,12 +779,17 @@ class ExecutionSessionEngine:
         reason: str | None,
         explicit_strategy_params: dict[str, Any] | None = None,
         execution_timeout_seconds: float | None = None,
+        shadow_account_id: str | None = None,
     ) -> SessionExecutionResult:
         _execution_started_at = _time.monotonic()
         _execution_timing_ms: dict[str, float] = {}
+        normalized_mode = str(mode or "").strip().lower()
+        normalized_shadow_account_id = str(shadow_account_id or "").strip()
+        if normalized_shadow_account_id and normalized_mode != "shadow":
+            raise ValueError("shadow_account_id can only be used for Shadow execution.")
         _shadow_execution_timeout_seconds = None
         _shadow_execution_deadline_mono = None
-        if str(mode or "").strip().lower() == "shadow":
+        if normalized_mode == "shadow":
             parsed_execution_timeout = safe_float(
                 execution_timeout_seconds,
                 None,
@@ -821,6 +827,14 @@ class ExecutionSessionEngine:
             signal.payload_json["execution_plan"] = plan
         session_timeout_seconds = safe_int(constraints.get("session_timeout_seconds"), 300)
         expires_at = utcnow() + timedelta(seconds=max(1, session_timeout_seconds))
+        execution_session_payload = {
+            "execution_plan": plan,
+            "strategy_key": strategy_key,
+            "strategy_version": int(strategy_version) if strategy_version is not None else None,
+            "reason": reason,
+        }
+        if normalized_shadow_account_id:
+            execution_session_payload["shadow_account_id"] = normalized_shadow_account_id
         session_row, built_leg_rows = build_execution_session_rows(
             trader_id=trader_id,
             signal=signal,
@@ -834,12 +848,7 @@ class ExecutionSessionEngine:
             requested_notional_usd=size_usd,
             max_unhedged_notional_usd=safe_float(constraints.get("max_unhedged_notional_usd"), 0.0),
             expires_at=expires_at,
-            payload={
-                "execution_plan": plan,
-                "strategy_key": strategy_key,
-                "strategy_version": int(strategy_version) if strategy_version is not None else None,
-                "reason": reason,
-            },
+            payload=execution_session_payload,
             trace_id=str(getattr(signal, "trace_id", "") or "") or None,
         )
         leg_rows = {str(row.leg_id): row for row in built_leg_rows}
@@ -1445,6 +1454,90 @@ class ExecutionSessionEngine:
             execution_orders.append(session_order)
             return trader_order, session_order
 
+        async def _persist_inline_shadow_ledgers() -> None:
+            if normalized_mode != "shadow" or not normalized_shadow_account_id:
+                return
+
+            for trader_order in trader_orders:
+                order_notional = safe_float(trader_order.notional_usd, 0.0) or 0.0
+                order_status = str(trader_order.status or "").strip().lower()
+                if order_notional <= 0.0 or order_status not in {"open", "executed"}:
+                    continue
+
+                order_payload = dict(trader_order.payload_json or {})
+                existing_ledger = order_payload.get("simulation_ledger")
+                if isinstance(existing_ledger, dict) and existing_ledger.get("account_id"):
+                    continue
+
+                order_direction = str(trader_order.direction or "").strip().lower()
+                if order_direction not in {"buy_yes", "buy_no"}:
+                    raise ValueError(
+                        "Inline Shadow ledger only supports canonical buy_yes/buy_no entries; "
+                        f"received {order_direction or '<empty>'}."
+                    )
+
+                live_market_payload = order_payload.get("live_market")
+                live_market_payload = (
+                    live_market_payload if isinstance(live_market_payload, dict) else {}
+                )
+                order_token_id = str(
+                    trader_order.token_id
+                    or order_payload.get("token_id")
+                    or live_market_payload.get("selected_token_id")
+                    or ""
+                ).strip()
+                if not order_token_id:
+                    raise ValueError("Inline Shadow ledger requires an authoritative token_id.")
+
+                order_entry_price = safe_float(
+                    trader_order.effective_price,
+                    safe_float(trader_order.entry_price, None),
+                )
+                if order_entry_price is None or order_entry_price <= 0.0:
+                    raise ValueError("Inline Shadow ledger requires a positive fill price.")
+
+                shadow_simulation = order_payload.get("shadow_simulation")
+                shadow_simulation = (
+                    dict(shadow_simulation) if isinstance(shadow_simulation, dict) else {}
+                )
+                ledger_payload = dict(order_payload)
+                ledger_payload["token_id"] = order_token_id
+                ledger_payload["trader_order_id"] = str(trader_order.id)
+                market_payload = signal_payload.get("market")
+                if isinstance(market_payload, dict) and not isinstance(
+                    ledger_payload.get("market"), dict
+                ):
+                    ledger_payload["market"] = dict(market_payload)
+
+                ledger_result = await simulation_service.record_orchestrator_shadow_fill(
+                    account_id=normalized_shadow_account_id,
+                    trader_id=trader_id,
+                    signal_id=str(getattr(signal, "id", "") or ""),
+                    market_id=str(trader_order.market_id or ""),
+                    market_question=trader_order.market_question,
+                    direction=order_direction,
+                    notional_usd=order_notional,
+                    entry_price=float(order_entry_price),
+                    strategy_type=str(strategy_key or "manual_buy"),
+                    token_id=order_token_id,
+                    payload=ledger_payload,
+                    execution_fee_usd=safe_float(
+                        shadow_simulation.get("estimated_fee_usd"), 0.0
+                    ),
+                    execution_slippage_usd=safe_float(
+                        shadow_simulation.get("slippage_usd"), 0.0
+                    ),
+                    session=self.db,
+                    commit=False,
+                )
+                persisted_payload = dict(trader_order.payload_json or {})
+                persisted_payload["simulation_ledger"] = dict(ledger_result)
+                trader_order.payload_json = persisted_payload
+                for created_order in created_order_records:
+                    if str(created_order.get("order_id") or "") == str(trader_order.id):
+                        created_order["payload"] = dict(persisted_payload)
+                        break
+
         async def _persist_execution_projection(
             *,
             signal_status: str,
@@ -1466,6 +1559,7 @@ class ExecutionSessionEngine:
             for trader_order in trader_orders:
                 self.db.add(trader_order)
             await self.db.flush()
+            await _persist_inline_shadow_ledgers()
             for execution_order in execution_orders:
                 self.db.add(execution_order)
             if execution_orders:
@@ -1597,12 +1691,19 @@ class ExecutionSessionEngine:
                 signal_status=signal_status,
                 effective_price=effective_price,
             )
-            if (mode == "live" and entry_submit_placeholders) or (
-                mode == "shadow" and shadow_intent_persisted
-            ):
-                await _await_cancellation_safe(persist)
-                return
-            await persist
+            try:
+                if (mode == "live" and entry_submit_placeholders) or (
+                    mode == "shadow" and shadow_intent_persisted
+                ):
+                    await _await_cancellation_safe(persist)
+                    return
+                await persist
+            except Exception:
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    pass
+                raise
 
         async def _finalize_cancelled_live_submit(
             *,

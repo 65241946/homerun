@@ -1,6 +1,7 @@
 """Polymarket-truth verification for TraderOrder realized P&L.
 
-The ONLY legitimate sources of realized P&L are:
+For legacy Live rows, the historical verifier accepts two realized-P&L
+authorities:
 
   1. A confirmed on-chain trade record from polymarket.get_wallet_trades —
      this includes both bot-initiated SELLs and any manual user sells
@@ -12,6 +13,13 @@ The ONLY legitimate sources of realized P&L are:
      pay $1 and losing shares pay $0. This is deterministic and can be
      computed from the market's resolution metadata + our recorded entry
      fill size.
+
+Managed Live settlements use the stricter ``services.live_settlement`` state
+machine: provider market finality remains projected and cannot write
+``actual_profit``.  Cash verification requires a full bot-owned CLOB sell,
+an identity/time/wallet-aligned closed-position row, or confirmed redemption
+plus attributable cash evidence.  Generic shared-wallet FIFO sells are never
+allowed to overwrite a managed order.
 
 NO other source — wallet aggregate `realizedPnl`, `currentPrice`, etc.
 — is acceptable. Inferred P&L conflates manual user trades with bot
@@ -41,22 +49,26 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Iterable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.database import TraderOrder, release_conn
+from models.database import TraderOrder, TraderOrderSettlement, release_conn
+from services.live_settlement import (
+    LiveSettlementError,
+    advance_live_settlement,
+)
 from services.polymarket import polymarket_client
 from services.trader_order_verification import (
     TRADER_ORDER_VERIFICATION_WALLET_ACTIVITY,
-    apply_trader_order_verification,
     append_trader_order_verification_event,
+    apply_trader_order_verification,
 )
 from utils.converters import safe_float
-from utils.utcnow import utcnow
-
 from utils.logger import get_logger
+from utils.utcnow import utcnow
 
 logger = get_logger("polymarket_trade_verifier")
 
@@ -167,6 +179,9 @@ def _market_winning_outcome_index(market_info: dict[str, Any]) -> int | None:
 
 def _entry_condition_id(row: TraderOrder) -> str:
     """Best-effort condition_id (Polymarket 0x... hash) from the order payload."""
+    typed = str(getattr(row, "condition_id", "") or "").strip()
+    if typed:
+        return typed
     payload = row.payload_json if isinstance(row.payload_json, dict) else {}
     for key in ("condition_id", "conditionId"):
         value = payload.get(key)
@@ -344,7 +359,10 @@ def _entry_anchor(row: TraderOrder) -> datetime | None:
 
 
 def _entry_token_id(row: TraderOrder) -> str:
-    """Best-effort token_id from the order's payload."""
+    """Use persisted typed token identity, with payload fallback for legacy rows."""
+    typed = str(getattr(row, "token_id", "") or "").strip()
+    if typed:
+        return typed
     payload = row.payload_json if isinstance(row.payload_json, dict) else {}
     candidates: list[Any] = []
     for key in (
@@ -372,6 +390,66 @@ def _entry_token_id(row: TraderOrder) -> str:
         if text:
             return text
     return ""
+
+
+async def _managed_live_order_ids(
+    session: AsyncSession,
+    rows: Iterable[TraderOrder],
+) -> set[str]:
+    order_ids = [str(row.id) for row in rows]
+    if not order_ids:
+        return set()
+    managed = (
+        await session.execute(
+            select(TraderOrderSettlement.trader_order_id).where(
+                TraderOrderSettlement.trader_order_id.in_(order_ids),
+                TraderOrderSettlement.mode == "live",
+                TraderOrderSettlement.settlement_kind == "market_resolution",
+            )
+        )
+    ).scalars().all()
+    return {str(value) for value in managed}
+
+
+def _managed_closed_position_evidence_error(
+    row: TraderOrder,
+    closed_position: dict[str, Any],
+    *,
+    wallet_address: str,
+) -> str | None:
+    """Return why a Data API closed-position row is not order-attributable."""
+
+    condition_id = str(
+        closed_position.get("conditionId")
+        or closed_position.get("condition_id")
+        or ""
+    ).strip().lower()
+    if not condition_id or condition_id != _entry_condition_id(row).lower():
+        return "closed_position_condition_mismatch"
+
+    proxy_wallet = str(
+        closed_position.get("proxyWallet")
+        or closed_position.get("proxy_wallet")
+        or ""
+    ).strip().lower()
+    if not proxy_wallet or proxy_wallet != str(wallet_address or "").strip().lower():
+        return "closed_position_wallet_mismatch"
+
+    try:
+        outcome_index = int(closed_position.get("outcomeIndex"))
+    except (TypeError, ValueError):
+        return "closed_position_outcome_missing"
+    if row.outcome_index is None or outcome_index != int(row.outcome_index):
+        return "closed_position_outcome_mismatch"
+
+    closed_at = _trade_timestamp(closed_position)
+    entry_at = _entry_anchor(row)
+    if closed_at is None or entry_at is None or closed_at < entry_at:
+        return "closed_position_predates_order"
+
+    if safe_float(closed_position.get("realizedPnl"), None) is None:
+        return "closed_position_realized_pnl_missing"
+    return None
 
 
 def _entry_fill_size(row: TraderOrder) -> float:
@@ -576,10 +654,12 @@ async def verify_orders_against_wallet_trades(
     query = query.order_by(TraderOrder.executed_at.asc(), TraderOrder.created_at.asc())
 
     rows = list((await session.execute(query)).scalars().all())
+    managed_live_ids = await _managed_live_order_ids(session, rows)
 
     examined = 0
     verified = 0
     unmatched = 0
+    skipped_managed_live = 0
     pnl_total_before = 0.0
     pnl_total_after = 0.0
 
@@ -596,6 +676,13 @@ async def verify_orders_against_wallet_trades(
 
     for row in rows:
         examined += 1
+        # Generic FIFO wallet SELL matching is not proof-grade for an order in
+        # a shared wallet.  Managed Live settlements may only be cash-verified
+        # by the bot's own CLOB lineage, attributable closed-position data, or
+        # confirmed redemption cash evidence.
+        if str(row.id) in managed_live_ids:
+            skipped_managed_live += 1
+            continue
         # Skip rows already verified by closed_positions or a prior
         # trade-matcher run — closed_positions takes priority because
         # its settlement price is deterministic and immune to
@@ -690,6 +777,7 @@ async def verify_orders_against_wallet_trades(
         "examined": examined,
         "verified": verified,
         "unmatched": unmatched,
+        "skipped_managed_live": skipped_managed_live,
         "wallet_trades_fetched": len(trades_raw or []),
         "pnl_total_before": pnl_total_before,
         "pnl_total_after": pnl_total_after,
@@ -793,12 +881,12 @@ async def verify_orders_from_bot_lineage(
     Verification rules per row:
       A) If payload['pending_live_exit'] has the bot's confirmed SELL
          fill data → realized_pnl = sell_proceeds - cost_basis_pro_rated
-      B) Else, if market resolved → realized_pnl =
-         (won?size:0) - cost_basis (deterministic)
+      B) Else, if market resolved → legacy rows may use deterministic payout;
+         managed rows remain market_final/projected until cash evidence exists
       C) Else → unverified, no write, defer
 
-    Writes verification_status='wallet_activity' (the only status the
-    DB-layer guard accepts) with verification_source='bot_lineage'.
+    Managed rows write through the Live settlement state machine. Legacy rows
+    retain verification_status='wallet_activity' compatibility behavior.
     """
     query = (
         select(TraderOrder)
@@ -825,11 +913,14 @@ async def verify_orders_from_bot_lineage(
             | (TraderOrder.verification_status != TRADER_ORDER_VERIFICATION_WALLET_ACTIVITY)
         )
     rows = list((await session.execute(query)).scalars().all())
+    managed_live_ids = await _managed_live_order_ids(session, rows)
 
     examined = 0
     verified_sell_fill = 0
     verified_resolution = 0
     unmatched = 0
+    market_final_only = 0
+    managed_evidence_blocked = 0
     pnl_total_before = 0.0
     pnl_total_after = 0.0
     now = utcnow()
@@ -916,6 +1007,63 @@ async def verify_orders_from_bot_lineage(
                 sell_proceeds = raw_sell_proceeds
             allocated_cost = bot_cost * min(1.0, sell_size / bot_size)
             verified_pnl = sell_proceeds - allocated_cost
+            if str(row.id) in managed_live_ids:
+                sell_status = str(sell.get("status") or "").strip().lower()
+                if not str(sell.get("clob_order_id") or "").strip() or sell_status not in {
+                    "filled",
+                    "partially_filled",
+                    "matched",
+                    "completed",
+                    "executed",
+                }:
+                    managed_evidence_blocked += 1
+                    unmatched += 1
+                    continue
+                # A partial exit is real cash, but it is not proof that the
+                # full managed order has been economically settled.  Keep the
+                # settlement projected until evidence covers every attributed
+                # entry share.
+                if abs(sell_size - bot_size) > 1e-6:
+                    managed_evidence_blocked += 1
+                    unmatched += 1
+                    continue
+                if not dry_run:
+                    try:
+                        await advance_live_settlement(
+                            session,
+                            trader_order_id=str(row.id),
+                            target_state="cash_verified",
+                            authority="bot_lineage_sell_fill",
+                            evidence={
+                                "condition_id": _entry_condition_id(row),
+                                "attributed_size": str(sell_size),
+                                "matched_proceeds_usdc": str(sell_proceeds),
+                                "allocated_cost_usdc": str(allocated_cost),
+                                "bot_sell_clob_order_id": sell["clob_order_id"],
+                                "bot_sell_average_price": sell["average_fill_price"],
+                                "fee_usdc": "0",
+                            },
+                            net_payout_usdc=Decimal(str(sell_proceeds)),
+                            realized_pnl_usdc=Decimal(str(verified_pnl)),
+                        )
+                    except LiveSettlementError as exc:
+                        managed_evidence_blocked += 1
+                        unmatched += 1
+                        logger.warning(
+                            "Managed Live bot-lineage cash evidence was rejected",
+                            order_id=str(row.id),
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
+                        continue
+                    _commit_batch += 1
+                    if commit and _commit_batch >= 50:
+                        await session.commit()
+                        _commit_batch = 0
+                verified_sell_fill += 1
+                pnl_total_before += prior
+                pnl_total_after += verified_pnl
+                continue
             verified_sell_fill += 1
             pnl_total_before += prior
             pnl_total_after += verified_pnl
@@ -927,7 +1075,11 @@ async def verify_orders_from_bot_lineage(
                     row,
                     verification_status=TRADER_ORDER_VERIFICATION_WALLET_ACTIVITY,
                     verification_source="bot_lineage_sell_fill",
-                    verification_reason=f"bot_sell_clob={sell['clob_order_id'][:14]}... fill={sell_size:.4f}@{(sell['average_fill_price'] or 0.0):.4f}",
+                    verification_reason=(
+                        f"bot_sell_clob={sell['clob_order_id'][:14]}... "
+                        f"fill={sell_size:.4f}@"
+                        f"{(sell['average_fill_price'] or 0.0):.4f}"
+                    ),
                     verification_tx_hash=sell["clob_order_id"] or None,
                     verified_at=now,
                     force=True,
@@ -978,6 +1130,12 @@ async def verify_orders_from_bot_lineage(
                 won = our_idx == winning_idx
                 payout = bot_size * (1.0 if won else 0.0)
                 verified_pnl = payout - bot_cost
+                if str(row.id) in managed_live_ids:
+                    # Gamma/market metadata proves market finality and the
+                    # projected payout only.  It does not prove redemption or
+                    # an attributable USDC receipt for managed Live orders.
+                    market_final_only += 1
+                    continue
                 verified_resolution += 1
                 pnl_total_before += prior
                 pnl_total_after += verified_pnl
@@ -1035,6 +1193,8 @@ async def verify_orders_from_bot_lineage(
         "examined": examined,
         "verified_sell_fill": verified_sell_fill,
         "verified_resolution": verified_resolution,
+        "market_final_only": market_final_only,
+        "managed_evidence_blocked": managed_evidence_blocked,
         "unmatched": unmatched,
         "pnl_total_before": pnl_total_before,
         "pnl_total_after": pnl_total_after,
@@ -1071,9 +1231,9 @@ async def verify_orders_against_closed_positions(
          because settled curPrice is the same for everyone who held
          the token (resolution payouts are deterministic per outcome).
 
-    Writes verification_status = wallet_activity with
-    verification_source = polymarket_closed_positions, since the
-    on-chain settlement is unambiguous truth.
+    Managed rows additionally require condition/outcome/wallet identity and a
+    close timestamp after this order's entry before the evidence can establish
+    cash_verified. Legacy rows retain the existing compatibility behavior.
     """
     wallet_lower = str(wallet_address or "").strip().lower()
     if not wallet_lower:
@@ -1158,10 +1318,12 @@ async def verify_orders_against_closed_positions(
         )
 
     rows = list((await session.execute(query)).scalars().all())
+    managed_live_ids = await _managed_live_order_ids(session, rows)
 
     examined = 0
     verified = 0
     unmatched = 0
+    managed_evidence_blocked = 0
     skipped_already_verified = 0
     pnl_total_before = 0.0
     pnl_total_after = 0.0
@@ -1215,6 +1377,55 @@ async def verify_orders_against_closed_positions(
             continue
         verified_pnl = (settled_price - bot_avg_price) * bot_size
         prior_profit = float(row.actual_profit) if row.actual_profit is not None else 0.0
+        if str(row.id) in managed_live_ids:
+            evidence_error = _managed_closed_position_evidence_error(
+                row,
+                cp,
+                wallet_address=wallet_lower,
+            )
+            if evidence_error is not None:
+                managed_evidence_blocked += 1
+                unmatched += 1
+                logger.warning(
+                    "Managed Live closed-position evidence was not attributable",
+                    order_id=str(row.id),
+                    reason=evidence_error,
+                )
+                continue
+            if not dry_run:
+                try:
+                    await advance_live_settlement(
+                        session,
+                        trader_order_id=str(row.id),
+                        target_state="cash_verified",
+                        authority="polymarket_closed_positions",
+                        evidence={
+                            "condition_id": _entry_condition_id(row),
+                            "attributed_size": str(bot_size),
+                            "settled_price": str(settled_price),
+                            "matched_proceeds_usdc": str(bot_size * settled_price),
+                            "allocated_cost_usdc": str(bot_cost),
+                            "wallet_address": wallet_lower,
+                            "wallet_position_timestamp": cp.get("timestamp"),
+                            "fee_usdc": "0",
+                        },
+                        net_payout_usdc=Decimal(str(bot_size * settled_price)),
+                        realized_pnl_usdc=Decimal(str(verified_pnl)),
+                    )
+                except LiveSettlementError as exc:
+                    managed_evidence_blocked += 1
+                    unmatched += 1
+                    logger.warning(
+                        "Managed Live closed-position cash evidence was rejected",
+                        order_id=str(row.id),
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    continue
+            verified += 1
+            pnl_total_before += prior_profit
+            pnl_total_after += verified_pnl
+            continue
         verified += 1
         pnl_total_before += prior_profit
         pnl_total_after += verified_pnl
@@ -1272,6 +1483,7 @@ async def verify_orders_against_closed_positions(
         "examined": examined,
         "verified": verified,
         "unmatched": unmatched,
+        "managed_evidence_blocked": managed_evidence_blocked,
         "skipped_already_verified": skipped_already_verified,
         "closed_positions_fetched": len(positions_raw or []),
         "pnl_total_before": pnl_total_before,
@@ -1303,10 +1515,10 @@ async def verify_orders_against_market_resolutions(
         (i.e. weren't matched by the trade-based verifier above)
       * the underlying market has resolved with a known winning outcome
 
-    For each match: realized_pnl = (winning ? size * 1.0 : 0.0) - cost_basis
-    Writes verification_status = wallet_activity (this IS truth — the
-    payout is deterministic from chain state) with verification_source
-    = polymarket_market_resolution.
+    For each legacy match: realized_pnl =
+    (winning ? size * 1.0 : 0.0) - cost_basis. Managed Live rows explicitly
+    stop at market_final/projected because a deterministic entitlement is not
+    evidence that collateral has reached the wallet.
     """
     from services.polymarket import polymarket_client
 
@@ -1329,11 +1541,13 @@ async def verify_orders_against_market_resolutions(
         query = query.where(TraderOrder.updated_at >= order_window_start)
 
     rows = list((await session.execute(query)).scalars().all())
+    managed_live_ids = await _managed_live_order_ids(session, rows)
 
     examined = 0
     verified = 0
     skipped_unresolved = 0
     skipped_already_verified = 0
+    managed_market_final_only = 0
     pnl_total_before = 0.0
     pnl_total_after = 0.0
     now = utcnow()
@@ -1396,6 +1610,12 @@ async def verify_orders_against_market_resolutions(
         winning_idx = _market_winning_outcome_index(market_info)
         if winning_idx is None:
             skipped_unresolved += 1
+            continue
+        if str(row.id) in managed_live_ids:
+            # This provider payload can corroborate the already-persisted
+            # market_final projection, but it cannot prove an attributable
+            # wallet receipt.  Do not mutate actual_profit or verification.
+            managed_market_final_only += 1
             continue
 
         # Determine which outcome WE actually held. Prefer the BUY
@@ -1500,6 +1720,7 @@ async def verify_orders_against_market_resolutions(
         "verified": verified,
         "skipped_unresolved": skipped_unresolved,
         "skipped_already_verified": skipped_already_verified,
+        "managed_market_final_only": managed_market_final_only,
         "pnl_total_before": pnl_total_before,
         "pnl_total_after": pnl_total_after,
         "pnl_delta": pnl_total_after - pnl_total_before,

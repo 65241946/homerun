@@ -1,13 +1,23 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Optional
-from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import OperationalError
 import asyncio
+from typing import Optional
 
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from config import settings
 from models.database import get_db_session
 from services.polymarket import polymarket_client
+from services.settlement_repair import (
+    SettlementRepairConflict,
+    SettlementRepairNotFound,
+    SettlementRepairRejected,
+    apply_settlement_repair,
+    preview_settlement_repair,
+)
 from services.simulation import simulation_service
+from services.simulation_ledger import get_ledger_integrity
 
 simulation_router = APIRouter()
 
@@ -24,6 +34,16 @@ class ExecuteTradeRequest(BaseModel):
     position_size: Optional[float] = Field(default=None, ge=1.0)
     take_profit_price: Optional[float] = Field(default=None, ge=0.01, le=1.0)
     stop_loss_price: Optional[float] = Field(default=None, ge=0.01, le=1.0)
+
+
+class SettlementRepairPreviewRequest(BaseModel):
+    order_ids: list[str] | None = Field(default=None, max_length=200)
+
+
+class SettlementRepairApplyRequest(BaseModel):
+    order_ids: list[str] = Field(..., min_length=1, max_length=200)
+    preview_digest: str = Field(..., min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
+    confirm: bool
 
 
 # ==================== ACCOUNTS ====================
@@ -61,14 +81,22 @@ async def list_simulation_accounts():
     accounts_with_positions = await simulation_service.get_all_accounts_with_positions()
     result = []
     for acc, positions in accounts_with_positions:
-        roi = (acc.current_capital - acc.initial_capital) / acc.initial_capital * 100 if acc.initial_capital > 0 else 0
         win_rate = acc.winning_trades / acc.total_trades * 100 if acc.total_trades > 0 else 0
         # Calculate unrealized P&L from open positions
         unrealized_pnl = sum(p.unrealized_pnl for p in positions)
         # Book value = sum of entry costs of open positions
         book_value = sum(p.entry_cost for p in positions)
         # Market value = sum of current value of open positions
-        market_value = sum(p.quantity * (p.current_price or p.entry_price) for p in positions)
+        market_value = sum(
+            p.quantity * (p.current_price if p.current_price is not None else p.entry_price)
+            for p in positions
+        )
+        equity_value = float(acc.current_capital or 0.0) + float(market_value or 0.0)
+        roi = (
+            ((equity_value - float(acc.initial_capital)) / float(acc.initial_capital)) * 100.0
+            if acc.initial_capital > 0
+            else 0.0
+        )
         result.append(
             {
                 "id": acc.id,
@@ -100,10 +128,118 @@ async def get_simulation_account(account_id: str):
     return stats
 
 
+@simulation_router.post("/accounts/{account_id}/settlement-repair/preview")
+async def preview_account_settlement_repair(
+    account_id: str,
+    request: SettlementRepairPreviewRequest,
+    session: AsyncSession = Depends(get_db_session),  # noqa: B008 - FastAPI dependency injection
+):
+    """Build a persisted-facts-only settlement certificate without writes."""
+
+    try:
+        return await preview_settlement_repair(
+            session,
+            account_id=account_id,
+            order_ids=request.order_ids,
+        )
+    except SettlementRepairNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "settlement_repair_account_not_found", "message": str(exc)},
+        ) from exc
+    except SettlementRepairRejected as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "settlement_repair_request_invalid", "message": str(exc)},
+        ) from exc
+
+
+@simulation_router.post("/accounts/{account_id}/settlement-repair/apply")
+async def apply_account_settlement_repair(
+    account_id: str,
+    request: SettlementRepairApplyRequest,
+    session: AsyncSession = Depends(get_db_session),  # noqa: B008 - FastAPI dependency injection
+):
+    """Apply one exact approved digest atomically; disabled by default."""
+
+    if not settings.HOMERUN_SETTLEMENT_REPAIR_APPLY_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "settlement_repair_apply_disabled",
+                "message": "Historical settlement repair apply is disabled by runtime configuration.",
+            },
+        )
+    try:
+        async with session.begin():
+            return await apply_settlement_repair(
+                session,
+                account_id=account_id,
+                order_ids=request.order_ids,
+                preview_digest=request.preview_digest,
+                confirm=request.confirm,
+            )
+    except SettlementRepairNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "settlement_repair_account_not_found", "message": str(exc)},
+        ) from exc
+    except SettlementRepairRejected as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "settlement_repair_request_invalid", "message": str(exc)},
+        ) from exc
+    except SettlementRepairConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "settlement_repair_preview_stale", "message": str(exc)},
+        ) from exc
+
+
+@simulation_router.get("/accounts/{account_id}/ledger-integrity")
+async def get_account_ledger_integrity(
+    account_id: str,
+    session: AsyncSession = Depends(get_db_session),  # noqa: B008 - FastAPI dependency injection
+):
+    """Expose rebuildable cash-journal coverage and six-decimal deltas."""
+
+    try:
+        snapshot = await get_ledger_integrity(session, account_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "simulation_account_not_found", "message": str(exc)},
+        ) from exc
+    return {
+        "account_id": snapshot.account_id,
+        "ledger_version": snapshot.ledger_version,
+        "status": snapshot.status,
+        "coverage": snapshot.coverage,
+        "initial_capital_usdc": f"{snapshot.initial_capital_usdc:.6f}",
+        "journal_delta_usdc": f"{snapshot.journal_delta_usdc:.6f}",
+        "journal_balance_usdc": f"{snapshot.rebuilt_balance_usdc:.6f}",
+        "rebuilt_balance_usdc": f"{snapshot.rebuilt_balance_usdc:.6f}",
+        "projected_balance_usdc": f"{snapshot.projected_balance_usdc:.6f}",
+        "difference_usdc": f"{snapshot.difference_usdc:.6f}",
+        "entry_count": snapshot.entry_count,
+        "max_sequence": snapshot.max_sequence,
+        "sequence_contiguous": snapshot.sequence_contiguous,
+    }
+
+
 @simulation_router.delete("/accounts/{account_id}")
 async def delete_simulation_account(account_id: str):
     """Delete a simulation account and all its trades/positions"""
-    deleted = await simulation_service.delete_account(account_id)
+    try:
+        deleted = await simulation_service.delete_account(account_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "append_only_ledger_account",
+                "message": str(exc),
+            },
+        ) from exc
     if not deleted:
         raise HTTPException(status_code=404, detail="Account not found")
     return {"message": "Account deleted successfully", "account_id": account_id}

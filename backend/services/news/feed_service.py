@@ -290,9 +290,10 @@ class NewsFeedService:
 
         out: list[dict[str, Any]] = []
         for record in run_result.get("records") or []:
-            observed_at = _parse_datetime(record.get("observed_at"))
-            if observed_at is None or observed_at < run_started_at:
+            ingested_at = _parse_datetime(record.get("ingested_at"))
+            if ingested_at is None or ingested_at < run_started_at:
                 continue
+            observed_at = _parse_datetime(record.get("observed_at"))
             payload = dict(record.get("payload_json") or {}) if isinstance(record.get("payload_json"), dict) else {}
             transformed = (
                 dict(record.get("transformed_json") or {})
@@ -310,7 +311,7 @@ class NewsFeedService:
                     "category": record.get("category") or merged.get("category"),
                     "source": record.get("source") or merged.get("source"),
                     "url": record.get("url") or merged.get("url"),
-                    "observed_at": observed_at or _parse_datetime(record.get("ingested_at")),
+                    "observed_at": observed_at or ingested_at,
                     "payload": payload,
                     "feed_source": merged.get("feed_source"),
                     "tags": list(record.get("tags_json") or []),

@@ -42,6 +42,8 @@ x-backend-env: &backend-env
   POLYGON_WS_URL: ${POLYGON_WS_URL:-wss://polygon-bor-rpc.publicnode.com}
   TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
   TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+  HOMERUN_SETTLEMENT_RUNTIME_MODE: ${HOMERUN_SETTLEMENT_RUNTIME_MODE:-observe}
+  HOMERUN_SETTLEMENT_REPAIR_APPLY_ENABLED: ${HOMERUN_SETTLEMENT_REPAIR_APPLY_ENABLED:-false}
 
 x-backend-volumes: &backend-volumes
   - ./data/cache:/app/data/cache
@@ -241,7 +243,8 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------
-  # Worker planes — three separate services on purpose.  See gui.py:233.
+  # Worker planes — one service per dedicated plane.  Keep this list aligned
+  # with gui.py::_WORKER_PLANES and backend/workers/host.py::_PLANE_CONFIGS.
   # Each plane runs ``python -m workers.host <plane>``.
   # ---------------------------------------------------------------------
   worker-trading:
@@ -280,6 +283,76 @@ services:
       <<: *backend-env
       HOMERUN_PROCESS_ROLE: worker
       HOMERUN_WORKER_PLANE: discovery
+    volumes: *backend-volumes
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-recording:
+    <<: *backend-image
+    container_name: homerun-worker-recording
+    command: ["python", "-m", "workers.host", "recording"]
+    environment:
+      <<: *backend-env
+      HOMERUN_PROCESS_ROLE: worker
+      HOMERUN_WORKER_PLANE: recording
+    volumes: *backend-volumes
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-detection:
+    <<: *backend-image
+    container_name: homerun-worker-detection
+    command: ["python", "-m", "workers.host", "detection"]
+    environment:
+      <<: *backend-env
+      HOMERUN_PROCESS_ROLE: worker
+      HOMERUN_WORKER_PLANE: detection
+    volumes: *backend-volumes
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-reconciliation:
+    <<: *backend-image
+    container_name: homerun-worker-reconciliation
+    command: ["python", "-m", "workers.host", "reconciliation"]
+    environment:
+      <<: *backend-env
+      HOMERUN_PROCESS_ROLE: worker
+      HOMERUN_WORKER_PLANE: reconciliation
+    volumes: *backend-volumes
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-services:
+    <<: *backend-image
+    container_name: homerun-worker-services
+    command: ["python", "-m", "workers.host", "services"]
+    environment:
+      <<: *backend-env
+      HOMERUN_PROCESS_ROLE: worker
+      HOMERUN_WORKER_PLANE: services
+    volumes: *backend-volumes
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-jobs:
+    <<: *backend-image
+    container_name: homerun-worker-jobs
+    command: ["python", "-m", "workers.host", "jobs"]
+    environment:
+      <<: *backend-env
+      HOMERUN_PROCESS_ROLE: worker
+      HOMERUN_WORKER_PLANE: jobs
     volumes: *backend-volumes
     depends_on:
       backend:

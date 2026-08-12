@@ -26,6 +26,24 @@ def _make_runtime() -> market_runtime.MarketRuntime:
 
 
 @pytest.mark.asyncio
+async def test_crypto_runtime_settings_are_reloaded_with_throttle(monkeypatch):
+    runtime = _make_runtime()
+    runtime._started = True
+    apply_mock = AsyncMock()
+    monkeypatch.setattr(market_runtime, "apply_search_filters", apply_mock)
+
+    first = await runtime._refresh_crypto_runtime_settings_if_due()
+    throttled = await runtime._refresh_crypto_runtime_settings_if_due()
+    runtime._last_crypto_settings_refresh_mono -= 100.0
+    second = await runtime._refresh_crypto_runtime_settings_if_due()
+
+    assert first is True
+    assert throttled is False
+    assert second is True
+    assert apply_mock.await_count == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "control",
     [

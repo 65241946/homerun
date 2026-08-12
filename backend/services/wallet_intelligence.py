@@ -49,7 +49,7 @@ WALLET_TAG_UPDATE_BATCH_SIZE = 200
 _CONFLUENCE_QUALIFYING_WALLET_LIMIT = 256
 _CONFLUENCE_EVENT_ROW_LIMIT = 5000
 _CONFLUENCE_CANDIDATE_LIMIT = 180
-_CONFLUENCE_MARKET_CONTEXT_TIMEOUT_SECONDS = 12.0
+_CONFLUENCE_MARKET_CONTEXT_TIMEOUT_SECONDS = 60.0
 _MIN_UTC = datetime.min.replace(tzinfo=timezone.utc)
 
 
@@ -126,6 +126,9 @@ class ConfluenceDetector:
                                 war.wallet_address AS wallet_address,
                                 war.market_id AS market_id,
                                 war.side AS side,
+                                war.token_id AS token_id,
+                                war.outcome AS outcome,
+                                war.outcome_index AS outcome_index,
                                 war.price AS price,
                                 war.size AS size,
                                 war.notional AS notional,
@@ -165,20 +168,43 @@ class ConfluenceDetector:
         # the asyncio loop.  Run in a thread so concurrent IO tasks
         # (Polymarket WS heartbeats, asyncpg socket reads, fast trader
         # cycles) keep making progress.
-        def _build_candidates() -> list[dict]:
+        def _build_candidates() -> tuple[list[dict], int, int]:
             grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+            confirmed_direction_rows = 0
+            unconfirmed_direction_rows = 0
             for event in events:
                 side_inner = self._normalize_side(event.get("side"))
-                if side_inner not in ("BUY", "SELL"):
+                effective_outcome = self._resolve_effective_outcome(
+                    side_inner,
+                    event.get("outcome"),
+                    event.get("outcome_index"),
+                )
+                if effective_outcome not in ("YES", "NO"):
+                    if side_inner in ("BUY", "SELL"):
+                        unconfirmed_direction_rows += 1
                     continue
                 market_id_inner = str(event.get("market_id") or "")
                 if not market_id_inner:
                     continue
-                key_inner = (market_id_inner, side_inner)
-                grouped.setdefault(key_inner, []).append(event)
+                canonical_event = dict(event)
+                canonical_event["effective_outcome"] = effective_outcome
+                canonical_price = self._canonical_entry_price(
+                    side_inner,
+                    event.get("price"),
+                )
+                canonical_event["price"] = canonical_price
+                try:
+                    canonical_size = abs(float(event.get("size") or 0.0))
+                except (TypeError, ValueError):
+                    canonical_size = 0.0
+                if canonical_price is not None and canonical_size > 0.0:
+                    canonical_event["notional"] = canonical_size * canonical_price
+                key_inner = (market_id_inner, effective_outcome)
+                grouped.setdefault(key_inner, []).append(canonical_event)
+                confirmed_direction_rows += 1
 
             built: list[dict] = []
-            for (market_id, side), side_events in grouped.items():
+            for (market_id, outcome), side_events in grouped.items():
                 unique_wallets = {
                     str(event.get("wallet_address") or "").strip().lower()
                     for event in side_events
@@ -239,7 +265,10 @@ class ConfluenceDetector:
 
                 built.append({
                     "market_id": market_id,
-                    "side": side,
+                    "outcome": outcome,
+                    # Keep the legacy strategy-side contract: BUY means the
+                    # canonical first outcome (YES), SELL the second (NO).
+                    "side": "BUY" if outcome == "YES" else "SELL",
                     "unique_wallets": unique_wallets,
                     "cluster_adjusted": cluster_adjusted,
                     "window_minutes": window_minutes,
@@ -261,13 +290,20 @@ class ConfluenceDetector:
                     -float(candidate["net_notional"]),
                     -float(candidate["weighted_wallet_score"]),
                     str(candidate["market_id"]),
+                    str(candidate["outcome"]),
                 )
             )
             if len(built) > _CONFLUENCE_CANDIDATE_LIMIT:
                 built = built[:_CONFLUENCE_CANDIDATE_LIMIT]
-            return built
+            return built, confirmed_direction_rows, unconfirmed_direction_rows
 
-        candidates = await asyncio.to_thread(_build_candidates)
+        candidates, confirmed_direction_rows, unconfirmed_direction_rows = await asyncio.to_thread(_build_candidates)
+        logger.info(
+            "Confluence direction identity evaluated",
+            event_rows=len(events),
+            confirmed_direction_rows=confirmed_direction_rows,
+            unconfirmed_direction_rows=unconfirmed_direction_rows,
+        )
 
         if not candidates:
             await self.expire_old_signals()
@@ -275,12 +311,12 @@ class ConfluenceDetector:
 
         # -- Phase 3: batch-fetch conflicting notionals (single session) --
         conflicting_map = await self._batch_conflicting_notional(
-            candidates=[(c["market_id"], c["side"]) for c in candidates],
+            candidates=[(c["market_id"], c["outcome"]) for c in candidates],
             addresses=addresses,
             cutoff=cutoff_60m,
         )
 
-        # -- Phase 4: batch-fetch market context via HTTP (no DB session) --
+        # -- Phase 4: batch-fetch fresh market context via HTTP (no DB session) --
         unique_market_ids = list({c["market_id"] for c in candidates})
         try:
             market_context_map = await asyncio.wait_for(
@@ -290,7 +326,7 @@ class ConfluenceDetector:
         except asyncio.TimeoutError:
             market_context_map = {}
             logger.warning(
-                "Confluence market context fetch timed out after %.0fs; continuing without venue metadata",
+                "Confluence market context fetch timed out after %.0fs; unverified signals remain inactive",
                 _CONFLUENCE_MARKET_CONTEXT_TIMEOUT_SECONDS,
             )
 
@@ -299,10 +335,14 @@ class ConfluenceDetector:
         broadcast_payloads: list[dict] = []
         for c in candidates:
             market_id = c["market_id"]
-            side = c["side"]
-            conflicting_notional = conflicting_map.get((market_id, side), 0.0)
+            outcome = c["outcome"]
+            side = "BUY" if outcome == "YES" else "SELL"
+            conflicting_notional = conflicting_map.get((market_id, outcome), 0.0)
             market_context = market_context_map.get(market_id, {})
-            outcome = "YES" if side == "BUY" else "NO"
+            is_tradeable = bool(
+                market_context.get("tradability_confirmed")
+                and market_context.get("is_tradeable")
+            )
             signal_type = "multi_wallet_buy" if side == "BUY" else "multi_wallet_sell"
             tier = self._tier_for_count(c["cluster_adjusted"])
             conviction = self._conviction_score(
@@ -339,8 +379,9 @@ class ConfluenceDetector:
                 "market_slug": market_context.get("market_slug"),
                 "market_liquidity": market_context.get("liquidity"),
                 "market_volume_24h": market_context.get("volume_24h"),
+                "is_tradeable": is_tradeable,
             })
-            if tier in ("HIGH", "EXTREME"):
+            if is_tradeable and tier in ("HIGH", "EXTREME"):
                 broadcast_payloads.append({
                     "market_id": market_id,
                     "market_question": market_context.get("question") or "",
@@ -475,6 +516,56 @@ class ConfluenceDetector:
             return "SELL"
         return side
 
+    @staticmethod
+    def _resolve_effective_outcome(
+        side: object,
+        outcome: object,
+        outcome_index: object,
+    ) -> Optional[str]:
+        """Map an executed token trade to the binary outcome it supports.
+
+        The action side and token outcome are independent dimensions.  Buying
+        token 0 supports canonical YES; selling that same token supports NO.
+        Rows without confirmed token outcome identity are deliberately ignored
+        instead of treating every BUY as YES and every SELL as NO.
+        """
+        normalized_side = str(side or "").strip().upper()
+        if normalized_side not in {"BUY", "SELL"}:
+            return None
+
+        token_outcome: Optional[str] = None
+        try:
+            parsed_index = int(outcome_index) if outcome_index is not None else None
+        except (TypeError, ValueError):
+            parsed_index = None
+        if parsed_index == 0:
+            token_outcome = "YES"
+        elif parsed_index == 1:
+            token_outcome = "NO"
+        else:
+            normalized_outcome = str(outcome or "").strip().upper()
+            if normalized_outcome in {"YES", "NO"}:
+                token_outcome = normalized_outcome
+
+        if token_outcome is None:
+            return None
+        if normalized_side == "BUY":
+            return token_outcome
+        return "NO" if token_outcome == "YES" else "YES"
+
+    @staticmethod
+    def _canonical_entry_price(side: object, price: object) -> Optional[float]:
+        """Return the equivalent entry price of the supported binary outcome."""
+        try:
+            parsed = float(price)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed) or parsed < 0.0 or parsed > 1.0:
+            return None
+        if str(side or "").strip().upper() == "SELL":
+            return max(0.0, min(1.0, 1.0 - parsed))
+        return parsed
+
     def _tier_for_count(self, adjusted_wallet_count: int) -> str:
         if adjusted_wallet_count >= self.MIN_WALLETS_EXTREME:
             return "EXTREME"
@@ -561,15 +652,19 @@ class ConfluenceDetector:
         addresses: list[str],
         cutoff: datetime,
     ) -> dict[tuple[str, str], float]:
-        """Fetch conflicting notionals for all candidate market/side pairs in one grouped query."""
+        """Fetch opposite-outcome notionals for all candidates in one grouped query."""
         if not candidates or not addresses:
             return {}
-        candidate_pairs = {(str(market_id or ""), str(side or "").upper()) for market_id, side in candidates if market_id}
+        candidate_pairs = {
+            (str(market_id or ""), str(outcome or "").upper())
+            for market_id, outcome in candidates
+            if market_id and str(outcome or "").upper() in {"YES", "NO"}
+        }
         market_ids = sorted({market_id for market_id, _ in candidate_pairs})
         if not market_ids:
             return {}
 
-        totals_by_market_side: dict[tuple[str, str], float] = {}
+        totals_by_market_outcome: dict[tuple[str, str], float] = {}
         async with AsyncSessionLocal() as session:
             rows = (
                 await session.execute(
@@ -577,12 +672,18 @@ class ConfluenceDetector:
                         """
                         SELECT
                             war.market_id AS market_id,
-                            CASE
-                                WHEN war.side IN ('BUY', 'YES') THEN 'BUY'
-                                WHEN war.side IN ('SELL', 'NO') THEN 'SELL'
-                                ELSE NULL
-                            END AS normalized_side,
-                            SUM(ABS(COALESCE(war.notional, 0.0))) AS total_notional
+                            war.side AS side,
+                            war.outcome AS outcome,
+                            war.outcome_index AS outcome_index,
+                            SUM(
+                                CASE
+                                    WHEN war.side = 'SELL'
+                                         AND war.price BETWEEN 0.0 AND 1.0
+                                         AND war.size IS NOT NULL
+                                    THEN ABS(war.size) * (1.0 - war.price)
+                                    ELSE ABS(COALESCE(war.notional, 0.0))
+                                END
+                            ) AS total_notional
                         FROM wallet_activity_rollups AS war
                         JOIN (
                             SELECT DISTINCT wallet_address
@@ -595,8 +696,8 @@ class ConfluenceDetector:
                         ) AS cm
                             ON cm.market_id = war.market_id
                         WHERE war.traded_at >= :cutoff
-                          AND war.side IN ('BUY', 'SELL', 'YES', 'NO')
-                        GROUP BY war.market_id, normalized_side
+                          AND war.side IN ('BUY', 'SELL')
+                        GROUP BY war.market_id, war.side, war.outcome, war.outcome_index
                         """
                     ),
                     {
@@ -608,16 +709,23 @@ class ConfluenceDetector:
             ).mappings()
             for row in rows:
                 market_id = row["market_id"]
-                side_key = row["normalized_side"]
-                if market_id is None or side_key is None:
+                effective_outcome = self._resolve_effective_outcome(
+                    row["side"],
+                    row["outcome"],
+                    row["outcome_index"],
+                )
+                if market_id is None or effective_outcome is None:
                     continue
-                map_key = (str(market_id), str(side_key).upper())
-                totals_by_market_side[map_key] = float(row["total_notional"] or 0.0)
+                map_key = (str(market_id), effective_outcome)
+                totals_by_market_outcome[map_key] = (
+                    totals_by_market_outcome.get(map_key, 0.0)
+                    + float(row["total_notional"] or 0.0)
+                )
 
         result_map: dict[tuple[str, str], float] = {}
-        for market_id, side in candidate_pairs:
-            opposite = "SELL" if side == "BUY" else "BUY"
-            result_map[(market_id, side)] = totals_by_market_side.get((market_id, opposite), 0.0)
+        for market_id, outcome in candidate_pairs:
+            opposite = "NO" if outcome == "YES" else "YES"
+            result_map[(market_id, outcome)] = totals_by_market_outcome.get((market_id, opposite), 0.0)
         return result_map
 
     async def _batch_resolve_market_context(self, market_ids: list[str]) -> dict[str, dict]:
@@ -668,6 +776,7 @@ class ConfluenceDetector:
                         existing_by_key[key] = row
                 for p in batch:
                     existing = existing_by_key.get((str(p["market_id"]), str(p["outcome"])))
+                    is_active = bool(p.get("is_tradeable", False))
 
                     if existing:
                         existing.signal_type = p["signal_type"]
@@ -689,8 +798,8 @@ class ConfluenceDetector:
                         existing.market_volume_24h = p["market_volume_24h"]
                         existing.last_seen_at = now
                         existing.detected_at = now
-                        existing.is_active = True
-                        existing.expired_at = None
+                        existing.is_active = is_active
+                        existing.expired_at = None if is_active else now
                         if p["market_slug"]:
                             existing.market_slug = p["market_slug"]
                         if p["market_question"]:
@@ -721,11 +830,12 @@ class ConfluenceDetector:
                             conflicting_notional=p["conflicting_notional"],
                             market_liquidity=p["market_liquidity"],
                             market_volume_24h=p["market_volume_24h"],
-                            is_active=True,
+                            is_active=is_active,
                             first_seen_at=now,
                             last_seen_at=now,
                             detected_at=now,
                             cooldown_until=now + timedelta(minutes=5),
+                            expired_at=None if is_active else now,
                         )
                         session.add(existing)
                         existing_by_key[(str(p["market_id"]), str(p["outcome"]))] = existing
@@ -736,12 +846,20 @@ class ConfluenceDetector:
         question = ""
         liquidity = None
         volume_24h = None
+        tradability_confirmed = False
+        is_tradeable = False
 
         try:
             if market_id.startswith("0x"):
-                info = await polymarket_client.get_market_by_condition_id(market_id)
+                info = await polymarket_client.get_market_by_condition_id(
+                    market_id,
+                    force_refresh=True,
+                )
             else:
-                info = await polymarket_client.get_market_by_token_id(market_id)
+                info = await polymarket_client.get_market_by_token_id(
+                    market_id,
+                    force_refresh=True,
+                )
             if info:
                 market_slug = info.get("event_slug") or info.get("slug")
                 question = info.get("question", "")
@@ -749,6 +867,9 @@ class ConfluenceDetector:
                     liquidity = float(info.get("liquidity") or 0)
                 if info.get("volume") is not None:
                     volume_24h = float(info.get("volume") or 0)
+                tradability_confirmed = polymarket_client._has_tradability_metadata(info)
+                if tradability_confirmed:
+                    is_tradeable = polymarket_client.is_market_tradable(info)
         except Exception:
             pass
 
@@ -757,6 +878,8 @@ class ConfluenceDetector:
             "question": question,
             "liquidity": liquidity,
             "volume_24h": volume_24h,
+            "tradability_confirmed": bool(tradability_confirmed),
+            "is_tradeable": bool(is_tradeable),
         }
 
     async def get_active_signals(
@@ -817,6 +940,31 @@ class ConfluenceDetector:
                 }
                 for s in signals
             ]
+
+    async def deactivate_market_signals(self, market_ids: list[str]) -> int:
+        """Persistently deactivate active confluence signals for closed markets."""
+        normalized = sorted(
+            {
+                str(market_id or "").strip().lower()
+                for market_id in market_ids
+                if str(market_id or "").strip()
+            }
+        )
+        if not normalized:
+            return 0
+
+        now = utcnow()
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                update(MarketConfluenceSignal)
+                .where(
+                    MarketConfluenceSignal.is_active == True,  # noqa: E712
+                    func.lower(MarketConfluenceSignal.market_id).in_(normalized),
+                )
+                .values(is_active=False, expired_at=now)
+            )
+            await session.commit()
+        return max(0, int(result.rowcount or 0))
 
     async def expire_old_signals(self):
         """Mark signals inactive when not reinforced within decay window."""

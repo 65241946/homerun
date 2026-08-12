@@ -310,6 +310,7 @@ async def _run_loop() -> None:
                             "degraded_mode": False,
                         },
                         stats={"pending_intents": pending},
+                        merge_stats=True,
                     )
                     await write_worker_snapshot(
                         session,
@@ -678,18 +679,22 @@ async def _publish_news_update_to_bus(
     from services.recorded_event_bus import RecordedEvent
     from services.recorded_event_bus import bus as _bus
     import services.recorded_event_bus.storage  # noqa: F401  attach storage
+    from fastapi.encoders import jsonable_encoder
 
     observed_at_us = int(event.timestamp.timestamp() * 1_000_000)
-    envelope = RecordedEvent(
-        topic=_NEWS_UPDATE_TOPIC,
-        entity_id="workflow_cycle",
-        observed_at_us=observed_at_us,
-        payload={
+    payload = jsonable_encoder(
+        {
             "intents": intent_dicts,
             "findings": finding_dicts,
             "n_intents": len(intent_dicts),
             "n_findings": len(finding_dicts),
-        },
+        }
+    )
+    envelope = RecordedEvent(
+        topic=_NEWS_UPDATE_TOPIC,
+        entity_id="workflow_cycle",
+        observed_at_us=observed_at_us,
+        payload=payload,
         source="news_worker",
     )
     await _bus.publish(envelope)
