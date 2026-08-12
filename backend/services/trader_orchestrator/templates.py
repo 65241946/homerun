@@ -283,7 +283,7 @@ TRADER_TEMPLATES: list[dict[str, Any]] = [
                     "kelly_fractional_scale": 0.4,
                     "take_profit_pct": 70.0,
                     "stop_loss_pct": 25.0,
-                    "trailing_stop_pct": 18.0,
+                    "trailing_stop_pct": 12.0,
                     "trailing_stop_activation_profit_pct": 25.0,
                     "max_hold_minutes": 240,
                     "momentum_stall_minutes": 45,
