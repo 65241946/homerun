@@ -17,13 +17,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
+from config import settings
 from services.news.event_extractor import ExtractedEvent
 from services.news.reranker import RerankedCandidate
+from services.news.semantic_matcher import NewsMarketMatch
 from utils.utcnow import utcnow
 
 logger = logging.getLogger(__name__)
@@ -75,6 +78,28 @@ class WorkflowFinding:
     signal_key: Optional[str] = None
     cache_key: Optional[str] = None
     created_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass
+class NewsEdge:
+    """A semantic-match edge estimated by the canonical news estimator."""
+
+    match: NewsMarketMatch
+    model_probability: float
+    market_price: float
+    edge_percent: float
+    direction: str
+    confidence: float
+    reasoning: str
+    estimated_at: datetime
+
+    @property
+    def market_id(self) -> str:
+        return self.match.market.market_id
+
+    @property
+    def article_title(self) -> str:
+        return self.match.article.title
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +177,168 @@ class EdgeEstimator:
     """Estimates probability edges for reranked article-market pairs."""
 
     _CONCURRENCY = 3
+
+    def __init__(self, cache_ttl_seconds: Optional[float] = None) -> None:
+        scan_interval = max(1.0, float(getattr(settings, "NEWS_SCAN_INTERVAL_SECONDS", 60) or 60))
+        self._cache_ttl_seconds = max(
+            scan_interval * 3.0,
+            float(cache_ttl_seconds) if cache_ttl_seconds is not None else 0.0,
+        )
+        self._llm_cache: dict[tuple[str, str, float], tuple[float, dict[str, Any]]] = {}
+        self._cached_edges: list[NewsEdge] = []
+
+    @staticmethod
+    def _cache_key(article_id: str, market_id: str, market_price: float) -> tuple[str, str, float]:
+        return (str(article_id), str(market_id), round(float(market_price), 2))
+
+    async def _cached_llm_result(
+        self,
+        *,
+        article_id: str,
+        market_id: str,
+        market_price: float,
+        article_title: str,
+        article_summary: str,
+        market_question: str,
+        event_title: str,
+        category: str,
+        yes_price: float,
+        no_price: float,
+        model: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        key = self._cache_key(article_id, market_id, market_price)
+        now = time.monotonic()
+        cached = self._llm_cache.get(key)
+        if cached is not None:
+            expires_at, result = cached
+            if expires_at > now:
+                return dict(result)
+            self._llm_cache.pop(key, None)
+
+        result = await self._call_llm(
+            article_title=article_title,
+            article_summary=article_summary,
+            market_question=market_question,
+            event_title=event_title,
+            category=category,
+            yes_price=yes_price,
+            no_price=no_price,
+            model=model,
+        )
+        if result is not None:
+            self._llm_cache[key] = (now + self._cache_ttl_seconds, dict(result))
+        return result
+
+    def get_cached_edges(self) -> list[NewsEdge]:
+        """Return the latest semantic-match estimates without new LLM calls."""
+        return list(self._cached_edges)
+
+    def clear_cached_edges(self) -> int:
+        """Clear displayed semantic-match estimates, preserving the LLM TTL cache."""
+        count = len(self._cached_edges)
+        self._cached_edges = []
+        return count
+
+    async def analyze_single_match(
+        self,
+        match: NewsMarketMatch,
+        model: Optional[str] = None,
+    ) -> Optional[NewsEdge]:
+        edge = await self._estimate_semantic_match(match, model=model)
+        if edge is None:
+            return None
+        key = (edge.match.article.article_id, edge.match.market.market_id)
+        self._cached_edges = [
+            existing
+            for existing in self._cached_edges
+            if (existing.match.article.article_id, existing.match.market.market_id) != key
+        ]
+        self._cached_edges.append(edge)
+        self._cached_edges.sort(key=lambda item: item.edge_percent, reverse=True)
+        return edge
+
+    async def detect_edges(
+        self,
+        matches: list[NewsMarketMatch],
+        model: Optional[str] = None,
+    ) -> list[NewsEdge]:
+        """Estimate semantic matches through the same calibrated LLM path."""
+        if not matches:
+            self._cached_edges = []
+            return []
+
+        deduplicated: dict[tuple[str, str], NewsMarketMatch] = {}
+        for match in matches:
+            key = (match.article.article_id, match.market.market_id)
+            existing = deduplicated.get(key)
+            if existing is None or match.similarity > existing.similarity:
+                deduplicated[key] = match
+
+        unique_matches = list(deduplicated.values())[: settings.NEWS_MAX_OPPORTUNITIES_PER_SCAN]
+        semaphore = asyncio.Semaphore(self._CONCURRENCY)
+
+        async def _one(match: NewsMarketMatch) -> Optional[NewsEdge]:
+            async with semaphore:
+                try:
+                    return await self._estimate_semantic_match(match, model=model)
+                except Exception as exc:
+                    logger.debug("Edge estimation failed: %s", exc)
+                    return None
+
+        results = await asyncio.gather(*[_one(match) for match in unique_matches])
+        edges = [edge for edge in results if edge is not None]
+        edges.sort(key=lambda item: item.edge_percent, reverse=True)
+        self._cached_edges = edges
+        logger.info("Edge estimation: %d edges from %d matches", len(edges), len(unique_matches))
+        return edges
+
+    async def _estimate_semantic_match(
+        self,
+        match: NewsMarketMatch,
+        model: Optional[str] = None,
+    ) -> Optional[NewsEdge]:
+        market = match.market
+        article = match.article
+        market_price = self._normalize_probability(market.yes_price, fallback=0.5)
+        result = await self._cached_llm_result(
+            article_id=article.article_id,
+            market_id=market.market_id,
+            market_price=market_price,
+            article_title=article.title,
+            article_summary=article.summary,
+            market_question=market.question,
+            event_title=market.event_title,
+            category=market.category,
+            yes_price=market_price,
+            no_price=self._normalize_probability(market.no_price, fallback=1.0 - market_price),
+            model=model,
+        )
+        if result is None:
+            return None
+
+        relevance = str(result.get("news_relevance") or "").strip().lower()
+        novelty = str(result.get("information_novelty") or "known").strip().lower()
+        if relevance in {"none", "low"} or novelty == "stale":
+            return None
+
+        probability_yes = self._normalize_probability(result.get("probability_yes"), fallback=market_price)
+        confidence = self._normalize_confidence(result.get("confidence"), fallback=0.0)
+        confidence *= NOVELTY_CONFIDENCE_MULTIPLIERS.get(novelty, 0.5)
+        confidence = self._normalize_confidence(confidence, fallback=0.0)
+        if confidence < MIN_POST_NOVELTY_CONFIDENCE:
+            return None
+
+        edge_percent = abs(probability_yes - market_price) * 100.0
+        return NewsEdge(
+            match=match,
+            model_probability=probability_yes,
+            market_price=market_price,
+            edge_percent=edge_percent,
+            direction="buy_yes" if probability_yes > market_price else "buy_no",
+            confidence=confidence,
+            reasoning=str(result.get("reasoning") or "").strip() or "Model returned no reasoning.",
+            estimated_at=utcnow(),
+        )
 
     @staticmethod
     def _normalize_probability(value: object, fallback: float = 0.5) -> float:
@@ -340,8 +527,10 @@ class EdgeEstimator:
             return _rejected("llm_budget_exhausted")
 
         # Try LLM estimation
-        llm_result = None
-        llm_result = await self._call_llm(
+        llm_result = await self._cached_llm_result(
+            article_id=article_id,
+            market_id=c.market_id,
+            market_price=float(c.yes_price or 0.5),
             article_title=article_title,
             article_summary=article_summary,
             market_question=c.question,

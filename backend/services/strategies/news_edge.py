@@ -36,7 +36,7 @@ from typing import Any, Optional
 from config import settings
 from models import Opportunity, Event, Market
 from models.opportunity import MispricingType
-from services.news.edge_detector import NewsEdge
+from services.news.edge_estimator import NewsEdge, edge_estimator
 from services.news.feed_service import news_feed_service
 from services.news.semantic_matcher import MarketInfo, semantic_matcher
 from services.strategies.base import (
@@ -52,6 +52,7 @@ from services.data_events import DataEvent
 from services.quality_filter import QualityFilterOverrides
 from services.strategy_sdk import StrategySDK
 from utils.converters import coerce_bool as _coerce_bool, to_float, to_confidence
+from utils.kelly import kalshi_taker_fee, polymarket_taker_fee
 from utils.signal_helpers import signal_payload
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,9 @@ NEWS_EDGE_DEFAULT_CONFIG: dict[str, Any] = {
     "min_supporting_articles": 2,
     "min_supporting_sources": 2,
     "max_signal_age_minutes": 60,
+    "require_ci_clears_market": True,
+    "llm_shrinkage_k": 0.7,
+    "edge_half_life_minutes_by_category": {"default": 45.0},
 }
 
 NEWS_EDGE_CONFIG_SCHEMA: dict[str, Any] = {
@@ -82,12 +86,25 @@ NEWS_EDGE_CONFIG_SCHEMA: dict[str, Any] = {
         {"key": "min_supporting_articles", "label": "Min Supporting Articles", "type": "integer", "min": 1, "max": 10, "phase": "signal"},
         {"key": "min_supporting_sources", "label": "Min Supporting Sources", "type": "integer", "min": 1, "max": 10, "phase": "signal"},
         {"key": "max_signal_age_minutes", "label": "Max Signal Age (Minutes)", "type": "integer", "min": 1, "max": 1440, "phase": "signal"},
+        {"key": "require_ci_clears_market", "label": "Require CI Beyond Market", "type": "boolean", "phase": "signal"},
+        {"key": "llm_shrinkage_k", "label": "LLM Probability Shrinkage", "type": "number", "min": 0, "max": 1, "phase": "signal"},
+        {
+            "key": "edge_half_life_minutes_by_category",
+            "label": "Edge Half-life by Category",
+            "type": "object",
+            "phase": "signal",
+            "description": "Category-specific decay half-life in minutes; default is used for unknown categories.",
+        },
     ]
 }
 
 
 def news_edge_defaults() -> dict[str, Any]:
-    return dict(NEWS_EDGE_DEFAULT_CONFIG)
+    defaults = dict(NEWS_EDGE_DEFAULT_CONFIG)
+    defaults["edge_half_life_minutes_by_category"] = dict(
+        NEWS_EDGE_DEFAULT_CONFIG["edge_half_life_minutes_by_category"]
+    )
+    return defaults
 
 
 def news_edge_config_schema() -> dict[str, Any]:
@@ -125,6 +142,18 @@ def validate_news_edge_config(config: Any) -> dict[str, Any]:
     cfg["min_supporting_articles"] = _coerce_int(cfg.get("min_supporting_articles"), 2, 1, 10)
     cfg["min_supporting_sources"] = _coerce_int(cfg.get("min_supporting_sources"), 2, 1, 10)
     cfg["max_signal_age_minutes"] = _coerce_int(cfg.get("max_signal_age_minutes"), 60, 1, 1440)
+    cfg["require_ci_clears_market"] = _coerce_bool(cfg.get("require_ci_clears_market"), True)
+    cfg["llm_shrinkage_k"] = _coerce_float(cfg.get("llm_shrinkage_k"), 0.7, 0.0, 1.0)
+    raw_half_lives = cfg.get("edge_half_life_minutes_by_category")
+    if not isinstance(raw_half_lives, dict):
+        raw_half_lives = {}
+    half_lives: dict[str, float] = {}
+    for raw_category, raw_minutes in raw_half_lives.items():
+        category = str(raw_category or "").strip().lower()
+        if category:
+            half_lives[category] = _coerce_float(raw_minutes, 45.0, 1.0, 10_080.0)
+    half_lives.setdefault("default", 45.0)
+    cfg["edge_half_life_minutes_by_category"] = half_lives
     return StrategySDK.normalize_strategy_retention_config(cfg)
 
 
@@ -156,9 +185,20 @@ class NewsEdgeStrategy(BaseStrategy):
     def __init__(self) -> None:
         super().__init__()
         self._config: dict[str, Any] = validate_news_edge_config(self.default_config)
+        self._embedded_article_ids: set[str] = set()
 
     def configure(self, config: dict) -> None:
         self._config = validate_news_edge_config(config)
+
+    def _select_articles_for_embedding(self, articles: list[Any]) -> list[Any]:
+        current_article_ids = {str(article.article_id) for article in articles}
+        self._embedded_article_ids.intersection_update(current_article_ids)
+        return [
+            article for article in articles if str(article.article_id) not in self._embedded_article_ids
+        ]
+
+    def _mark_articles_embedded(self, articles: list[Any]) -> None:
+        self._embedded_article_ids.update(str(article.article_id) for article in articles)
 
     def detect(self, events: list[Event], markets: list[Market], prices: dict[str, dict]) -> list[Opportunity]:
         """Sync detect -- not used for this strategy.
@@ -287,14 +327,17 @@ class NewsEdgeStrategy(BaseStrategy):
 
     @classmethod
     def _extract_signal_age_minutes(cls, payload: dict[str, Any]) -> float | None:
-        explicit_age = cls._coerce_optional_float(
-            payload.get("age_minutes")
-            or payload.get("news_age_minutes")
-            or payload.get("minutes_since_published")
-            or payload.get("article_age_minutes")
-        )
-        if explicit_age is not None and explicit_age >= 0:
-            return float(explicit_age)
+        for key in (
+            "age_minutes",
+            "news_age_minutes",
+            "minutes_since_published",
+            "article_age_minutes",
+        ):
+            if key not in payload or payload.get(key) is None:
+                continue
+            explicit_age = cls._coerce_optional_float(payload.get(key))
+            if explicit_age is not None and explicit_age >= 0:
+                return float(explicit_age)
 
         now = utcnow()
         for key in (
@@ -312,11 +355,130 @@ class NewsEdgeStrategy(BaseStrategy):
                 return float(age)
         return None
 
+    @staticmethod
+    def _decayed_edge_percent(edge_percent: float, age_minutes: float | None, half_life_minutes: float) -> float:
+        if age_minutes is None or age_minutes <= 0.0:
+            return max(0.0, edge_percent)
+        half_life = max(1.0, half_life_minutes)
+        return max(0.0, edge_percent) * math.exp(-math.log(2.0) * age_minutes / half_life)
+
+    def _edge_half_life_minutes(self, category: str | None) -> float:
+        configured = self._config.get("edge_half_life_minutes_by_category")
+        half_lives = configured if isinstance(configured, dict) else {"default": 45.0}
+        category_key = str(category or "").strip().lower()
+        return self._coerce_float(half_lives.get(category_key, half_lives.get("default", 45.0)), 45.0)
+
+    @staticmethod
+    def _canonical_fee_adjusted_edge_pct(
+        edge_percent: float,
+        entry_price: float,
+        *,
+        platform: str,
+        category: str | None,
+    ) -> float:
+        platform_key = str(platform or "polymarket").strip().lower()
+        if platform_key == "polymarket":
+            fee = polymarket_taker_fee(entry_price, category=category)
+        elif platform_key == "kalshi":
+            fee = kalshi_taker_fee(entry_price)
+        else:
+            fee = 0.0
+        return edge_percent - (fee * 100.0)
+
+    @staticmethod
+    def _ci_is_beyond_market(direction: str, ci_low: float, ci_high: float, market_price_yes: float) -> bool:
+        if direction == "buy_yes":
+            return ci_low > market_price_yes
+        return ci_high < market_price_yes
+
+    def _calculate_edge_metrics(
+        self,
+        *,
+        direction: str,
+        model_probability_yes: float,
+        market_price_yes: float,
+        entry_price: float,
+        confidence: float,
+        age_minutes: float | None,
+        platform: str,
+        category: str | None,
+        uncertainty_payload: dict[str, Any],
+    ) -> dict[str, float | bool]:
+        model_probability_yes = max(0.0, min(1.0, model_probability_yes))
+        market_price_yes = max(0.0, min(1.0, market_price_yes))
+        entry_price = max(0.0, min(1.0, entry_price))
+        shrinkage = float(self._config.get("llm_shrinkage_k", 0.7))
+        adjusted_probability_yes = market_price_yes + shrinkage * (model_probability_yes - market_price_yes)
+        adjusted_target = (
+            adjusted_probability_yes if direction == "buy_yes" else (1.0 - adjusted_probability_yes)
+        )
+        gross_edge_percent = max(0.0, adjusted_target - entry_price) * 100.0
+        ci_low, ci_high, ci_width, confidence_uncertainty = self._resolve_uncertainty(
+            uncertainty_payload,
+            model_probability_yes,
+            confidence,
+        )
+        ci_passed = self._ci_is_beyond_market(direction, ci_low, ci_high, market_price_yes)
+        decayed_edge_percent = self._decayed_edge_percent(
+            gross_edge_percent,
+            age_minutes,
+            self._edge_half_life_minutes(category),
+        )
+        fee_adjusted_edge_percent = self._canonical_fee_adjusted_edge_pct(
+            decayed_edge_percent,
+            entry_price,
+            platform=platform,
+            category=category,
+        )
+        return {
+            "adjusted_probability_yes": adjusted_probability_yes,
+            "gross_edge_percent": gross_edge_percent,
+            "decayed_edge_percent": decayed_edge_percent,
+            "fee_adjusted_edge_percent": fee_adjusted_edge_percent,
+            "ci_low": ci_low,
+            "ci_high": ci_high,
+            "ci_width": ci_width,
+            "confidence_uncertainty": confidence_uncertainty,
+            "ci_passed": ci_passed,
+        }
+
+    def _payload_edge_metrics(self, payload: dict[str, Any]) -> dict[str, float | bool]:
+        direction = str(payload.get("direction") or "buy_yes").strip().lower()
+        market_price_yes = max(0.0, min(1.0, self._coerce_float(payload.get("market_price"), 0.5)))
+        raw_edge_percent = max(0.0, self._coerce_float(payload.get("edge_percent"), 0.0))
+        raw_model_probability = self._coerce_optional_float(payload.get("model_probability"))
+        if raw_model_probability is None:
+            signed_edge = raw_edge_percent / 100.0
+            raw_model_probability = (
+                market_price_yes + signed_edge if direction == "buy_yes" else market_price_yes - signed_edge
+            )
+        entry_price = self._coerce_float(payload.get("entry_price"), -1.0)
+        if entry_price <= 0.0:
+            entry_price = market_price_yes if direction == "buy_yes" else (1.0 - market_price_yes)
+        category = payload.get("category") or payload.get("market_category")
+        market_meta = payload.get("market")
+        if not category and isinstance(market_meta, dict):
+            category = market_meta.get("category")
+        return self._calculate_edge_metrics(
+            direction=direction,
+            model_probability_yes=raw_model_probability,
+            market_price_yes=market_price_yes,
+            entry_price=entry_price,
+            confidence=self._coerce_float(payload.get("confidence"), 0.0),
+            age_minutes=self._extract_signal_age_minutes(payload),
+            platform=str(payload.get("platform") or "polymarket"),
+            category=str(category or "") or None,
+            uncertainty_payload=payload,
+        )
+
     def _passes_filters(self, payload: dict[str, Any]) -> bool:
         cfg = self._config
-        edge_percent = self._coerce_float(payload.get("edge_percent"), 0.0)
+        edge_metrics = self._payload_edge_metrics(payload)
+        edge_percent = float(edge_metrics["fee_adjusted_edge_percent"])
         confidence = self._coerce_float(payload.get("confidence"), 0.0)
         if edge_percent < float(cfg.get("min_edge_percent", 0.0) or 0.0):
+            return False
+        if bool(cfg.get("require_ci_clears_market", True)) and not bool(edge_metrics["ci_passed"]):
             return False
         if confidence < float(cfg.get("min_confidence", 0.0) or 0.0):
             return False
@@ -409,15 +571,16 @@ class NewsEdgeStrategy(BaseStrategy):
 
         direction = str(payload.get("direction") or "buy_yes").strip().lower()
         question = str(payload.get("market_question") or "").strip()
-        edge_percent = self._coerce_float(payload.get("edge_percent"), 0.0)
         confidence = self._coerce_float(payload.get("confidence"), 0.0)
         model_probability_yes = self._coerce_float(payload.get("model_probability"), 0.5)
         model_probability_yes = max(0.0, min(1.0, model_probability_yes))
-        ci_low, ci_high, ci_width, confidence_uncertainty = self._resolve_uncertainty(
-            payload,
-            model_probability_yes,
-            confidence,
-        )
+        edge_metrics = self._payload_edge_metrics(payload)
+        adjusted_probability_yes = float(edge_metrics["adjusted_probability_yes"])
+        fee_adjusted_edge = float(edge_metrics["fee_adjusted_edge_percent"])
+        ci_low = float(edge_metrics["ci_low"])
+        ci_high = float(edge_metrics["ci_high"])
+        ci_width = float(edge_metrics["ci_width"])
+        confidence_uncertainty = float(edge_metrics["confidence_uncertainty"])
         entry_price = self._coerce_float(payload.get("entry_price"), -1.0)
         market_price_yes = self._coerce_float(payload.get("market_price"), 0.5)
         if entry_price <= 0.0:
@@ -425,12 +588,10 @@ class NewsEdgeStrategy(BaseStrategy):
         entry_price = max(0.0, min(1.0, entry_price))
 
         side = "YES" if direction == "buy_yes" else "NO"
-        target_price = model_probability_yes if direction == "buy_yes" else (1.0 - model_probability_yes)
+        target_price = adjusted_probability_yes if direction == "buy_yes" else (1.0 - adjusted_probability_yes)
         target_price = max(0.0, min(1.0, target_price))
         if target_price <= 0.0 and entry_price > 0.0:
-            target_price = max(0.0, min(1.0, entry_price + (edge_percent / 100.0)))
-        platform = str(payload.get("platform") or "polymarket").strip().lower() or "polymarket"
-        fee_adjusted_edge = self.fee_adjusted_edge_pct(edge_percent, entry_price, platform=platform)
+            target_price = max(0.0, min(1.0, entry_price + (fee_adjusted_edge / 100.0)))
 
         metadata = {
             k: v
@@ -454,11 +615,13 @@ class NewsEdgeStrategy(BaseStrategy):
         metadata["model_probability_ci_high"] = ci_high
         metadata["model_probability_ci_width"] = ci_width
         metadata["confidence_uncertainty"] = confidence_uncertainty
+        metadata["adjusted_model_probability"] = adjusted_probability_yes
+        metadata["fee_adjusted_edge_percent"] = fee_adjusted_edge
 
         market = self._market_from_payload(payload)
         opp = self.create_opportunity(
             title=f"News Edge: {question[:50]}",
-            description=f"News-driven {side} at ${entry_price:.2f} (edge: {edge_percent:.1f}%)",
+            description=f"News-driven {side} at ${entry_price:.2f} (net edge: {fee_adjusted_edge:.1f}%)",
             total_cost=entry_price,
             expected_payout=target_price,
             markets=[market],
@@ -481,6 +644,7 @@ class NewsEdgeStrategy(BaseStrategy):
             opp.strategy_context = {
                 **dict(getattr(opp, "strategy_context", {}) or {}),
                 "model_probability": model_probability_yes,
+                "adjusted_model_probability": adjusted_probability_yes,
                 "model_probability_ci_low": ci_low,
                 "model_probability_ci_high": ci_high,
                 "model_probability_ci_width": ci_width,
@@ -541,8 +705,15 @@ class NewsEdgeStrategy(BaseStrategy):
 
             await loop.run_in_executor(_MATCHER_EXECUTOR, semantic_matcher.update_market_index, market_infos)
 
-            # Step 3: Embed new articles
-            await loop.run_in_executor(_MATCHER_EXECUTOR, semantic_matcher.embed_articles, all_articles)
+            # Step 3: Embed only article ids not processed by this strategy instance.
+            articles_to_embed = self._select_articles_for_embedding(all_articles)
+            if articles_to_embed:
+                await loop.run_in_executor(
+                    _MATCHER_EXECUTOR,
+                    semantic_matcher.embed_articles,
+                    articles_to_embed,
+                )
+                self._mark_articles_embedded(articles_to_embed)
 
             # Step 4: Match articles to markets
             matches = await loop.run_in_executor(
@@ -565,18 +736,39 @@ class NewsEdgeStrategy(BaseStrategy):
             )
 
             # Step 5: Estimate edges via LLM
-            from services.news.edge_detector import edge_detector
-
-            edges = await edge_detector.detect_edges(matches)
+            edges = await edge_estimator.detect_edges(matches)
 
             # Step 6: Convert edges to Opportunity objects
             opportunities = []
+            live_price_edge_drops = 0
             for edge in edges:
-                opp = self._edge_to_opportunity(edge, markets, events, prices)
+                market = next((candidate for candidate in markets if candidate.id == edge.market_id), None)
+                if market is None:
+                    continue
+                live_metrics = self._refresh_edge_metrics(edge, market, prices)
+                if live_metrics is None:
+                    live_price_edge_drops += 1
+                    continue
+                if edge.confidence < float(self._config.get("min_confidence", 0.45)):
+                    continue
+                if bool(self._config.get("require_ci_clears_market", True)) and not bool(
+                    live_metrics["ci_passed"]
+                ):
+                    continue
+                if float(live_metrics["fee_adjusted_edge_percent"]) < float(
+                    self._config.get("min_edge_percent", 5.0)
+                ):
+                    live_price_edge_drops += 1
+                    continue
+                opp = self._edge_to_opportunity(edge, market, events, live_metrics)
                 if opp:
                     opportunities.append(opp)
 
-            logger.info("News Edge: %d opportunities generated", len(opportunities))
+            logger.info(
+                "News Edge: %d opportunities generated; %d dropped after live-price edge refresh",
+                len(opportunities),
+                live_price_edge_drops,
+            )
             return opportunities
 
         except Exception as e:
@@ -637,20 +829,59 @@ class NewsEdgeStrategy(BaseStrategy):
 
         return infos
 
+    def _refresh_edge_metrics(
+        self,
+        edge: NewsEdge,
+        market: Market,
+        prices: dict[str, dict],
+    ) -> dict[str, Any] | None:
+        """Refresh the tradable side price and recompute all edge gates."""
+        side = "YES" if edge.direction == "buy_yes" else "NO"
+        entry_price = self._coerce_float(StrategySDK.get_live_price(market, prices, side=side), 0.0)
+        if entry_price <= 0.0 or entry_price >= 1.0:
+            return None
+        market_price_yes = entry_price if edge.direction == "buy_yes" else (1.0 - entry_price)
+        article_age_minutes = self._extract_signal_age_minutes(
+            {"article_published_at": edge.match.article.published}
+        )
+        metrics = self._calculate_edge_metrics(
+            direction=edge.direction,
+            model_probability_yes=edge.model_probability,
+            market_price_yes=market_price_yes,
+            entry_price=entry_price,
+            confidence=edge.confidence,
+            age_minutes=article_age_minutes,
+            platform=str(getattr(market, "platform", "polymarket") or "polymarket"),
+            category=edge.match.market.category or None,
+            uncertainty_payload={},
+        )
+        token_index = 0 if edge.direction == "buy_yes" else 1
+        token_ids = market.clob_token_ids or []
+        metrics.update(
+            {
+                "side": side,
+                "entry_price": entry_price,
+                "market_price_yes": market_price_yes,
+                "target_price": (
+                    float(metrics["adjusted_probability_yes"])
+                    if edge.direction == "buy_yes"
+                    else 1.0 - float(metrics["adjusted_probability_yes"])
+                ),
+                "token_id": token_ids[token_index] if len(token_ids) > token_index else None,
+                "article_age_minutes": article_age_minutes,
+            }
+        )
+        return metrics
+
     def _edge_to_opportunity(
         self,
         edge: NewsEdge,
-        markets: list[Market],
+        market: Market,
         events: list[Event],
-        prices: dict[str, dict],
+        live_metrics: dict[str, Any],
     ) -> Optional[Opportunity]:
-        """Convert a NewsEdge into an Opportunity."""
+        """Convert a refreshed NewsEdge into an Opportunity."""
         mi = edge.match.market
-
-        # Find the actual Market object
-        market = next((m for m in markets if m.id == mi.market_id), None)
-        if not market:
-            return None
 
         # Find the event
         event = None
@@ -659,37 +890,22 @@ class NewsEdgeStrategy(BaseStrategy):
                 event = e
                 break
 
-        # Determine position
-        if edge.direction == "buy_yes":
-            side = "YES"
-            entry_price = mi.yes_price
-            target_price = edge.model_probability
-            token_id = market.clob_token_ids[0] if market.clob_token_ids else None
-        else:
-            side = "NO"
-            entry_price = mi.no_price
-            target_price = 1.0 - edge.model_probability
-            token_id = market.clob_token_ids[1] if len(market.clob_token_ids) > 1 else None
-
-        ci_low, ci_high, ci_width, confidence_uncertainty = self._resolve_uncertainty(
-            {},
-            max(0.0, min(1.0, edge.model_probability)),
-            max(0.0, min(1.0, edge.confidence)),
-        )
+        side = str(live_metrics["side"])
+        entry_price = float(live_metrics["entry_price"])
+        target_price = float(live_metrics["target_price"])
+        token_id = live_metrics.get("token_id")
+        ci_low = float(live_metrics["ci_low"])
+        ci_high = float(live_metrics["ci_high"])
+        ci_width = float(live_metrics["ci_width"])
+        confidence_uncertainty = float(live_metrics["confidence_uncertainty"])
+        adjusted_probability_yes = float(live_metrics["adjusted_probability_yes"])
+        roi = float(live_metrics["fee_adjusted_edge_percent"])
 
         # Profit calculation: if we buy at entry_price and the true probability
         # is target_price, our expected value is target_price per share.
         # Expected profit = target_price - entry_price (per $1 of shares).
         expected_payout = target_price
         total_cost = entry_price
-        roi = self.fee_adjusted_edge_pct(
-            edge.edge_percent,
-            entry_price,
-            platform=str(getattr(market, "platform", "polymarket") or "polymarket"),
-        )
-
-        if roi < settings.NEWS_MIN_EDGE_PERCENT / 2:
-            return None
 
         sizing = StrategySDK.resolve_position_sizing(
             liquidity_usd=market.liquidity,
@@ -731,11 +947,15 @@ class NewsEdgeStrategy(BaseStrategy):
                     "article_url": edge.match.article.url,
                     "article_source": edge.match.article.source,
                     "model_probability": edge.model_probability,
+                    "adjusted_model_probability": adjusted_probability_yes,
                     "model_probability_ci_low": ci_low,
                     "model_probability_ci_high": ci_high,
                     "model_probability_ci_width": ci_width,
-                    "market_price": edge.market_price,
-                    "edge_percent": edge.edge_percent,
+                    "market_price": float(live_metrics["market_price_yes"]),
+                    "edge_percent": roi,
+                    "gross_edge_percent": float(live_metrics["gross_edge_percent"]),
+                    "decayed_edge_percent": float(live_metrics["decayed_edge_percent"]),
+                    "article_age_minutes": live_metrics.get("article_age_minutes"),
                     "direction": edge.direction,
                     "confidence": edge.confidence,
                     "confidence_uncertainty": confidence_uncertainty,
@@ -750,9 +970,9 @@ class NewsEdgeStrategy(BaseStrategy):
             title=f"News Edge: {market.question[:50]}...",
             description=(
                 f"News suggests {side} at ${entry_price:.2f} "
-                f"(model: {edge.model_probability:.0%}, "
-                f"market: {edge.market_price:.0%}, "
-                f"edge: {edge.edge_percent:.1f}%). "
+                f"(adjusted model: {adjusted_probability_yes:.0%}, "
+                f"market: {float(live_metrics['market_price_yes']):.0%}, "
+                f"net edge: {roi:.1f}%). "
                 f"Source: {edge.match.article.title[:80]}"
             ),
             total_cost=total_cost,
@@ -773,11 +993,12 @@ class NewsEdgeStrategy(BaseStrategy):
             opp.strategy_context = {
                 **dict(getattr(opp, "strategy_context", {}) or {}),
                 "model_probability": edge.model_probability,
+                "adjusted_model_probability": adjusted_probability_yes,
                 "model_probability_ci_low": ci_low,
                 "model_probability_ci_high": ci_high,
                 "model_probability_ci_width": ci_width,
                 "confidence_uncertainty": confidence_uncertainty,
-                "market_price_yes": edge.market_price,
+                "market_price_yes": float(live_metrics["market_price_yes"]),
                 "direction": edge.direction,
             }
 
@@ -796,7 +1017,8 @@ class NewsEdgeStrategy(BaseStrategy):
     def compute_score(
         self, edge: float, confidence: float, risk_score: float, market_count: int, payload: dict
     ) -> float:
-        return (edge * 0.55) + (confidence * 45.0)
+        # These relative weights need calibration against shadow/backtest outcomes.
+        return (edge * 1.0) + (confidence * 10.0)
 
     def compute_size(
         self, base_size: float, max_size: float, edge: float, confidence: float, risk_score: float, market_count: int
