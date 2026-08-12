@@ -560,7 +560,14 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
 
     def custom_checks(self, signal: Any, context: dict, params: dict, payload: dict) -> list[DecisionCheck]:
         live_market = context.get("live_market") or {}
-        min_liquidity = max(0.0, to_float(params.get("min_liquidity", 1500.0), 1500.0))
+        configured_min_liquidity = to_float(
+            (getattr(self, "config", {}) or {}).get("min_liquidity"),
+            self.default_config["min_liquidity"],
+        )
+        min_liquidity = max(
+            0.0,
+            to_float(params.get("min_liquidity", configured_min_liquidity), configured_min_liquidity),
+        )
         min_abs_move_5m = max(0.0, to_float(params.get("min_abs_move_5m", 4.0), 4.0))
         max_abs_move_2h = max(5.0, to_float(params.get("max_abs_move_2h_pct", 80.0), 80.0))
         require_alignment = self._to_bool(params.get("require_breakout_alignment"), True)
