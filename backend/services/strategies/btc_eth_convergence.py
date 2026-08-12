@@ -42,6 +42,10 @@ from services.strategy_helpers.crypto_strategy_utils import (
     resolve_oracle_availability as _resolve_oracle_availability,
     extract_oracle_status as _extract_oracle_status,
     enrich_crypto_market_row as _enrich_crypto_market_row,
+    default_max_market_data_age_ms,
+    default_max_oracle_age_ms,
+    estimate_p_win,
+    fee_aware_min_edge_pct,
 )
 from services.data_events import DataEvent
 from services.strategy_sdk import StrategySDK
@@ -554,6 +558,8 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         # Directional-entry gates
         "opening_directional_buy_yes_enabled": True,
         "opening_directional_buy_no_enabled": True,
+        "min_edge_percent": 0.0,
+        "min_confidence": 0.45,
         # Exit controls
         "rapid_take_profit_pct": 10.0,
         "take_profit_pct": 8.0,
@@ -593,6 +599,13 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         "resolution_risk_disable_when_take_profit_armed": True,
         # Circuit breaker
         "max_consecutive_losses_before_pause": 3,
+        "consecutive_loss_pause_minutes": 15.0,
+        "consecutive_loss_pause_enabled": True,
+        "exit_on_oracle_flip": True,
+        "kelly_fraction": 0.25,
+        "min_execution_adjusted_edge_percent": 0.0,
+        "debug_decision_payload": False,
+        "runtime_cache_ttl_seconds": 600.0,
         # ── Convergence-detection tunables ─────────────────────────────
         # The "convergence" thesis: in the final ~5-45s of a 15-minute
         # cycle, when the oracle confidently points one way, the market
@@ -605,6 +618,10 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         "convergence_max_score": 85.0,              # ceiling on final score
         "convergence_min_price": 0.85,              # need ≥0.85¢ on the favored side
         "convergence_max_entry_price": 0.95,        # too late once already at 0.95
+        "convergence_base_scale": 0.50,
+        "convergence_min_scale": 0.08,
+        "convergence_prob_min": 0.03,
+        "convergence_prob_max": 0.97,
     }
     default_config["enabled_sub_strategies"] = ["convergence"]
     default_config["strategy_mode"] = "convergence"
@@ -630,12 +647,100 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         # Runtime anti-churn controls used by evaluate().
         self._edge_first_seen_ms: dict[str, int] = {}
         self._last_selected_at_ms_by_market: dict[str, int] = {}
+        self._market_scope_cache: dict[str, tuple[str, str]] = {}
+        self._book_imbalance_memo: dict[tuple[str, str, int], Optional[float]] = {}
         # Consecutive loss circuit breaker state.
         self._consecutive_losses: int = 0
         self._paused_until_ms: int = 0
 
     def configure(self, config: dict) -> None:
         super().configure({**self.default_config, **(config or {})})
+
+    @classmethod
+    def _convergence_metrics(
+        cls,
+        params: dict[str, Any],
+        *,
+        oracle_diff_pct: float,
+        elapsed_ratio: float,
+        entry_price: float,
+    ) -> dict[str, float]:
+        p_win = estimate_p_win(
+            oracle_diff_pct,
+            elapsed_ratio,
+            base_scale=to_float(
+                params.get("convergence_base_scale", cls.default_config["convergence_base_scale"]),
+                cls.default_config["convergence_base_scale"],
+            ),
+            min_scale=to_float(
+                params.get("convergence_min_scale", cls.default_config["convergence_min_scale"]),
+                cls.default_config["convergence_min_scale"],
+            ),
+            prob_min=to_float(
+                params.get("convergence_prob_min", cls.default_config["convergence_prob_min"]),
+                cls.default_config["convergence_prob_min"],
+            ),
+            prob_max=to_float(
+                params.get("convergence_prob_max", cls.default_config["convergence_prob_max"]),
+                cls.default_config["convergence_prob_max"],
+            ),
+        )
+        gross_edge = (p_win - entry_price) * 100.0
+        fee_edge = fee_aware_min_edge_pct(entry_price, multiplier=1.0)
+        net_edge = gross_edge - fee_edge
+        base_score = to_float(
+            params.get("convergence_base_score", cls.default_config["convergence_base_score"]),
+            cls.default_config["convergence_base_score"],
+        )
+        max_score = to_float(
+            params.get("convergence_max_score", cls.default_config["convergence_max_score"]),
+            cls.default_config["convergence_max_score"],
+        )
+        score = min(max_score, base_score + abs(oracle_diff_pct) * 100.0)
+        return {
+            "p_win": p_win,
+            "gross_edge_percent": gross_edge,
+            "fee_edge_percent": fee_edge,
+            "net_edge_percent": net_edge,
+            "score": score,
+        }
+
+    @classmethod
+    def _convergence_kelly_size(
+        cls,
+        params: dict[str, Any],
+        *,
+        base_size: float,
+        max_size: float,
+        p_win: float,
+        entry_price: float,
+        confidence: float,
+    ) -> float:
+        return StrategySDK.fractional_kelly_size(
+            base_size,
+            max_size,
+            edge_price=max(0.0, p_win - entry_price),
+            market_price=entry_price,
+            confidence=confidence,
+            risk_score=1.0 - confidence,
+            kelly_fraction=to_float(
+                params.get("kelly_fraction", cls.default_config["kelly_fraction"]),
+                cls.default_config["kelly_fraction"],
+            ),
+        )
+
+    def _prune_runtime_caches(self, *, now_ms: int, ttl_seconds: float) -> None:
+        cutoff_ms = now_ms - int(max(1.0, ttl_seconds) * 1000.0)
+        for cache in (self._edge_first_seen_ms, self._last_selected_at_ms_by_market):
+            for key in [key for key, timestamp_ms in cache.items() if timestamp_ms < cutoff_ms]:
+                cache.pop(key, None)
+        if len(self._market_scope_cache) > 4096:
+            self._market_scope_cache.clear()
+        if len(self._book_imbalance_memo) > 1024:
+            self._book_imbalance_memo.clear()
+
+    def _build_decision_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return payload
 
     # ------------------------------------------------------------------
     # Detection entry point — EVENT-DRIVEN (see on_event below)
@@ -1089,6 +1194,16 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         """
         params = context.get("params") or {}
         payload = signal_payload(signal)
+        market_id = str(getattr(signal, "market_id", "") or payload.get("market_id") or "").strip()
+        evaluation_now = utcnow()
+        now_ms = int(evaluation_now.timestamp() * 1000.0)
+        self._prune_runtime_caches(
+            now_ms=now_ms,
+            ttl_seconds=to_float(
+                params.get("runtime_cache_ttl_seconds", self.default_config["runtime_cache_ttl_seconds"]),
+                self.default_config["runtime_cache_ttl_seconds"],
+            ),
+        )
         live_market = context.get("live_market")
         if not isinstance(live_market, dict):
             live_market = payload.get("live_market")
@@ -1096,8 +1211,14 @@ class BtcEthConvergenceStrategy(BaseStrategy):
             live_market = {}
 
         # --- Core thresholds ---
-        min_edge = to_float(params.get("min_edge_percent", 3.0), 3.0)
-        min_conf = to_confidence(params.get("min_confidence", 0.45), 0.45)
+        min_edge = to_float(
+            params.get("min_edge_percent", self.default_config["min_edge_percent"]),
+            self.default_config["min_edge_percent"],
+        )
+        min_conf = to_confidence(
+            params.get("min_confidence", self.default_config["min_confidence"]),
+            self.default_config["min_confidence"],
+        )
         base_size, max_size = _trader_size_limits(context)
 
         # --- Direction guardrail parameters ---
@@ -1121,26 +1242,24 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         enabled_active_modes = _resolve_enabled_active_modes(params)
 
         # --- Asset / timeframe extraction ---
-        signal_asset = _normalize_asset(
-            _first_present(
-                live_market.get("asset"),
-                live_market.get("coin"),
-                live_market.get("symbol"),
-                payload.get("asset"),
-                payload.get("coin"),
-                payload.get("symbol"),
+        cached_scope = self._market_scope_cache.get(market_id) if market_id else None
+        if cached_scope is not None:
+            signal_asset, signal_timeframe = cached_scope
+        else:
+            signal_asset = _normalize_asset(
+                _first_present(
+                    live_market.get("asset"), live_market.get("coin"), live_market.get("symbol"),
+                    payload.get("asset"), payload.get("coin"), payload.get("symbol"),
+                )
             )
-        )
-        signal_timeframe = _normalize_timeframe(
-            _first_present(
-                live_market.get("timeframe"),
-                live_market.get("cadence"),
-                live_market.get("interval"),
-                payload.get("timeframe"),
-                payload.get("cadence"),
-                payload.get("interval"),
+            signal_timeframe = _normalize_timeframe(
+                _first_present(
+                    live_market.get("timeframe"), live_market.get("cadence"), live_market.get("interval"),
+                    payload.get("timeframe"), payload.get("cadence"), payload.get("interval"),
+                )
             )
-        )
+            if market_id and signal_asset and signal_timeframe:
+                self._market_scope_cache[market_id] = (signal_asset, signal_timeframe)
 
         # --- Asset/timeframe include+exclude filtering ---
         include_assets = _normalize_scope(
@@ -1230,7 +1349,7 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         if signal_is_live is None and signal_end_time:
             try:
                 parsed_end = datetime.fromisoformat(signal_end_time.replace("Z", "+00:00"))
-                signal_is_live = parsed_end.timestamp() > utcnow().timestamp()
+                signal_is_live = parsed_end.timestamp() > evaluation_now.timestamp()
             except Exception:
                 signal_is_live = None
         if signal_is_live is None and signal_seconds_left >= 0:
@@ -1258,7 +1377,7 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         if live_context_fetched_at is not None:
             live_context_age_seconds = max(
                 0.0,
-                (utcnow() - live_context_fetched_at.astimezone(timezone.utc)).total_seconds(),
+                (evaluation_now - live_context_fetched_at.astimezone(timezone.utc)).total_seconds(),
             )
         live_context_fresh_ok = (
             live_context_age_seconds is None or live_context_age_seconds <= max_live_context_age_seconds
@@ -1287,7 +1406,7 @@ class BtcEthConvergenceStrategy(BaseStrategy):
             )
             signal_age_seconds = max(
                 0.0,
-                (utcnow() - signal_ts_utc.astimezone(timezone.utc)).total_seconds(),
+                (evaluation_now - signal_ts_utc.astimezone(timezone.utc)).total_seconds(),
             )
         max_signal_age_seconds_cfg = self._float(
             _timeframe_override(params, "max_signal_age_seconds", signal_timeframe)
@@ -1326,13 +1445,15 @@ class BtcEthConvergenceStrategy(BaseStrategy):
             if observed_at is not None:
                 market_data_age_ms = max(
                     0.0,
-                    (utcnow() - observed_at.astimezone(timezone.utc)).total_seconds() * 1000.0,
+                    (evaluation_now - observed_at.astimezone(timezone.utc)).total_seconds() * 1000.0,
                 )
         max_market_data_age_ms_cfg = self._float(
             _timeframe_override(params, "max_market_data_age_ms", signal_timeframe)
         )
         if max_market_data_age_ms_cfg is None:
-            max_market_data_age_ms_cfg = to_float(params.get("max_market_data_age_ms", 900.0), 900.0)
+            max_market_data_age_ms_cfg = self._float(params.get("max_market_data_age_ms"))
+        if max_market_data_age_ms_cfg is None:
+            max_market_data_age_ms_cfg = default_max_market_data_age_ms(signal_timeframe)
         max_market_data_age_ms = max(50.0, float(max_market_data_age_ms_cfg))
         if low_notional_live_mode:
             market_data_floor_by_timeframe = {
@@ -1357,26 +1478,24 @@ class BtcEthConvergenceStrategy(BaseStrategy):
             or (market_data_age_ms is None and not require_market_data_age)
         )
 
-        default_min_seconds_by_timeframe: dict[str, float] = {
-            "5m": 45.0,
-            "15m": 180.0,
-            "1h": 360.0,
-            "4h": 900.0,
-        }
-        timeframe_specific_floor = self._float(
-            _timeframe_override(params, "min_seconds_left_for_entry", signal_timeframe)
+        min_seconds_left_for_entry = max(
+            0.0,
+            to_float(
+                params.get("convergence_min_seconds_left", self.default_config["convergence_min_seconds_left"]),
+                self.default_config["convergence_min_seconds_left"],
+            ),
         )
-        global_min_seconds = self._float(params.get("min_seconds_left_for_entry"))
-        min_seconds_left_for_entry = (
-            max(0.0, timeframe_specific_floor)
-            if timeframe_specific_floor is not None
-            else (
-                max(0.0, global_min_seconds)
-                if global_min_seconds is not None
-                else default_min_seconds_by_timeframe.get(signal_timeframe, 0.0)
-            )
+        max_seconds_left_for_entry = max(
+            min_seconds_left_for_entry,
+            to_float(
+                params.get("convergence_max_seconds_left", self.default_config["convergence_max_seconds_left"]),
+                self.default_config["convergence_max_seconds_left"],
+            ),
         )
-        entry_window_ok = signal_seconds_left < 0 or signal_seconds_left >= float(min_seconds_left_for_entry)
+        entry_window_ok = (
+            signal_seconds_left >= min_seconds_left_for_entry
+            and signal_seconds_left <= max_seconds_left_for_entry
+        )
 
         if signal_seconds_left >= 0 and signal_timeframe:
             regime = self._crypto_regime(signal_seconds_left, self._timeframe_seconds(signal_timeframe))
@@ -1406,7 +1525,8 @@ class BtcEthConvergenceStrategy(BaseStrategy):
             )
         )
         entry_window_detail = (
-            f"seconds_left={signal_seconds_left:.1f} required>={min_seconds_left_for_entry:.1f}"
+            f"seconds_left={signal_seconds_left:.1f} "
+            f"window=[{min_seconds_left_for_entry:.1f},{max_seconds_left_for_entry:.1f}]"
             if signal_seconds_left >= 0
             else "seconds_left unavailable"
         )
@@ -1580,16 +1700,41 @@ class BtcEthConvergenceStrategy(BaseStrategy):
             int(to_float(params.get("orderbook_imbalance_levels", 5), 5)),
         )
         live_imbalance_signed = None
-        try:
-            live_imbalance_signed = StrategySDK.get_book_imbalance(
-                live_market_for_imbalance,
-                side="YES",
-                levels=live_imbalance_levels,
+        imbalance_token_id = str(
+            _first_present(
+                live_market_for_imbalance.get("token_id"),
+                payload.get("token_id"),
+                getattr(signal, "token_id", None),
             )
-        except Exception:
-            # SDK call should never raise, but defensively swallow any
-            # surprise so a cache hiccup can't take out the evaluate path.
-            live_imbalance_signed = None
+            or ""
+        ).strip()
+        imbalance_tick = str(
+            _first_present(
+                live_market_for_imbalance.get("book_updated_at_ms"),
+                live_market_for_imbalance.get("updated_at_ms"),
+                live_market_for_imbalance.get("market_data_observed_at"),
+                payload.get("market_data_observed_at"),
+            )
+            or ""
+        ).strip()
+        imbalance_memo_key = (
+            (imbalance_token_id, imbalance_tick, live_imbalance_levels)
+            if imbalance_token_id and imbalance_tick
+            else None
+        )
+        if imbalance_memo_key is not None and imbalance_memo_key in self._book_imbalance_memo:
+            live_imbalance_signed = self._book_imbalance_memo[imbalance_memo_key]
+        else:
+            try:
+                live_imbalance_signed = StrategySDK.get_book_imbalance(
+                    live_market_for_imbalance,
+                    side="YES",
+                    levels=live_imbalance_levels,
+                )
+            except Exception:
+                live_imbalance_signed = None
+            if imbalance_memo_key is not None:
+                self._book_imbalance_memo[imbalance_memo_key] = live_imbalance_signed
 
         if live_imbalance_signed is not None:
             raw_orderbook_imbalance = live_imbalance_signed
@@ -1714,7 +1859,7 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         model_prob_no = max(0.0, min(1.0, to_float(payload.get("model_prob_no"), 0.5)))
         up_price = max(0.0, min(1.0, to_float(payload.get("up_price"), 0.5)))
         down_price = max(0.0, min(1.0, to_float(payload.get("down_price"), 0.5)))
-        now_epoch_ms = int(utcnow().timestamp() * 1000.0)
+        now_epoch_ms = now_ms
         oracle_status = _extract_oracle_status(
             live_market=live_market,
             payload=payload,
@@ -1722,17 +1867,19 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         )
         oracle_age_ms = self._float(oracle_status.get("age_ms"))
         oracle_age_seconds = (oracle_age_ms / 1000.0) if oracle_age_ms is not None else None
-        max_oracle_age_seconds_cfg = to_float(params.get("max_oracle_age_seconds", 12.0), 12.0)
-        max_oracle_age_seconds_cfg = max(0.1, float(max_oracle_age_seconds_cfg))
-        max_oracle_age_ms_cfg = self._float(params.get("max_oracle_age_ms"))
+        max_oracle_age_ms_cfg = self._float(_timeframe_override(params, "max_oracle_age_ms", signal_timeframe))
+        if max_oracle_age_ms_cfg is None:
+            max_oracle_age_ms_cfg = self._float(params.get("max_oracle_age_ms"))
         max_oracle_age_ms = (
             max(100.0, float(max_oracle_age_ms_cfg))
             if max_oracle_age_ms_cfg is not None
-            else max(100.0, max_oracle_age_seconds_cfg * 1000.0)
+            else default_max_oracle_age_ms(signal_timeframe)
         )
         max_oracle_age_seconds = max_oracle_age_ms / 1000.0
         require_oracle_for_directional = to_bool(params.get("require_oracle_for_directional"), True)
-        oracle_required = require_oracle_for_directional and active_mode == "directional"
+        oracle_required = active_mode == "convergence" or (
+            require_oracle_for_directional and active_mode == "directional"
+        )
         oracle_source_policy = str(params.get("oracle_source_policy") or "degrade").strip().lower()
         if oracle_source_policy not in {"degrade", "hard_skip", "allow_fallback"}:
             oracle_source_policy = "degrade"
@@ -2093,8 +2240,6 @@ class BtcEthConvergenceStrategy(BaseStrategy):
 
         # --- Adaptive edge gating ---
         edge_for_gate = min(edge, mode_edge) if mode_edge > 0.0 else edge
-        now_ms = int(utcnow().timestamp() * 1000.0)
-        market_id = str(getattr(signal, "market_id", "") or "").strip()
         edge_tracker_key = f"{market_id}|{direction}|{active_mode}" if market_id else ""
         min_edge_persistence_ms = max(
             0,
@@ -2246,6 +2391,11 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         default_entry_price_floor = (
             maker_entry_price_floor if active_mode == "maker_quote" else directional_entry_price_floor
         )
+        if active_mode == "convergence":
+            default_entry_price_floor = to_float(
+                params.get("convergence_min_price", self.default_config["convergence_min_price"]),
+                self.default_config["convergence_min_price"],
+            )
         if regime == "closing":
             default_entry_price_floor = max(default_entry_price_floor, 0.05)
         entry_price_floor = clamp(
@@ -2284,6 +2434,18 @@ class BtcEthConvergenceStrategy(BaseStrategy):
                 )
             else:
                 default_entry_price_ceiling = maker_entry_price_ceiling
+        elif active_mode == "convergence":
+            default_entry_price_ceiling = clamp(
+                to_float(
+                    params.get(
+                        "convergence_max_entry_price",
+                        self.default_config["convergence_max_entry_price"],
+                    ),
+                    self.default_config["convergence_max_entry_price"],
+                ),
+                0.01,
+                1.0,
+            )
         else:
             if direction == "buy_yes":
                 default_entry_price_ceiling = clamp(
@@ -2326,7 +2488,9 @@ class BtcEthConvergenceStrategy(BaseStrategy):
             )
         )
         if min_execution_adjusted_edge_percent is None:
-            min_execution_adjusted_edge_percent = 0.0
+            min_execution_adjusted_edge_percent = float(
+                self.default_config["min_execution_adjusted_edge_percent"]
+            )
 
         # --- Decision checks ---
         checks = [
@@ -2591,6 +2755,31 @@ class BtcEthConvergenceStrategy(BaseStrategy):
                 )
             )
 
+        score = min(
+            to_float(
+                params.get("convergence_max_score", self.default_config["convergence_max_score"]),
+                self.default_config["convergence_max_score"],
+            ),
+            to_float(
+                params.get("convergence_base_score", self.default_config["convergence_base_score"]),
+                self.default_config["convergence_base_score"],
+            )
+            + abs(to_float(payload.get("oracle_diff_pct"), 0.0)) * 100.0,
+        )
+        all_checks_passed = all(check.passed for check in checks)
+        debug_decision_payload = to_bool(
+            params.get("debug_decision_payload"),
+            bool(self.default_config["debug_decision_payload"]),
+        )
+        if not all_checks_passed and not debug_decision_payload:
+            return StrategyDecision(
+                decision="skipped",
+                reason="Crypto worker filters not met",
+                score=score,
+                checks=checks,
+                payload={},
+            )
+
         failed_check_keys = [
             str(getattr(check, "key", "") or "").strip()
             for check in checks
@@ -2609,7 +2798,7 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         age_present_but_unavailable = int(oracle_status.get("availability_state") == "age_present_but_unavailable")
 
         # --- Build shared payload dict ---
-        decision_payload: dict[str, Any] = {
+        decision_payload = self._build_decision_payload({
             "requested_mode": requested_mode,
             "active_mode": active_mode,
             "dominant_mode": dominant_mode,
@@ -2794,13 +2983,11 @@ class BtcEthConvergenceStrategy(BaseStrategy):
                 "live_market": _json_safe(live_market),
                 "oracle_status": _json_safe(oracle_status),
             },
-        }
+        })
         if maker_execution_plan_override is not None:
             decision_payload["execution_plan_override"] = maker_execution_plan_override
 
-        score = (edge_for_gate * 0.7) + (confidence * 30.0)
-
-        if not all(c.passed for c in checks):
+        if not all_checks_passed:
             return StrategyDecision(
                 decision="skipped",
                 reason="Crypto worker filters not met",
@@ -2810,23 +2997,23 @@ class BtcEthConvergenceStrategy(BaseStrategy):
             )
 
         # --- Position sizing ---
-        # Historical data shows edge calibration is inverted: higher reported
-        # edge correlates with worse outcomes. Use a conservative, capped
-        # edge boost that penalises suspiciously large edges.
-        edge_excess = max(0.0, edge_for_gate - required_edge)
-        if edge_excess > 15.0:
-            # Suspiciously large edge — size DOWN (inverted calibration)
-            edge_boost = max(0.5, 1.0 - (edge_excess - 15.0) / 60.0)
-        else:
-            # Moderate edge — small linear boost, capped
-            edge_boost = 1.0 + min(edge_excess / 50.0, 0.3)
-        conf_boost = 0.8 + (confidence * 0.8)
+        resolved_entry_price = entry_price_for_execution if entry_price_for_execution is not None else 0.90
+        p_win = clamp(
+            to_float(payload.get("p_win"), resolved_entry_price + (edge_for_gate / 100.0)),
+            0.0,
+            1.0,
+        )
         size = (
-            base_size
+            self._convergence_kelly_size(
+                params,
+                base_size=base_size,
+                max_size=max_size,
+                p_win=p_win,
+                entry_price=resolved_entry_price,
+                confidence=confidence,
+            )
             * _MODE_SIZE_FACTORS.get(active_mode, 1.0)
             * _REGIME_SIZE_FACTORS.get(regime, 1.0)
-            * edge_boost
-            * conf_boost
             * oracle_size_multiplier
             * edge_calibration_size_multiplier
             * edge_calibration_bucket_multiplier
@@ -3893,6 +4080,47 @@ class BtcEthConvergenceStrategy(BaseStrategy):
     def should_exit(self, position: Any, market_state: dict) -> ExitDecision:
         if market_state.get("is_resolved"):
             return self.default_exit_check(position, market_state)
+        position_config = getattr(position, "config", None)
+        exit_config = {**self.default_config, **(self.config or {})}
+        if isinstance(position_config, dict):
+            exit_config.update(position_config)
+        strategy_context = getattr(position, "strategy_context", None)
+        strategy_context = strategy_context if isinstance(strategy_context, dict) else {}
+        initial_oracle_diff = self._float(strategy_context.get("oracle_diff_pct"))
+        current_oracle_diff = self._float(
+            _first_present(
+                market_state.get("oracle_diff_pct"),
+                (market_state.get("oracle_status") or {}).get("diff_pct")
+                if isinstance(market_state.get("oracle_status"), dict)
+                else None,
+            )
+        )
+        seconds_left = self._float(
+            _first_present(market_state.get("seconds_left"), strategy_context.get("seconds_left"))
+        )
+        min_seconds_left = to_float(
+            exit_config.get("convergence_min_seconds_left"),
+            self.default_config["convergence_min_seconds_left"],
+        )
+        oracle_flip = (
+            initial_oracle_diff is not None
+            and current_oracle_diff is not None
+            and initial_oracle_diff * current_oracle_diff < 0.0
+        )
+        if (
+            to_bool(exit_config.get("exit_on_oracle_flip"), self.default_config["exit_on_oracle_flip"])
+            and oracle_flip
+            and seconds_left is not None
+            and seconds_left > min_seconds_left
+        ):
+            return ExitDecision(
+                "close",
+                (
+                    f"Oracle direction flipped ({initial_oracle_diff:+.4f}% -> "
+                    f"{current_oracle_diff:+.4f}%)"
+                ),
+                close_price=self._float(market_state.get("current_price")),
+            )
         evaluation = self._evaluate_local_exit(position, market_state)
         config = evaluation.get("config")
         if isinstance(config, dict):
@@ -3949,12 +4177,20 @@ class BtcEthConvergenceStrategy(BaseStrategy):
             defaults = self.config
             max_streak = max(
                 1,
-                int(to_float(defaults.get("max_consecutive_losses_before_pause"), 3.0)),
+                int(
+                    to_float(
+                        defaults.get("max_consecutive_losses_before_pause"),
+                        self.default_config["max_consecutive_losses_before_pause"],
+                    )
+                ),
             )
             if self._consecutive_losses >= max_streak:
                 pause_minutes = max(
                     1.0,
-                    to_float(defaults.get("consecutive_loss_pause_minutes"), 15.0),
+                    to_float(
+                        defaults.get("consecutive_loss_pause_minutes"),
+                        self.default_config["consecutive_loss_pause_minutes"],
+                    ),
                 )
                 self._paused_until_ms = int(utcnow().timestamp() * 1000.0) + int(pause_minutes * 60_000)
                 logger.warning(
@@ -3966,7 +4202,10 @@ class BtcEthConvergenceStrategy(BaseStrategy):
 
     def _circuit_breaker_active(self) -> bool:
         defaults = self.config
-        if not to_bool(defaults.get("consecutive_loss_pause_enabled"), True):
+        if not to_bool(
+            defaults.get("consecutive_loss_pause_enabled"),
+            self.default_config["consecutive_loss_pause_enabled"],
+        ):
             return False
         if self._paused_until_ms <= 0:
             return False
@@ -4093,6 +4332,73 @@ class BtcEthConvergenceStrategy(BaseStrategy):
 
             regime = str(market.get("regime") or self._crypto_regime(seconds_left, timeframe_seconds))
 
+            min_seconds_left = max(
+                0.0,
+                to_float(
+                    defaults.get("convergence_min_seconds_left", self.default_config["convergence_min_seconds_left"]),
+                    self.default_config["convergence_min_seconds_left"],
+                ),
+            )
+            max_seconds_left = max(
+                min_seconds_left,
+                to_float(
+                    defaults.get("convergence_max_seconds_left", self.default_config["convergence_max_seconds_left"]),
+                    self.default_config["convergence_max_seconds_left"],
+                ),
+            )
+            convergence_window_ok = min_seconds_left <= seconds_left <= max_seconds_left
+            gates.append(GateResult(
+                "convergence_window",
+                "Convergence entry window",
+                convergence_window_ok,
+                score=float(seconds_left),
+                detail=f"seconds_left={seconds_left:.1f} window=[{min_seconds_left:.1f},{max_seconds_left:.1f}]",
+            ))
+            if not convergence_window_ok:
+                rejections.append({
+                    "market": market.get("slug") or market_id,
+                    "asset": asset or "?",
+                    "timeframe": timeframe or "?",
+                    "gate": "convergence_window",
+                    "seconds_left": seconds_left,
+                })
+                _emit_reject(MURMUR)
+                continue
+
+            oracle_age_ms = self._float(oracle_status.get("age_ms"))
+            max_oracle_age_ms_cfg = self._float(
+                _timeframe_override(defaults, "max_oracle_age_ms", timeframe)
+            )
+            if max_oracle_age_ms_cfg is None:
+                max_oracle_age_ms_cfg = self._float(defaults.get("max_oracle_age_ms"))
+            max_oracle_age_ms = (
+                max(100.0, max_oracle_age_ms_cfg)
+                if max_oracle_age_ms_cfg is not None
+                else default_max_oracle_age_ms(timeframe)
+            )
+            oracle_fresh = bool(has_oracle and oracle_age_ms is not None and oracle_age_ms <= max_oracle_age_ms)
+            gates.append(GateResult(
+                "oracle_freshness",
+                "Fresh directional oracle",
+                oracle_fresh,
+                score=oracle_age_ms,
+                detail=(
+                    f"age_ms={oracle_age_ms if oracle_age_ms is not None else 'missing'} "
+                    f"max_ms={max_oracle_age_ms:.0f}"
+                ),
+            ))
+            if not oracle_fresh:
+                rejections.append({
+                    "market": market.get("slug") or market_id,
+                    "asset": asset or "?",
+                    "timeframe": timeframe or "?",
+                    "gate": "oracle_freshness",
+                    "oracle_age_ms": oracle_age_ms,
+                    "max_oracle_age_ms": max_oracle_age_ms,
+                })
+                _emit_reject(MURMUR)
+                continue
+
             # --- Latency-arb detect: only signal when oracle shows decisive move ---
             # The oracle (Binance direct WS) updates 30-90s before the Polymarket
             # order book reprices.  diff_pct/oracle_move_pct are stamped by
@@ -4110,8 +4416,11 @@ class BtcEthConvergenceStrategy(BaseStrategy):
 
             # Gate 1: Minimum oracle move — small moves are noise, not signal.
             min_oracle_move = to_float(
-                _crypto_hf_param_value(defaults, "min_oracle_move_pct", timeframe),
-                _coerce_float(self._default_param("min_oracle_move_pct", timeframe), 0.30, 0.0, 100.0),
+                defaults.get(
+                    "convergence_min_oracle_diff_pct",
+                    self.default_config["convergence_min_oracle_diff_pct"],
+                ),
+                self.default_config["convergence_min_oracle_diff_pct"],
             )
             oracle_move_ok = oracle_move_pct >= min_oracle_move
             gates.append(GateResult(
@@ -4137,61 +4446,6 @@ class BtcEthConvergenceStrategy(BaseStrategy):
                 _emit_reject(MURMUR)
                 continue
 
-            # Gate 2: Price lag detection — only enter when Polymarket hasn't
-            # repriced to reflect the oracle move.  If the contract price on our
-            # predicted winning side is already expensive, there's no lag to exploit.
-            max_repricing = to_float(
-                _crypto_hf_param_value(defaults, "max_market_repricing_for_entry", timeframe),
-                _coerce_float(
-                    self._default_param("max_market_repricing_for_entry", timeframe),
-                    0.30,
-                    0.0,
-                    1.0,
-                ),
-            )
-            repricing_ceiling = round(0.50 + max_repricing, 3)
-            if diff_pct > 0 and up_price > repricing_ceiling:
-                gates.append(GateResult(
-                    "not_repriced", "Polymarket hasn't repriced (YES)", False,
-                    score=float(up_price),
-                    detail=f"up_price={up_price:.4f} ceiling={repricing_ceiling:.4f}",
-                ))
-                rejections.append({
-                    "market": market.get("slug") or market_id,
-                    "asset": asset or "?",
-                    "timeframe": timeframe or "?",
-                    "gate": "repriced",
-                    "side": "YES",
-                    "price": up_price,
-                    "max_price": repricing_ceiling,
-                    "oracle_move_pct": round(oracle_move_pct, 4),
-                })
-                _emit_reject(MURMUR)
-                continue  # YES side already repriced — no lag
-            if diff_pct < 0 and down_price > repricing_ceiling:
-                gates.append(GateResult(
-                    "not_repriced", "Polymarket hasn't repriced (NO)", False,
-                    score=float(down_price),
-                    detail=f"down_price={down_price:.4f} ceiling={repricing_ceiling:.4f}",
-                ))
-                rejections.append({
-                    "market": market.get("slug") or market_id,
-                    "asset": asset or "?",
-                    "timeframe": timeframe or "?",
-                    "gate": "repriced",
-                    "side": "NO",
-                    "price": down_price,
-                    "max_price": repricing_ceiling,
-                    "oracle_move_pct": round(oracle_move_pct, 4),
-                })
-                _emit_reject(MURMUR)
-                continue  # NO side already repriced — no lag
-            gates.append(GateResult(
-                "not_repriced", "Polymarket hasn't repriced", True,
-                score=float(up_price if diff_pct > 0 else down_price),
-                detail=f"side={'YES' if diff_pct > 0 else 'NO'} price={up_price if diff_pct > 0 else down_price:.4f} ceiling={repricing_ceiling:.4f}",
-            ))
-
             spread = clamp(self._float(market.get("spread")) or 0.0, 0.0, 0.10)
             liquidity = max(0.0, self._float(market.get("liquidity")) or 0.0)
 
@@ -4203,33 +4457,99 @@ class BtcEthConvergenceStrategy(BaseStrategy):
                 direction = "buy_no"
                 entry_price = down_price
 
+            min_entry_price = clamp(
+                to_float(
+                    defaults.get("convergence_min_price", self.default_config["convergence_min_price"]),
+                    self.default_config["convergence_min_price"],
+                ),
+                0.0,
+                1.0,
+            )
+            max_entry_price = clamp(
+                to_float(
+                    defaults.get(
+                        "convergence_max_entry_price",
+                        self.default_config["convergence_max_entry_price"],
+                    ),
+                    self.default_config["convergence_max_entry_price"],
+                ),
+                min_entry_price,
+                1.0,
+            )
+            entry_price_ok = min_entry_price <= entry_price <= max_entry_price
+            gates.append(GateResult(
+                "convergence_price",
+                "Favored-side convergence price",
+                entry_price_ok,
+                score=float(entry_price),
+                detail=f"entry={entry_price:.4f} range=[{min_entry_price:.4f},{max_entry_price:.4f}]",
+            ))
+            if not entry_price_ok:
+                rejections.append({
+                    "market": market.get("slug") or market_id,
+                    "asset": asset or "?",
+                    "timeframe": timeframe or "?",
+                    "gate": "convergence_price",
+                    "entry_price": entry_price,
+                })
+                _emit_reject(MURMUR)
+                continue
+
             elapsed_ratio = clamp(
                 1.0 - (seconds_left / float(max(1, timeframe_seconds))),
                 0.0,
                 1.0,
             )
-            base_confidence = clamp(
-                0.55
-                + clamp(oracle_move_pct / 10.0, 0.0, 0.25)
-                + clamp(elapsed_ratio * 0.15, 0.0, 0.15),
-                0.55,
-                0.92,
+            side_oracle_diff_pct = diff_pct if direction == "buy_yes" else -diff_pct
+            metrics = self._convergence_metrics(
+                defaults,
+                oracle_diff_pct=side_oracle_diff_pct,
+                elapsed_ratio=elapsed_ratio,
+                entry_price=entry_price,
             )
+            p_win = metrics["p_win"]
+            edge_percent = metrics["net_edge_percent"]
+            score = metrics["score"]
+            if edge_percent <= 0.0:
+                gates.append(GateResult(
+                    "fee_adjusted_edge",
+                    "Fee-adjusted convergence edge",
+                    False,
+                    score=float(edge_percent),
+                    detail=(
+                        f"gross={metrics['gross_edge_percent']:.4f}% "
+                        f"fee={metrics['fee_edge_percent']:.4f}% net={edge_percent:.4f}%"
+                    ),
+                ))
+                rejections.append({
+                    "market": market.get("slug") or market_id,
+                    "asset": asset or "?",
+                    "timeframe": timeframe or "?",
+                    "gate": "fee_adjusted_edge",
+                    "net_edge_percent": edge_percent,
+                })
+                _emit_reject(MURMUR)
+                continue
+            gates.append(GateResult(
+                "fee_adjusted_edge",
+                "Fee-adjusted convergence edge",
+                True,
+                score=float(edge_percent),
+                detail=(
+                    f"gross={metrics['gross_edge_percent']:.4f}% "
+                    f"fee={metrics['fee_edge_percent']:.4f}% net={edge_percent:.4f}%"
+                ),
+            ))
+
+            base_confidence = clamp(0.50 + abs(p_win - 0.50), 0.30, 0.97)
             ml_probability_yes = _market_ml_probability_yes(market)
             if ml_probability_yes is not None:
                 ml_probability_yes = clamp(ml_probability_yes, 0.03, 0.97)
-                expected_prob = ml_probability_yes if direction == "buy_yes" else (1.0 - ml_probability_yes)
-                model_edge_percent = max(0.0, (expected_prob - entry_price) * 100.0)
-                edge_percent = max(oracle_move_pct, model_edge_percent)
-                confidence = clamp(
-                    max(base_confidence, 0.48 + (abs(ml_probability_yes - 0.5) * 1.1)),
-                    0.55,
-                    0.97,
-                )
+                ml_conviction = abs(ml_probability_yes - 0.50) * 2.0
+                confidence = clamp(base_confidence * (0.75 + 0.25 * ml_conviction), 0.30, 0.97)
             else:
-                edge_percent = oracle_move_pct
                 confidence = base_confidence
-            min_required_edge = 0.0  # evaluate() handles final gating
+            min_required_edge = metrics["fee_edge_percent"]
 
             side = "YES" if direction == "buy_yes" else "NO"
             slug = market.get("slug") or market_id
@@ -4251,6 +4571,9 @@ class BtcEthConvergenceStrategy(BaseStrategy):
                 live_market_fetched_at=live_market_fetched_at,
                 market_data_age_ms=market_data_age_ms,
                 signal_family="crypto_maker", token_id=position_token_id,
+                p_win=p_win, convergence_score=score,
+                gross_edge_percent=metrics["gross_edge_percent"],
+                fee_edge_percent=metrics["fee_edge_percent"],
             )
             if opp is not None:
                 emit_emit_nowait(
@@ -4292,12 +4615,14 @@ class BtcEthConvergenceStrategy(BaseStrategy):
 
         oracle_rejections = [r for r in rejections if r["gate"] == "oracle_move"]
         max_oracle_move = max((r["oracle_move_pct"] for r in oracle_rejections), default=0.0)
-        repriced_count = sum(1 for r in rejections if r["gate"] == "repriced")
         thresholds_percent = {
             timeframe_key: round(
                 to_float(
-                    _crypto_hf_param_value(defaults, "min_oracle_move_pct", timeframe_key),
-                    _coerce_float(self._default_param("min_oracle_move_pct", timeframe_key), 0.30, 0.0, 100.0),
+                    defaults.get(
+                        "convergence_min_oracle_diff_pct",
+                        self.default_config["convergence_min_oracle_diff_pct"],
+                    ),
+                    self.default_config["convergence_min_oracle_diff_pct"],
                 ),
                 4,
             )
@@ -4318,13 +4643,11 @@ class BtcEthConvergenceStrategy(BaseStrategy):
             "message": (
                 f"Scanned {len(markets)} markets, {len(opportunities)} signals"
                 f" \u2014 {len(oracle_rejections)} below oracle threshold"
-                f" ({round(min_threshold, 4)}%-{round(max_threshold, 4)}%, max seen {round(max_oracle_move, 4)}%),"
-                f" {repriced_count} already repriced"
+                f" ({round(min_threshold, 4)}%-{round(max_threshold, 4)}%, max seen {round(max_oracle_move, 4)}%)"
             ),
             "thresholds_percent": thresholds_percent,
             "summary": {
                 "oracle_move": len(oracle_rejections),
-                "repriced": repriced_count,
                 "max_oracle_move_pct": round(max_oracle_move, 4),
                 "oracle_rejections_by_timeframe": dict(sorted(oracle_rejections_by_timeframe.items())),
                 "thresholds_percent": thresholds_percent,
@@ -4364,6 +4687,10 @@ class BtcEthConvergenceStrategy(BaseStrategy):
         market_data_age_ms,
         signal_family: str,
         token_id,
+        p_win: float,
+        convergence_score: float,
+        gross_edge_percent: float,
+        fee_edge_percent: float,
     ):
         """Build and return an Opportunity for the detect/on_event path."""
         opp = self.create_opportunity(
@@ -4404,6 +4731,10 @@ class BtcEthConvergenceStrategy(BaseStrategy):
                         "oracle_prices_by_source": _json_safe(market.get("oracle_prices_by_source") or {}),
                         "machine_learning": _json_safe(_market_ml_contract(market) or {}),
                         "oracle_diff_pct": diff_pct,
+                        "p_win": p_win,
+                        "convergence_score": convergence_score,
+                        "gross_edge_percent": gross_edge_percent,
+                        "fee_edge_percent": fee_edge_percent,
                         "taker_fee_gate": min_required_edge,
                         "edge_percent": edge_percent,
                         "spread": spread,
@@ -4427,10 +4758,10 @@ class BtcEthConvergenceStrategy(BaseStrategy):
                 }
             ],
             is_guaranteed=False,
-            skip_fee_model=True,
             custom_roi_percent=edge_percent,
             custom_risk_score=1.0 - confidence,
             confidence=confidence,
+            fee_model_maker_mode=False,
         )
         if opp is not None:
             opp.risk_factors = [
@@ -4460,6 +4791,10 @@ class BtcEthConvergenceStrategy(BaseStrategy):
                 "oracle_prices_by_source": _json_safe(market.get("oracle_prices_by_source") or {}),
                 "machine_learning": _json_safe(_market_ml_contract(market) or {}),
                 "oracle_diff_pct": diff_pct,
+                "p_win": p_win,
+                "convergence_score": convergence_score,
+                "gross_edge_percent": gross_edge_percent,
+                "fee_edge_percent": fee_edge_percent,
                 "taker_fee_gate": min_required_edge,
                 "edge_percent": edge_percent,
                 "spread": spread,
