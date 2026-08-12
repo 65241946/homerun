@@ -1,6 +1,7 @@
 import sys
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -95,6 +96,40 @@ async def test_initialize_services_schedules_live_execution_in_background(monkey
 
     release.set()
     await asyncio.gather(*worker_host._background_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_missing_credentials_are_probed_without_repeating_initialize_error(monkeypatch):
+    worker_host = host.WorkerHost("all")
+    worker_host._shutting_down = False
+    last_error = {"value": None}
+
+    async def initialize_once():
+        last_error["value"] = "missing_polymarket_credentials"
+        return False
+
+    initialize_mock = AsyncMock(side_effect=initialize_once)
+    resolve_mock = AsyncMock(return_value=(None, None, None, None, "none"))
+    sleep_calls = 0
+
+    async def stop_after_second_backoff(_delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            worker_host._shutting_down = True
+
+    monkeypatch.setattr(host.live_execution_service, "is_ready", lambda: False)
+    monkeypatch.setattr(host.live_execution_service, "initialize", initialize_mock)
+    monkeypatch.setattr(host.live_execution_service, "get_last_init_error", lambda: last_error["value"])
+    monkeypatch.setattr(host.live_execution_service, "_resolve_polymarket_credentials", resolve_mock)
+    monkeypatch.setattr(host.asyncio, "sleep", stop_after_second_backoff)
+    monkeypatch.setattr(host, "_MISSING_CREDENTIALS_WARNING_INTERVAL_SECONDS", 0.0)
+
+    await worker_host._initialize_live_execution_background()
+
+    initialize_mock.assert_awaited_once()
+    resolve_mock.assert_awaited_once()
+
 
 
 @pytest.mark.asyncio

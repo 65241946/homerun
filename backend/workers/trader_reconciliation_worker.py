@@ -465,11 +465,11 @@ def _wallet_monitor_snapshot_stats() -> dict[str, Any]:
 
 async def _sync_live_wallet_monitor_source(current_wallet: str) -> str:
     execution_wallet = ""
-    try:
-        if await live_execution_service.ensure_initialized():
+    if live_execution_service.is_ready():
+        try:
             execution_wallet = str(live_execution_service.get_execution_wallet_address() or "").strip().lower()
-    except Exception as exc:
-        logger.warning("Failed to initialize trading service for wallet WS monitor sync", exc_info=exc)
+        except Exception as exc:
+            logger.warning("Failed to resolve wallet for reconciliation WS monitor", exc_info=exc)
 
     if execution_wallet != current_wallet:
         wallet_ws_monitor.set_wallets_for_source(WORKER_NAME, [execution_wallet] if execution_wallet else [])
@@ -712,6 +712,21 @@ async def _sync_live_wallet_positions() -> None:
 # "trader idle for 5s on boot".
 _WALLET_CACHE_RESEED_INTERVAL_SECONDS = 30.0
 _WALLET_CACHE_RESEED_BOOTSTRAP_INTERVAL_SECONDS = 5.0
+_WALLET_CACHE_NOT_READY_WARNING_INTERVAL_SECONDS = 300.0
+_wallet_cache_not_ready_last_warning_mono = 0.0
+
+
+def _warn_wallet_cache_not_ready(message: str, **context: Any) -> None:
+    global _wallet_cache_not_ready_last_warning_mono
+    now_mono = time.monotonic()
+    if (
+        _wallet_cache_not_ready_last_warning_mono > 0.0
+        and now_mono - _wallet_cache_not_ready_last_warning_mono
+        < _WALLET_CACHE_NOT_READY_WARNING_INTERVAL_SECONDS
+    ):
+        return
+    _wallet_cache_not_ready_last_warning_mono = now_mono
+    logger.warning(message, **context)
 
 
 async def _run_wallet_cache_reseeder_loop(stop_event: asyncio.Event) -> None:
@@ -845,56 +860,35 @@ async def _reseed_wallet_state_cache_from_rest() -> None:
     Call sites: ``_sync_live_wallet_positions`` (every 30s) and
     bootstrap path.  No direct exposure to the orchestrator hot path.
 
-    Robust bootstrap contract: if ``live_execution_service`` is not yet
-    initialized (e.g. credentials still loading, or a prior init failed
-    silently), this function calls ``ensure_initialized()`` to drive the
-    retry — silent no-ops here would leave the freshness gate refusing
-    every cycle indefinitely.  As a final fallback, if init still
-    refuses but the WalletStateCache already has a wallet pinned (from
-    ``polymarket_user_feed.configure_credentials``), seed against that
-    wallet directly so the freshness gate can clear.
+    The worker host owns live-client initialization and credential retries.
+    This reseeder does not duplicate that loop: when the service is not ready,
+    it either uses an already pinned cache wallet for public REST reads or
+    returns with a throttled diagnostic.  This prevents the bootstrap 5-second
+    cadence from repeating the live initializer's missing-credential ERROR.
     """
     from services.wallet_state_cache import get_wallet_state_cache
 
     cache = get_wallet_state_cache()
 
-    # Try to recover from a stuck init by driving a retry.  This is the
-    # difference between "trading silently blocked for hours" and
-    # "trading recovers within one reseeder tick after creds load".
     if not live_execution_service.is_ready():
-        try:
-            recovered = await asyncio.wait_for(
-                live_execution_service.ensure_initialized(),
-                timeout=20.0,
+        # Last-resort: use the wallet the cache was pinned to via the
+        # user-channel WS credential wiring.  If that's also empty,
+        # there is genuinely nothing to seed against.  Shadow execution
+        # does not consult this live-wallet cache; live remains blocked by
+        # the unchanged freshness gate until host initialization succeeds.
+        cache_wallet = cache.wallet_address()
+        if not cache_wallet:
+            _warn_wallet_cache_not_ready(
+                "WalletStateCache reseeder skipped: live execution is not ready "
+                "and the cache has no pinned wallet",
+                last_init_error=live_execution_service.get_last_init_error(),
             )
-        except asyncio.TimeoutError:
-            recovered = False
-        except Exception as exc:
-            logger.warning(
-                "WalletStateCache reseeder: ensure_initialized() raised; "
-                "falling back to cache-pinned wallet if available",
-                exc_info=exc,
-            )
-            recovered = False
-        if not recovered:
-            # Last-resort: use the wallet the cache was pinned to via the
-            # user-channel WS credential wiring.  If that's also empty,
-            # there is genuinely nothing to seed against.
-            cache_wallet = cache.wallet_address()
-            if not cache_wallet:
-                logger.warning(
-                    "WalletStateCache reseeder skipped: live_execution_service "
-                    "not ready and cache has no pinned wallet; the freshness "
-                    "gate will keep refusing trades.  Last init error: %s",
-                    live_execution_service.get_last_init_error(),
-                )
-                return
-            logger.warning(
-                "WalletStateCache reseeder using cache-pinned wallet=%s "
-                "(live_execution_service not ready, last_init_error=%s)",
-                cache_wallet,
-                live_execution_service.get_last_init_error(),
-            )
+            return
+        _warn_wallet_cache_not_ready(
+            "WalletStateCache reseeder using cache-pinned wallet while live execution is not ready",
+            wallet=cache_wallet,
+            last_init_error=live_execution_service.get_last_init_error(),
+        )
 
     cache_wallet = cache.wallet_address()
     wallet_address = (
