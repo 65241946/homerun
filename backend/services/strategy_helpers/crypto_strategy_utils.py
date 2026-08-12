@@ -27,6 +27,7 @@ from services.strategies.crypto_strategy_utils import (  # noqa: F401
     normalize_timeframe,
     parse_datetime_utc,
     pick_oracle_source,
+    realized_vol_per_sec,
     seconds_left_from_row,
     spread_pct_from_row,
     taker_fee_pct,

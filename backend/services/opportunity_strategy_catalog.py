@@ -1051,6 +1051,15 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                     "default": 5000,
                     "phase": "signal",
                 },
+                {
+                    "key": "win_prob_estimate",
+                    "label": "Fallback Win Probability",
+                    "type": "number",
+                    "min": 0.0,
+                    "max": 1.0,
+                    "default": 0.80,
+                    "phase": "signal",
+                },
             ]
         },
     ),
@@ -1137,7 +1146,8 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                     "type": "integer",
                     "min": 250,
                     "max": 60000,
-                    "default": 4000,
+                    "default": None,
+                    "description": "Optional override; blank uses the timeframe-aware crypto default.",
                     "phase": "signal",
                 },
                 {
@@ -1169,11 +1179,12 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                 },
                 {
                     "key": "fee_buffer",
-                    "label": "Fee buffer ($/share)",
+                    "label": "Extra fee margin ($/share)",
                     "type": "number",
                     "min": 0.0,
                     "max": 0.10,
-                    "default": 0.015,
+                    "default": 0.0,
+                    "description": "Extra model-error margin after the canonical per-side taker fee.",
                     "phase": "execution",
                 },
                 {
@@ -1240,6 +1251,23 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                     "phase": "signal",
                 },
                 {
+                    "key": "missing_recent_move_zscore_policy",
+                    "label": "Missing recent-move z-score policy",
+                    "type": "select",
+                    "options": ["reject", "reduce_confidence"],
+                    "default": "reduce_confidence",
+                    "phase": "signal",
+                },
+                {
+                    "key": "missing_recent_move_confidence_multiplier",
+                    "label": "Missing z-score confidence multiplier",
+                    "type": "number",
+                    "min": 0.0,
+                    "max": 1.0,
+                    "default": 0.80,
+                    "phase": "signal",
+                },
+                {
                     "key": "bet_size_usd",
                     "label": "Bet size (USD)",
                     "type": "number",
@@ -1279,6 +1307,14 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                     "phase": "signal",
                 },
                 {
+                    "key": "distance_cost_tiers_bps",
+                    "label": "Distance(bps)→Min-Cost(¢) Tiers",
+                    "type": "json",
+                    "default": [],
+                    "description": "When non-empty, these price-regime-neutral tiers take priority over USD tiers.",
+                    "phase": "signal",
+                },
+                {
                     "key": "max_cost_cents",
                     "label": "Max Cost (¢)",
                     "type": "number",
@@ -1302,7 +1338,7 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                     "type": "number",
                     "min": 0.0,
                     "max": 900.0,
-                    "default": 10.0,
+                    "default": 60.0,
                     "phase": "signal",
                 },
                 {
@@ -1311,7 +1347,8 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                     "type": "integer",
                     "min": 0,
                     "max": 60000,
-                    "default": 5000,
+                    "default": None,
+                    "description": "Optional override; blank uses the timeframe-aware crypto default.",
                     "phase": "signal",
                 },
                 {
@@ -1422,7 +1459,7 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
             "param_fields": [
                 {"key": "min_edge_percent", "label": "Min Edge (%)", "type": "number", "min": 0, "max": 100},
                 {"key": "min_confidence", "label": "Min Confidence", "type": "number", "min": 0, "max": 1},
-                {"key": "min_entropy", "label": "Min Entropy", "type": "number", "min": 0, "max": 1},
+                {"key": "min_entropy", "label": "Min Entropy", "type": "number", "default": 0.0, "min": 0, "max": 1},
                 {"key": "min_spread_pct", "label": "Min Spread", "type": "number", "min": 0, "max": 1},
                 {"key": "max_spread_pct", "label": "Max Spread", "type": "number", "min": 0, "max": 1},
                 {
@@ -1438,14 +1475,23 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                     "type": "number",
                     "min": 0,
                     "max": 1,
+                    "description": "Bonus threshold for cancel-recovery scoring; not a filter.",
                 },
-                {"key": "min_cancel_drop", "label": "Min Cancel Drop", "type": "number", "min": 0, "max": 1},
+                {
+                    "key": "min_cancel_drop",
+                    "label": "Min Cancel Drop",
+                    "type": "number",
+                    "min": 0,
+                    "max": 1,
+                    "description": "Bonus threshold for cancel-recovery scoring; not a filter.",
+                },
                 {
                     "key": "min_orderflow_alignment",
                     "label": "Min Orderflow Alignment",
                     "type": "number",
                     "min": 0,
                     "max": 1,
+                    "description": "Bonus threshold for orderflow scoring; not a filter.",
                 },
                 {
                     "key": "min_recent_move_zscore",
@@ -1453,6 +1499,7 @@ SYSTEM_OPPORTUNITY_STRATEGY_SEEDS: list[SystemOpportunityStrategySeed] = [
                     "type": "number",
                     "min": 0,
                     "max": 10,
+                    "description": "Bonus threshold for recent-move scoring; not a filter.",
                 },
                 {"key": "min_liquidity_usd", "label": "Min Liquidity (USD)", "type": "number", "min": 0},
                 {
