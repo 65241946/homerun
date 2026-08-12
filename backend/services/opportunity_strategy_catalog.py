@@ -259,10 +259,13 @@ _SCANNER_SCHEMA_CERTAINTY_SHOCK = {
     "param_fields": [
         *_COMMON_SCANNER_SCHEMA["param_fields"][:3],
         {"key": "shock_lookback_seconds", "label": "Lookback (sec)", "type": "number", "min": 60, "phase": "signal"},
+        {"key": "shock_recent_window_seconds", "label": "Recent Shock Window (sec)", "type": "number", "min": 60, "phase": "signal"},
+        {"key": "shock_recent_share_min", "label": "Min Recent Move Share", "type": "number", "min": 0, "max": 1, "phase": "signal"},
         {"key": "shock_min_abs_move", "label": "Min Absolute Move", "type": "number", "min": 0.05, "max": 1, "phase": "signal"},
         {"key": "shock_max_retrace", "label": "Max Retrace", "type": "number", "min": 0, "max": 1, "phase": "signal"},
         {"key": "shock_min_favored_price", "label": "Min Favored Price", "type": "number", "min": 0.01, "max": 0.99, "phase": "signal"},
         {"key": "shock_target_certainty", "label": "Target Certainty", "type": "number", "min": 0.5, "max": 0.995, "phase": "signal"},
+        {"key": "shock_min_expected_move", "label": "Min Expected Move", "type": "number", "min": 0, "max": 1, "phase": "signal"},
         {"key": "min_days_to_deadline", "label": "Min Days To Deadline", "type": "number", "min": 0, "max": 365, "phase": "signal"},
         {"key": "max_days_to_deadline", "label": "Max Days To Deadline", "type": "number", "min": 0, "max": 365, "phase": "signal"},
         {"key": "exclude_market_keywords", "label": "Exclude Market Keywords", "type": "list", "phase": "signal"},
