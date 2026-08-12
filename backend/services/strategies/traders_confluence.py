@@ -25,7 +25,14 @@ from typing import Any, Optional
 
 from models import Opportunity, Event, Market, Token
 from models.opportunity import MispricingType
-from services.strategies.base import BaseStrategy, DecisionCheck, ScoringWeights, SizingConfig, ExitDecision
+from services.strategies.base import (
+    BaseStrategy,
+    DecisionCheck,
+    ExitDecision,
+    ScoringWeights,
+    SizingConfig,
+    _trader_size_limits,
+)
 from services.data_events import DataEvent
 from services.quality_filter import QualityFilterOverrides
 from services.strategy_sdk import StrategySDK
@@ -33,6 +40,7 @@ from utils.converters import normalize_market_id, to_confidence
 from functools import partial
 from utils.converters import safe_float
 from utils.utcnow import utcnow
+from utils.signal_helpers import signal_payload
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +88,7 @@ class TradersConfluenceStrategy(BaseStrategy):
         "min_confluence_strength": 0.50,
         "min_tier": "low",
         "min_wallet_count": 2,
+        "tier_weights": {"low": 1.0, "medium": 1.5, "high": 2.0, "extreme": 3.0},
         "max_entry_price": 0.85,
         "risk_base_score": 0.40,
         "take_profit_pct": 12.0,
@@ -87,7 +96,7 @@ class TradersConfluenceStrategy(BaseStrategy):
         "firehose_require_tradable_market": True,
         "firehose_exclude_crypto_markets": False,
         "firehose_require_qualified_source": True,
-        "firehose_max_age_minutes": 720,
+        "firehose_max_age_minutes": 60,
         "firehose_source_scope": "all",
         "firehose_side_filter": "all",
         "execution_policy": "REPRICE_LOOP",
@@ -104,13 +113,21 @@ class TradersConfluenceStrategy(BaseStrategy):
     def __init__(self):
         super().__init__()
         self._config = dict(self.DEFAULT_CONFIG)
+        self.config = dict(self._config)
+        self._config_version = 0
+        self._effective_config_cache_version = -1
+        self._effective_config_cache: dict[str, Any] = {}
 
     def configure(self, config: dict) -> None:
         """Apply user config overrides from the DB config column."""
+        merged = dict(self.DEFAULT_CONFIG)
         if config:
             for key in self.DEFAULT_CONFIG:
                 if key in config:
-                    self._config[key] = config[key]
+                    merged[key] = config[key]
+        self._config = merged
+        self.config = dict(merged)
+        self._config_version += 1
 
     @property
     def pipeline_defaults(self) -> dict[str, Any]:
@@ -121,6 +138,9 @@ class TradersConfluenceStrategy(BaseStrategy):
         }
 
     def _effective_config(self) -> dict:
+        if self._effective_config_cache_version == self._config_version:
+            return dict(self._effective_config_cache)
+
         cfg = dict(self.DEFAULT_CONFIG)
         if isinstance(self._config, dict):
             cfg.update(self._config)
@@ -128,7 +148,19 @@ class TradersConfluenceStrategy(BaseStrategy):
         if isinstance(runtime_cfg, dict):
             cfg.update(runtime_cfg)
         cfg.update(StrategySDK.validate_trader_filter_config(cfg))
-        return cfg
+        cfg["tier_weights"] = self._normalize_tier_weights(cfg.get("tier_weights"))
+        self._effective_config_cache = dict(cfg)
+        self._effective_config_cache_version = self._config_version
+        return dict(cfg)
+
+    @classmethod
+    def _normalize_tier_weights(cls, raw: object) -> dict[str, float]:
+        configured = raw if isinstance(raw, dict) else {}
+        defaults = cls.DEFAULT_CONFIG["tier_weights"]
+        return {
+            tier: max(0.0, _safe_float_nan(configured.get(tier), defaults[tier]))
+            for tier in cls.TIER_ORDER
+        }
 
     @staticmethod
     def _to_bool(value: object, default: bool = False) -> bool:
@@ -160,7 +192,7 @@ class TradersConfluenceStrategy(BaseStrategy):
         return "buy" in signal_type or "sell" in signal_type or "accumulation" in signal_type
 
     @staticmethod
-    def _resolve_trade_outcome(signal: dict) -> str:
+    def _resolve_trade_outcome(signal: dict) -> Optional[str]:
         outcome = str(signal.get("outcome") or "").strip().upper()
         if outcome in {"YES", "NO"}:
             return outcome
@@ -176,7 +208,7 @@ class TradersConfluenceStrategy(BaseStrategy):
             return "YES"
         if "sell" in signal_type or "distribution" in signal_type:
             return "NO"
-        return "NO"
+        return None
 
     @staticmethod
     def _extract_outcome_labels(raw: object) -> list[str]:
@@ -262,6 +294,44 @@ class TradersConfluenceStrategy(BaseStrategy):
         return TradersConfluenceStrategy.TIER_ORDER.get(normalized, 0)
 
     @staticmethod
+    def _base_wallet_count(signal: dict) -> float:
+        cluster_adjusted_wallets = signal.get("cluster_adjusted_wallets")
+        if isinstance(cluster_adjusted_wallets, list):
+            adjusted_addresses = {
+                StrategySDK.normalize_trader_wallet(
+                    item.get("address") if isinstance(item, dict) else item
+                )
+                for item in cluster_adjusted_wallets
+            }
+            adjusted_addresses.discard("")
+            if adjusted_addresses:
+                return float(len(adjusted_addresses))
+
+        adjusted_count = _safe_float_nan(signal.get("cluster_adjusted_wallet_count"), 0.0)
+        if adjusted_count > 0.0:
+            return adjusted_count
+
+        wallets = signal.get("wallets")
+        if isinstance(wallets, list):
+            addresses = {
+                StrategySDK.normalize_trader_wallet(
+                    item.get("address") if isinstance(item, dict) else item
+                )
+                for item in wallets
+            }
+            addresses.discard("")
+            if addresses:
+                return float(len(addresses))
+
+        return max(0.0, _safe_float_nan(signal.get("wallet_count"), 0.0))
+
+    @classmethod
+    def _effective_wallet_count(cls, signal: dict, config: dict) -> float:
+        tier = StrategySDK.normalize_trader_tier(signal.get("tier"), default="low")
+        weights = cls._normalize_tier_weights(config.get("tier_weights"))
+        return cls._base_wallet_count(signal) * weights[tier]
+
+    @staticmethod
     def _parse_dt(value: object) -> Optional[datetime]:
         if isinstance(value, datetime):
             if value.tzinfo is None:
@@ -332,25 +402,17 @@ class TradersConfluenceStrategy(BaseStrategy):
         for signal in signals:
             if not isinstance(signal, dict):
                 continue
-            has_source_provenance = self._has_source_provenance(signal)
-            row = StrategySDK.normalize_trader_signal(dict(signal))
-            if not has_source_provenance:
-                row.pop("source_flags", None)
-            rows.append(row)
+            rows.append(dict(signal))
         if not rows:
             return []
 
         for row in rows:
-            has_source_provenance = self._has_source_provenance(row)
             market_id = normalize_market_id(row.get("market_id")) or ""
             row["market_id"] = market_id
             row["firehose_market_tradable"] = self._is_market_tradable(row)
             row["firehose_is_crypto"] = self._is_crypto_market(row)
             row["firehose_age_minutes"] = self._age_minutes(row)
             row["firehose_confidence"] = self._confidence(row)
-            row.update(StrategySDK.normalize_trader_signal(row))
-            if not has_source_provenance:
-                row.pop("source_flags", None)
 
         return rows
 
@@ -359,6 +421,7 @@ class TradersConfluenceStrategy(BaseStrategy):
         signal: dict,
         *,
         cfg: Optional[dict] = None,
+        normalized: bool = False,
     ) -> tuple[bool, list[str], dict[str, bool]]:
         """Evaluate one traders firehose row.
 
@@ -367,7 +430,9 @@ class TradersConfluenceStrategy(BaseStrategy):
         config = cfg or self._effective_config()
         raw_signal = signal if isinstance(signal, dict) else {}
         has_source_provenance = self._has_source_provenance(raw_signal)
-        signal = StrategySDK.normalize_trader_signal(raw_signal)
+        signal = raw_signal if normalized else StrategySDK.normalize_trader_signal(raw_signal)
+        if not has_source_provenance:
+            signal.pop("source_flags", None)
         checks: dict[str, bool] = {}
         reasons: list[str] = []
 
@@ -466,11 +531,9 @@ class TradersConfluenceStrategy(BaseStrategy):
             reasons.append("side_filtered")
 
         min_wallet_count = max(1, int(_safe_float_nan(config.get("min_wallet_count"), 2)))
-        wallet_count = int(_safe_float_nan(signal.get("cluster_adjusted_wallet_count"), 0))
-        if wallet_count <= 0:
-            wallet_count = int(_safe_float_nan(signal.get("wallet_count"), 0))
-        checks["meets_min_wallet_count"] = wallet_count >= min_wallet_count
-        if wallet_count < min_wallet_count:
+        effective_wallet_count = self._effective_wallet_count(signal, config)
+        checks["meets_min_wallet_count"] = effective_wallet_count >= min_wallet_count
+        if effective_wallet_count < min_wallet_count:
             reasons.append("insufficient_wallet_count")
 
         max_entry_price = _safe_float_nan(config.get("max_entry_price"), 1.0)
@@ -500,8 +563,11 @@ class TradersConfluenceStrategy(BaseStrategy):
             if not isinstance(signal, dict):
                 continue
             raw_signal = dict(signal)
+            has_source_provenance = self._has_source_provenance(raw_signal)
             row = StrategySDK.normalize_trader_signal(raw_signal)
-            passed, reasons, checks = self.evaluate_firehose_signal(raw_signal, cfg=cfg)
+            if not has_source_provenance:
+                row.pop("source_flags", None)
+            passed, reasons, checks = self.evaluate_firehose_signal(row, cfg=cfg, normalized=True)
             row["validation"] = {
                 "is_valid": passed,
                 "is_actionable": passed,
@@ -606,22 +672,35 @@ class TradersConfluenceStrategy(BaseStrategy):
         for raw in rows:
             if not isinstance(raw, dict):
                 continue
-            signal = StrategySDK.normalize_trader_signal(dict(raw))
-            passed, reasons, checks = self.evaluate_firehose_signal(signal, cfg=cfg)
+            signal = dict(raw)
+            validation = signal.get("validation") if isinstance(signal.get("validation"), dict) else None
+            if validation is not None:
+                passed = bool(validation.get("is_valid"))
+                reasons = list(validation.get("reasons") or [])
+                checks = dict(validation.get("checks") or {})
+            else:
+                has_source_provenance = self._has_source_provenance(signal)
+                signal = StrategySDK.normalize_trader_signal(signal)
+                if not has_source_provenance:
+                    signal.pop("source_flags", None)
+                passed, reasons, checks = self.evaluate_firehose_signal(
+                    signal,
+                    cfg=cfg,
+                    normalized=True,
+                )
             if not passed:
                 continue
 
             side_label = self._resolve_trade_outcome(signal)
+            if side_label is None:
+                continue
             direction = "buy_yes" if side_label == "YES" else "buy_no"
             market = self._build_signal_market(signal)
             confidence = self._confidence(signal)
             strength = max(0.0, min(1.0, _safe_float_nan(signal.get("strength"), confidence)))
-            wallet_count = int(
-                _safe_float_nan(
-                    signal.get("cluster_adjusted_wallet_count"), _safe_float_nan(signal.get("wallet_count"), 0)
-                )
-            )
             tier = StrategySDK.normalize_trader_tier(signal.get("tier"), default="low")
+            wallet_count = self._base_wallet_count(signal)
+            effective_wallet_count = self._effective_wallet_count(signal, cfg)
             edge_percent = _safe_float_nan(signal.get("edge_percent"), 0.0)
             if edge_percent <= 0.0:
                 edge_percent = max(float(cfg.get("min_edge_percent", 3.0)), confidence * 100.0 * 0.12)
@@ -634,7 +713,7 @@ class TradersConfluenceStrategy(BaseStrategy):
             risk_score = float(cfg.get("risk_base_score", 0.4))
             if confidence < 0.6:
                 risk_score = min(1.0, risk_score + 0.15)
-            if wallet_count <= 2:
+            if effective_wallet_count <= 2:
                 risk_score = min(1.0, risk_score + 0.1)
             if tier == "high":
                 risk_score = max(0.0, risk_score - 0.05)
@@ -647,9 +726,10 @@ class TradersConfluenceStrategy(BaseStrategy):
                 token_id = market.clob_token_ids[idx]
 
             opportunity = self.create_opportunity(
-                title=f"Trader Flow: {wallet_count} wallets -> {market.question[:56]}",
+                title=f"Trader Flow: {effective_wallet_count:g} weighted wallets -> {market.question[:56]}",
                 description=(
-                    f"{wallet_count} tracked wallets ({tier} tier, {strength:.0%} confluence) "
+                    f"{wallet_count:g} tracked wallets ({effective_wallet_count:g} weighted, "
+                    f"{tier} tier, {strength:.0%} confluence) "
                     f"converging on {side_label} at ${entry_price:.2f}."
                 ),
                 total_cost=entry_price,
@@ -694,6 +774,8 @@ class TradersConfluenceStrategy(BaseStrategy):
                 "side": signal.get("side"),
                 "outcome": side_label,
                 "wallet_count": wallet_count,
+                "effective_wallet_count": effective_wallet_count,
+                "tier_weight": self._normalize_tier_weights(cfg.get("tier_weights"))[tier],
                 "confidence": confidence,
                 "confluence_strength": strength,
                 "edge_percent": edge_percent,
@@ -710,7 +792,7 @@ class TradersConfluenceStrategy(BaseStrategy):
             }
             opportunity.risk_factors = [
                 "Smart money convergence bet (behavioral edge)",
-                f"Confluence: {strength:.0%} strength, {wallet_count} wallets, tier {tier}",
+                f"Confluence: {strength:.0%} strength, {effective_wallet_count:g} weighted wallets, tier {tier}",
             ]
             opportunity.mispricing_type = MispricingType.NEWS_INFORMATION
             opportunities.append(opportunity)
@@ -809,7 +891,38 @@ class TradersConfluenceStrategy(BaseStrategy):
     scoring_weights = ScoringWeights()
     sizing_config = SizingConfig()
 
-    _confluence_strength: float = 0.0
+    @staticmethod
+    def _payload_context(payload: dict) -> tuple[dict, dict]:
+        strategy_context = payload.get("strategy_context")
+        strategy_context = strategy_context if isinstance(strategy_context, dict) else {}
+        firehose = strategy_context.get("firehose")
+        firehose = firehose if isinstance(firehose, dict) else {}
+        return strategy_context, firehose
+
+    @classmethod
+    def _payload_confluence_strength(cls, payload: dict) -> float:
+        strategy_context, firehose = cls._payload_context(payload)
+        return to_confidence(
+            payload.get(
+                "strength",
+                payload.get(
+                    "conviction_score",
+                    strategy_context.get(
+                        "confluence_strength",
+                        firehose.get("strength", firehose.get("conviction_score", 0.0)),
+                    ),
+                ),
+            ),
+            0.0,
+        )
+
+    @classmethod
+    def _payload_tier(cls, payload: dict) -> str:
+        strategy_context, firehose = cls._payload_context(payload)
+        return StrategySDK.normalize_trader_tier(
+            payload.get("tier", strategy_context.get("tier", firehose.get("tier"))),
+            default="low",
+        )
 
     def custom_checks(self, signal: Any, context: dict, params: dict, payload: dict) -> list[DecisionCheck]:
         source = str(getattr(signal, "source", "") or "").strip().lower()
@@ -844,21 +957,7 @@ class TradersConfluenceStrategy(BaseStrategy):
             ),
             self.DEFAULT_CONFIG["min_confluence_strength"],
         )
-        confluence_strength = to_confidence(
-            payload.get(
-                "strength",
-                payload.get(
-                    "conviction_score",
-                    strategy_context.get(
-                        "confluence_strength",
-                        firehose.get("strength", firehose.get("conviction_score", 0.0)),
-                    ),
-                ),
-            ),
-            0.0,
-        )
-
-        self._confluence_strength = confluence_strength
+        confluence_strength = self._payload_confluence_strength(payload)
 
         source_ok = source == "traders"
         channel_ok = channel == "confluence"
@@ -884,13 +983,47 @@ class TradersConfluenceStrategy(BaseStrategy):
     def compute_score(
         self, edge: float, confidence: float, risk_score: float, market_count: int, payload: dict
     ) -> float:
-        return (edge * 0.55) + (confidence * 35.0) + (self._confluence_strength * 10.0)
+        confluence_strength = self._payload_confluence_strength(payload)
+        tier = self._payload_tier(payload)
+        tier_weight = self._effective_config()["tier_weights"][tier]
+        return (edge * 0.55) + (confidence * 35.0) + (confluence_strength * 10.0 * tier_weight)
 
     def compute_size(
-        self, base_size: float, max_size: float, edge: float, confidence: float, risk_score: float, market_count: int
+        self,
+        base_size: float,
+        max_size: float,
+        edge: float,
+        confidence: float,
+        risk_score: float,
+        market_count: int,
+        *,
+        payload: Optional[dict] = None,
     ) -> float:
-        size = base_size * (1.0 + (edge / 100.0)) * (0.75 + confidence) * (0.9 + self._confluence_strength)
+        confluence_strength = self._payload_confluence_strength(payload or {})
+        size = base_size * (1.0 + (edge / 100.0)) * (0.75 + confidence) * (0.9 + confluence_strength)
         return max(1.0, min(max_size, size))
+
+    def evaluate(self, signal: Any, context: dict) -> Any:
+        decision = super().evaluate(signal, context)
+        if decision.decision != "selected":
+            return decision
+
+        payload = signal_payload(signal)
+        base_size, max_size = _trader_size_limits(context)
+        edge = max(0.0, _safe_float_nan(getattr(signal, "edge_percent", 0.0), 0.0))
+        confidence = to_confidence(getattr(signal, "confidence", 0.0), 0.0)
+        risk_score = to_confidence(payload.get("risk_score", 0.5), 0.5)
+        market_count = len(payload.get("markets") or [])
+        decision.size_usd = self.compute_size(
+            base_size,
+            max_size,
+            edge,
+            confidence,
+            risk_score,
+            market_count,
+            payload=payload,
+        )
+        return decision
 
     def should_exit(self, position: Any, market_state: dict) -> ExitDecision:
         """Traders confluence: standard TP/SL exit."""
