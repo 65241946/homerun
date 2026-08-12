@@ -295,6 +295,7 @@ ALLOWED_IMPORT_PREFIXES = {
     "services.data_events",
     "services.event_dispatcher",
     "services.forecasting",
+    "services.ml",
     "config",
     "utils",
     # Standard library (safe subset)
