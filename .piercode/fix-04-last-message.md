@@ -3,12 +3,12 @@
 ## 分支与提交
 
 - 分支：`claude/batch-2-identity-finality-review-jvcsc5`
-- 基点：`ea8707dc`
-- F-1：`f74f6ded F-1: reconcile copy-trade defaults and live gates`
-- F-2：`9f49e130 F-2: weight and single-pass trader confluence`
-- F-3：`642bd974 F-3: unify and harden news edge estimation`
-- F-4：`1171b6ad F-4: repair news momentum thresholds and exits`
-- F-5：`180a24a0 F-5: enforce recent side-aware certainty shocks`
+- 最终 rebase 基点：`7c51d161`
+- F-1：`33335814 F-1: reconcile copy-trade defaults and live gates`
+- F-2：`6cbae424 F-2: weight and single-pass trader confluence`；远端并发补充裁决后的修正为 `dd485e58 F-2: remove dead medium tier weight`
+- F-3：`5bb6ef08 F-3: unify and harden news edge estimation`
+- F-4：`b13d2cb0 F-4: repair news momentum thresholds and exits`
+- F-5：`be0cd53c F-5: enforce recent side-aware certainty shocks`
 
 严格按 `docs/fix-04-batch-a-reconciled.md` 的第零节裁决实施；未应用作废的 `docs/repair/traders_copy_trade_p0_draft.patch`，也未恢复 WO-A1.1/A1.2 的旧方案。
 
@@ -27,14 +27,14 @@
 
 - `backend/services/strategies/traders_confluence.py:195,694`：方向不能明确解析时返回 `None` 并跳过，不再猜 NO。
 - `backend/services/strategies/traders_confluence.py:99,509`：`firehose_max_age_minutes 720→60`；firehose runtime 不再先用通用 720 覆盖策略默认。
-- `backend/services/strategies/traders_confluence.py:91,157-173,298-337,534-536`：新增 tier weights；有效钱包数优先 cluster-adjusted 名单/计数，再退 wallets/原计数，最小钱包闸按加权和判断。
+- `backend/services/strategies/traders_confluence.py:91,157-173,298-337,534-536`：新增实际可产生的三档 tier weights（low/high/extreme）；有效钱包数优先 cluster-adjusted 名单/计数，再退 wallets/原计数，最小钱包闸按加权和判断。未知 tier 保守使用 low 权重，配置中的 medium/未知 key 被丢弃，不形成死配置。
 - `backend/services/strategies/traders_confluence.py:703-795,983-1006`：tier weight 进入 score，strength/tier/weighted count 都经当前 payload 传递；无 `self._confluence_strength` 实例态。
 - `backend/services/strategies/traders_confluence.py:117-153,571-581,676-680`：配置按 version memoize；filtered row 携带 validation，builder 不重跑 evaluate。
 - `backend/services/traders_firehose_pipeline.py:95-97,165,229-231`：pipeline 只调用策略 prepare/filter/build，不做提前或尾部 normalize，保持 fix-03 的“缺 source_flags”与“显式全 False”可区分。
 - `backend/services/opportunity_strategy_catalog.py:1502-1505`：schema 明确最小值是 tier-weighted wallet count，并暴露 `tier_weights`。
 - 回归：`backend/tests/test_traders_firehose_provenance.py:181-206,288-368` 覆盖未知方向、cluster-adjusted 加权、单次 normalize/evaluate、pipeline 不提前 normalize、payload 局部并发状态。
 
-对账项仍生效：`backend/services/strategies/traders_confluence.py:88-89,521-524,953-964` 保持 fix-03 的 `min_confluence_strength=0.50`、`min_tier=low` 单一回退值。已核实但未越界修复：`backend/services/wallet_intelligence.py:478-483` 只产生 EXTREME/HIGH/WATCH，WATCH 归一化为 low，因此 medium tier 仍不会由该上游产生。
+对账项仍生效：`backend/services/strategies/traders_confluence.py:88-89,521-524,953-964` 保持 fix-03 的 `min_confluence_strength=0.50`、`min_tier=low` 单一回退值。`backend/services/wallet_intelligence.py:478-483` 只产生 EXTREME/HIGH/WATCH，WATCH 归一化为 low；依照 2026-08-13 pull 到的最新权威裁决，medium 不进入 `tier_weights`，同时不越界修改上游 tier 分档。
 
 ## F-3 `news_edge`
 
@@ -83,7 +83,7 @@
 | F-1 | `max_copy_drawdown_pct` | 100 | 50 | 收紧跟单回撤容忍 |
 | F-1 | `require_live_context` | 不存在 | false | 默认兼容；live 可显式 fail-close |
 | F-2 | `firehose_max_age_minutes` | 720 | 60 | 避免旧钱包流被当实时共识 |
-| F-2 | `tier_weights` | 不存在 | low 1 / medium 1.5 / high 2 / extreme 3 | 按 wallet tier 加权共识 |
+| F-2 | `tier_weights` | 不存在 | low 1 / high 2 / extreme 3；未知→low | 只保留实际上游会产生的 tier，避免 medium 死权重 |
 | F-3 | `require_ci_clears_market` | 不存在 | true | 拒绝 CI 跨市场价的非显著 edge |
 | F-3 | `llm_shrinkage_k` | 不存在 | 0.7 | 缓解 LLM 过度偏离市场 |
 | F-3 | `edge_half_life_minutes_by_category` | 不存在 | default 45 | 新闻 edge 随时间衰减 |
@@ -105,14 +105,14 @@
 ## 测试与审计证据
 
 - F-1：`python -m pytest backend/tests/ -k "copy_trade" -q` → `25 passed, 2589 deselected, 1 warning`。
-- F-2：`python -m pytest backend/tests/ -k "confluence or firehose" -q` → `47 passed, 2575 deselected, 1 warning`；StrategyLoader compile/load smoke 默认 age=60。
+- F-2：最新裁决修正后 `backend/tests/test_traders_firehose_provenance.py` → `15 passed`；`python -m pytest backend/tests/ -k "confluence or firehose" -q` → `47 passed, 2600 deselected, 1 warning`；StrategyLoader compile/load smoke 默认 age=60。
 - F-3：直接相关 22 tests passed；`python -m pytest backend/tests/ -k "news_edge or news_workflow" -q` → `29 passed, 2602 deselected, 1 warning`。
 - F-4：直接/相邻 33 tests passed；`python -m pytest backend/tests/ -k "news_momentum" -q` → `13 passed, 2628 deselected, 1 warning`。
 - F-5：专项与 `python -m pytest backend/tests/ -k "certainty" -q` 均 `9 passed, 2638 deselected, 1 warning`。
-- 最终合并回归：`python -m pytest backend/tests/ -k "copy_trade or confluence or firehose or news_edge or news_workflow or news_momentum or certainty" -q` → `123 passed, 2524 deselected, 1 warning in 21.92s`。
+- 最终合并回归：`python -m pytest backend/tests/ -k "copy_trade or confluence or firehose or news_edge or news_workflow or news_momentum or certainty" -q` → `123 passed, 2524 deselected, 1 warning in 15.16s`。
 - warning 均为既有 `backend/services/scanner.py:60`：`DeprecationWarning: There is no current event loop`，不在本批范围。
 - `python -m compileall -q`：全部触碰的 strategy/news/service/test 文件通过。
-- `git diff ea8707dc..HEAD --check`：通过。
+- `git diff 7c51d161..HEAD --check`：通过。
 - 新增 config key 全部引用≥2；F-4 全 32 个 default key、F-5 全 23 个 default key 引用≥2。
 - production legacy fee audit：`polymarket_taker_fee_legacy_quartic(` 除 `utils/kelly.py` 历史 helper 定义和专门历史回归测试外无调用。
 - 精确残留 audit：生产代码无 `edge_midpoint/edge_multiplier` copy key、无 `self._confluence_strength`、旧 `edge_detector.py` 无 `structured_output/PROBABILITY_SCHEMA/_estimate_edge`、firehose pipeline 无 normalize/source_flags=False 回退。
@@ -122,5 +122,5 @@
 - 未跑全部 `backend/tests/` 无筛选套件；本批全部直接/相邻纯逻辑测试已跑。未涉及数据库 schema，相关测试无需 PostgreSQL。
 - 未连接真实 LLM、Polymarket CLOB 或真实订单；LLM cache、live-price refresh、费用/edge 闸使用 stub/纯逻辑验证。
 - F-3 score、F-4 relative/target/exit、F-5 recent-share/risk 新默认尚未做历史回测或 shadow A/B 标定，代码已明确标注需校准。
-- `wallet_intelligence` 的 medium tier 不产生问题仅记录，未按本 spec 越界修改。
+- `wallet_intelligence` 的 tier 分档未越界修改；medium 权重已按最新权威 spec 从策略配置删除，未来若要新增 medium 必须独立决策并做 shadow 对照。
 - 本仓库这些文件是 seed template；合并/部署后必须通过 Strategy Editor/API reset-to-factory 同步 DB `strategies.source_code/config/schema`，否则运行库仍可能使用旧源码/配置。
