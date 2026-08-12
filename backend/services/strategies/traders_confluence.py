@@ -112,6 +112,14 @@ class TradersConfluenceStrategy(BaseStrategy):
                 if key in config:
                     self._config[key] = config[key]
 
+    @property
+    def pipeline_defaults(self) -> dict[str, Any]:
+        config = self._effective_config()
+        return {
+            "min_edge_percent": config.get("min_edge_percent", self.DEFAULT_CONFIG["min_edge_percent"]),
+            "min_confidence": config.get("min_confidence", self.DEFAULT_CONFIG["min_confidence"]),
+        }
+
     def _effective_config(self) -> dict:
         cfg = dict(self.DEFAULT_CONFIG)
         if isinstance(self._config, dict):

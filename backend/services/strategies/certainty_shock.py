@@ -75,7 +75,7 @@ class CertaintyShockStrategy(BaseStrategy):
         "min_confidence": 0.50,
         "max_risk_score": 0.70,
         # Shock detection knobs.
-        "shock_lookback_seconds": 21600,
+        "shock_lookback_seconds": 900,
         "shock_min_abs_move": 0.22,
         "shock_max_retrace": 0.08,
         "shock_min_favored_price": 0.65,
@@ -225,7 +225,8 @@ class CertaintyShockStrategy(BaseStrategy):
         config.update(getattr(self, "config", {}) or {})
 
         excluded = self._normalize_excluded_keywords(config.get("exclude_market_keywords"))
-        lookback = max(60, int(float(config.get("shock_lookback_seconds", 21600) or 21600)))
+        excluded_patterns = [re.compile(rf"\b{re.escape(keyword)}\b", re.IGNORECASE) for keyword in excluded]
+        lookback = max(60, int(float(config.get("shock_lookback_seconds", 900) or 900)))
         min_abs_move = max(0.05, float(config.get("shock_min_abs_move", 0.22) or 0.22))
         max_retrace = max(0.0, float(config.get("shock_max_retrace", 0.08) or 0.08))
         min_favored = max(0.0, float(config.get("shock_min_favored_price", 0.65) or 0.65))
@@ -251,13 +252,9 @@ class CertaintyShockStrategy(BaseStrategy):
             if market.closed or not market.active:
                 continue
 
-            if excluded:
+            if excluded_patterns:
                 text = self._market_text(market)
-                for kw in excluded:
-                    if kw in text:
-                        text = None
-                        break
-                if text is None:
+                if any(pattern.search(text) for pattern in excluded_patterns):
                     continue
 
             yes_price = self._live_yes_price(market, prices)
@@ -281,8 +278,6 @@ class CertaintyShockStrategy(BaseStrategy):
 
             cutoff = scan_time - lookback
             window = [p for ts, p in history if ts >= cutoff]
-            if len(window) < min_points:
-                window = [p for _, p in history[-min_points:]]
             if len(window) < min_points:
                 continue
 

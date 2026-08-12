@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -15,6 +16,8 @@ from services.data_events import EventType
 from services.strategies.base import BaseStrategy, DecisionCheck, ExitDecision, StrategyDecision, _trader_size_limits
 from services.strategy_sdk import StrategySDK
 from utils.converters import coerce_bool as _coerce_bool, safe_float, to_confidence
+
+logger = logging.getLogger(__name__)
 
 # Outer safety ceiling on user-configured max_signal_age_seconds. The user's
 # UI param is authoritative within this bound (set generously high so the
@@ -52,12 +55,6 @@ TRADERS_COPY_TRADE_DEFAULTS: dict[str, Any] = {
     "require_inventory_for_sells": True,
     "allow_partial_inventory_sells": True,
     "min_inventory_fraction": 0.25,
-    # Edge-percent calculation: edge = abs(entry_price - edge_midpoint) * edge_multiplier.
-    # The defaults (0.5, 200) preserve historical behavior (which was hardcoded
-    # in _build_copy_opportunity); exposing them as params lets users tune
-    # how aggressively the edge is scored without editing strategy code.
-    "edge_midpoint": 0.5,
-    "edge_multiplier": 200.0,
     "traders_scope": {
         "modes": ["tracked", "pool"],
         "individual_wallets": [],
@@ -103,24 +100,6 @@ TRADERS_COPY_TRADE_CONFIG_SCHEMA: dict[str, Any] = {
         {"key": "require_inventory_for_sells", "label": "Require Inventory For Sells", "type": "boolean"},
         {"key": "allow_partial_inventory_sells", "label": "Allow Partial Inventory Sells", "type": "boolean"},
         {"key": "min_inventory_fraction", "label": "Min Inventory Fraction", "type": "number", "min": 0, "max": 1},
-        {
-            "key": "edge_midpoint",
-            "label": "Edge Midpoint",
-            "type": "number",
-            "min": 0,
-            "max": 1,
-            "phase": "signal",
-            "description": "Reference price (0-1) used for edge calculation: edge = abs(entry_price - midpoint) * multiplier. Default 0.5.",
-        },
-        {
-            "key": "edge_multiplier",
-            "label": "Edge Multiplier",
-            "type": "number",
-            "min": 0,
-            "max": 1000,
-            "phase": "signal",
-            "description": "Multiplier applied to the price-vs-midpoint distance to compute edge_percent. Default 200.",
-        },
         {
             "key": "traders_scope",
             "label": "Wallet Scope",
@@ -175,6 +154,7 @@ def validate_traders_copy_trade_config(config: Any) -> dict[str, Any]:
         "min_source_notional_usd",
         "max_entry_price",
         "max_signal_age_seconds",
+        "max_signal_age_seconds_hard_ceiling",
         "min_live_liquidity_usd",
         "max_adverse_entry_drift_pct",
         "copy_delay_seconds",
@@ -194,8 +174,6 @@ def validate_traders_copy_trade_config(config: Any) -> dict[str, Any]:
         "require_inventory_for_sells",
         "allow_partial_inventory_sells",
         "min_inventory_fraction",
-        "edge_midpoint",
-        "edge_multiplier",
         "traders_scope",
         "max_opportunities",
         "retention_max_opportunities",
@@ -213,9 +191,22 @@ def validate_traders_copy_trade_config(config: Any) -> dict[str, Any]:
     cfg["min_source_notional_usd"] = _coerce_float(cfg.get("min_source_notional_usd"), 10.0, 0.0, 1_000_000.0)
     cfg["max_entry_price"] = _coerce_float(cfg.get("max_entry_price"), 0.98, 0.0, 1.0)
     cfg["max_signal_age_seconds"] = _coerce_int(cfg.get("max_signal_age_seconds"), 5, 1, 600)
+    cfg["max_signal_age_seconds_hard_ceiling"] = _coerce_float(
+        cfg.get("max_signal_age_seconds_hard_ceiling"),
+        _MAX_LIVE_COPY_SIGNAL_AGE_SECONDS_HARD_CEILING,
+        1.0,
+        _MAX_LIVE_COPY_SIGNAL_AGE_SECONDS_HARD_CEILING,
+    )
     cfg["min_live_liquidity_usd"] = _coerce_float(cfg.get("min_live_liquidity_usd"), 150.0, 0.0, 1_000_000_000.0)
     cfg["max_adverse_entry_drift_pct"] = _coerce_float(cfg.get("max_adverse_entry_drift_pct"), 2.0, 0.0, 100.0)
     cfg["copy_delay_seconds"] = _coerce_int(cfg.get("copy_delay_seconds"), 0, 0, 300)
+    if cfg["copy_delay_seconds"] >= cfg["max_signal_age_seconds_hard_ceiling"]:
+        logger.warning(
+            "copy_delay_seconds=%ss is greater than or equal to the max signal age hard ceiling=%ss; "
+            "the live-copy freshness window is empty",
+            cfg["copy_delay_seconds"],
+            cfg["max_signal_age_seconds_hard_ceiling"],
+        )
     cfg["copy_existing_positions_on_start"] = _coerce_bool(cfg.get("copy_existing_positions_on_start"), False)
     cfg["copy_buys"] = _coerce_bool(cfg.get("copy_buys"), True)
     cfg["copy_sells"] = _coerce_bool(cfg.get("copy_sells"), True)
@@ -240,8 +231,6 @@ def validate_traders_copy_trade_config(config: Any) -> dict[str, Any]:
     cfg["require_inventory_for_sells"] = _coerce_bool(cfg.get("require_inventory_for_sells"), True)
     cfg["allow_partial_inventory_sells"] = _coerce_bool(cfg.get("allow_partial_inventory_sells"), True)
     cfg["min_inventory_fraction"] = _coerce_float(cfg.get("min_inventory_fraction"), 0.25, 0.0, 1.0)
-    cfg["edge_midpoint"] = _coerce_float(cfg.get("edge_midpoint"), 0.5, 0.0, 1.0)
-    cfg["edge_multiplier"] = _coerce_float(cfg.get("edge_multiplier"), 200.0, 0.0, 1000.0)
     cfg["traders_scope"] = StrategySDK.validate_trader_scope_config(cfg.get("traders_scope"))
     return StrategySDK.normalize_strategy_retention_config(cfg)
 
@@ -362,18 +351,9 @@ class TradersCopyTradeStrategy(BaseStrategy):
         if source_notional <= 0.0:
             source_notional = max(0.0, entry_price * size)
 
-        # Edge-percent calculation reads its midpoint and multiplier from
-        # the strategy config so the user can tune them in the bot's
-        # strategy params editor without editing this code.
-        cfg = getattr(self, "config", None) or {}
-        edge_midpoint = safe_float(cfg.get("edge_midpoint"), 0.5)
-        edge_multiplier = safe_float(cfg.get("edge_multiplier"), 200.0)
-        edge_percent = (
-            max(0.0, abs(edge_midpoint - entry_price) * edge_multiplier)
-            if 0.0 <= entry_price <= 1.0
-            else 0.0
-        )
-        expected_payout = min(1.0, entry_price + max(0.01, edge_percent / 100.0))
+        edge_ev = confidence - entry_price
+        edge_percent = max(0.0, edge_ev / entry_price * 100.0) if entry_price > 0.0 else 0.0
+        expected_payout = min(1.0, max(0.0, confidence))
         detected_at = _to_utc(
             copy_event.get("detected_at")
             or source_trade.get("detected_at")
@@ -633,8 +613,12 @@ class TradersCopyTradeStrategy(BaseStrategy):
                 _MAX_LIVE_COPY_SIGNAL_AGE_SECONDS_HARD_CEILING,
             ),
         )
-        max_signal_age_seconds = min(hard_ceiling, requested_max_signal_age_seconds)
-        age_seconds = max_signal_age_seconds + 1.0
+        copy_delay_seconds = max(0.0, safe_float(params.get("copy_delay_seconds"), 0.0))
+        effective_max_age_seconds = min(
+            hard_ceiling,
+            copy_delay_seconds + requested_max_signal_age_seconds,
+        )
+        age_seconds = effective_max_age_seconds + 1.0
         if detected_at is not None:
             age_seconds = max(0.0, (utcnow() - detected_at).total_seconds())
 
@@ -679,7 +663,6 @@ class TradersCopyTradeStrategy(BaseStrategy):
 
         copy_buys = bool(params.get("copy_buys", True))
         copy_sells = bool(params.get("copy_sells", True))
-        copy_delay_seconds = max(0.0, safe_float(params.get("copy_delay_seconds"), 0.0))
         min_live_liquidity_usd = max(0.0, safe_float(params.get("min_live_liquidity_usd"), 150.0))
         live_liquidity = safe_float(live_market.get("liquidity_usd"), None)
         liquidity_passed = live_liquidity is None or live_liquidity >= min_live_liquidity_usd
@@ -788,10 +771,10 @@ class TradersCopyTradeStrategy(BaseStrategy):
             DecisionCheck(
                 "max_age",
                 "Signal freshness",
-                age_seconds <= max_signal_age_seconds,
+                age_seconds <= effective_max_age_seconds,
                 score=age_seconds,
                 detail=(
-                    f"max={max_signal_age_seconds:.0f}s "
+                    f"max={effective_max_age_seconds:.0f}s "
                     f"requested={requested_max_signal_age_seconds:.0f}s"
                 ),
             ),

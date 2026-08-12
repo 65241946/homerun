@@ -450,7 +450,14 @@ class FlashCrashReversionStrategy(BaseStrategy):
     def custom_checks(self, signal: Any, context: dict, params: dict, payload: dict) -> list[DecisionCheck]:
         """Flash crash reversion: source, strategy type, liquidity, crash alignment checks."""
         live_market = context.get("live_market") or {}
-        min_liquidity = max(0.0, to_float(params.get("min_liquidity", 1500.0), 1500.0))
+        configured_min_liquidity = to_float(
+            (getattr(self, "config", {}) or {}).get("min_liquidity"),
+            self.default_config["min_liquidity"],
+        )
+        min_liquidity = max(
+            0.0,
+            to_float(params.get("min_liquidity", configured_min_liquidity), configured_min_liquidity),
+        )
         min_abs_move_5m = max(0.1, to_float(params.get("min_abs_move_5m", 1.5), 1.5))
         require_alignment = bool(params.get("require_crash_alignment", True))
         exclude_crypto_markets = self._to_bool(params.get("exclude_crypto_markets"), True)

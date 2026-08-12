@@ -811,14 +811,22 @@ class NewsEdgeStrategy(BaseStrategy):
         first_position = positions[0] if positions and isinstance(positions[0], dict) else {}
         news_meta = first_position.get("_news_edge") if isinstance(first_position.get("_news_edge"), dict) else {}
 
+        configured_min_edge = to_float(
+            self._config.get("min_edge_percent"),
+            NEWS_EDGE_DEFAULT_CONFIG["min_edge_percent"],
+        )
+        configured_min_confidence = to_confidence(
+            self._config.get("min_confidence"),
+            NEWS_EDGE_DEFAULT_CONFIG["min_confidence"],
+        )
         d = self.pipeline_defaults
         min_edge = to_float(
-            params.get("min_edge_percent", d.get("min_edge_percent", 3.0)),
-            d.get("min_edge_percent", 3.0),
+            params.get("min_edge_percent", configured_min_edge),
+            configured_min_edge,
         )
         min_conf = to_confidence(
-            params.get("min_confidence", d.get("min_confidence", 0.42)),
-            d.get("min_confidence", 0.42),
+            params.get("min_confidence", configured_min_confidence),
+            configured_min_confidence,
         )
         max_risk = to_confidence(
             params.get("max_risk_score", d.get("max_risk_score", 0.68)),

@@ -219,11 +219,17 @@ class StatArbStrategy(BaseStrategy):
         "confidence_agreement_weight": 0.6,
     }
 
-    pipeline_defaults = {
-        "min_edge_percent": 3.5,
-        "min_confidence": 0.45,
-        "max_risk_score": 0.75,
-    }
+    @property
+    def pipeline_defaults(self) -> dict[str, Any]:
+        config = getattr(self, "config", {}) or {}
+        return {
+            "min_edge_percent": config.get(
+                "min_edge_percent",
+                self.default_config["min_edge_percent"],
+            ),
+            "min_confidence": self.default_config["min_confidence"],
+            "max_risk_score": self.default_config["max_risk_score"],
+        }
 
     # Composable evaluate pipeline: score = edge*0.58 + conf*32 - risk*8
     scoring_weights = ScoringWeights(

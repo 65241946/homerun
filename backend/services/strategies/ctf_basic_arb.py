@@ -81,6 +81,16 @@ class CTFBasicArbStrategy(BaseStrategy):
         "min_position_size": 10.0,
     }
 
+    @property
+    def pipeline_defaults(self) -> dict[str, Any]:
+        config = getattr(self, "config", {}) or {}
+        return {
+            "min_edge_percent": config.get(
+                "min_edge_percent",
+                self.default_config["min_edge_percent"],
+            ),
+        }
+
     @staticmethod
     def _quotes_for_market(market: Market, prices: dict[str, dict]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         token_ids = list(getattr(market, "clob_token_ids", []) or [])
