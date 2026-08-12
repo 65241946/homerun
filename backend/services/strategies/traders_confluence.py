@@ -88,7 +88,7 @@ class TradersConfluenceStrategy(BaseStrategy):
         "min_confluence_strength": 0.50,
         "min_tier": "low",
         "min_wallet_count": 2,
-        "tier_weights": {"low": 1.0, "medium": 1.5, "high": 2.0, "extreme": 3.0},
+        "tier_weights": {"low": 1.0, "high": 2.0, "extreme": 3.0},
         "max_entry_price": 0.85,
         "risk_base_score": 0.40,
         "take_profit_pct": 12.0,
@@ -159,7 +159,7 @@ class TradersConfluenceStrategy(BaseStrategy):
         defaults = cls.DEFAULT_CONFIG["tier_weights"]
         return {
             tier: max(0.0, _safe_float_nan(configured.get(tier), defaults[tier]))
-            for tier in cls.TIER_ORDER
+            for tier in defaults
         }
 
     @staticmethod
@@ -329,7 +329,7 @@ class TradersConfluenceStrategy(BaseStrategy):
     def _effective_wallet_count(cls, signal: dict, config: dict) -> float:
         tier = StrategySDK.normalize_trader_tier(signal.get("tier"), default="low")
         weights = cls._normalize_tier_weights(config.get("tier_weights"))
-        return cls._base_wallet_count(signal) * weights[tier]
+        return cls._base_wallet_count(signal) * weights.get(tier, weights["low"])
 
     @staticmethod
     def _parse_dt(value: object) -> Optional[datetime]:
@@ -985,7 +985,8 @@ class TradersConfluenceStrategy(BaseStrategy):
     ) -> float:
         confluence_strength = self._payload_confluence_strength(payload)
         tier = self._payload_tier(payload)
-        tier_weight = self._effective_config()["tier_weights"][tier]
+        tier_weights = self._effective_config()["tier_weights"]
+        tier_weight = tier_weights.get(tier, tier_weights["low"])
         return (edge * 0.55) + (confidence * 35.0) + (confluence_strength * 10.0 * tier_weight)
 
     def compute_size(
