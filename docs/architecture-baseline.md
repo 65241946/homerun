@@ -168,7 +168,12 @@ reconcile_shadow_positions (position_lifecycle.py:4591) ← 编排 worker 维护
 **已核实。** 除 3 个 simulation 列(`TradeStatus`/`PositionSide` 真枚举)外,**所有** status/side/**direction**/mode/verification_status 都是自由 `String`,合法取值只写在行内注释里。DB 层无法保证:价格∈[0,1]、size/notional≥0、filled≤size、legs_completed≤legs_total、枚举合法性。
 
 - **`trader_orders.direction`**(`database.py:4331`)= nullable String,无枚举无 CHECK → 数据库接受任意字符串。这是你之前在 pmr 版遇到的 `buy_<人名>` 能落库的 schema 层根源。
-- **干净基座现状**:执行路径的 direction 构造 `_resolve_leg_direction`(`session_engine.py:149`)是 fail-safe 的(拼接前校验 `outcome∈{yes,no}`,否则退回裸 `buy`/`sell`)。**即缺陷的"使能条件"在基座就存在,但主执行路径当前不产生垃圾值** —— 其它写入路径(manual-buy、钱包共识 traders_confluence)是否安全需针对干净基座单独核实(见"待核实清单")。
+- **干净基座各写入路径核查结果**(已逐行核实):
+  - 编排执行路径 `_resolve_leg_direction`(`session_engine.py:149`)= **安全**(拼接前校验 `outcome∈{yes,no}`,否则退回裸 `buy`/`sell`)。
+  - 钱包共识 `traders_confluence.py:575`(`"buy_yes" if side_label=="YES" else "buy_no"`)= **安全**(只产出 buy_yes/buy_no)。
+  - **manual-buy `routes_traders.py:2268`(`f"buy_{pos.outcome.lower()}"`)= 🔴 有 bug**:`pos.outcome` 来自 UI 表单(用户输入,即"真正的系统边界"),体育市场 outcome="Elina Svitolina" → `direction="buy_elina svitolina"`,直接写进 `TraderOrder.direction`(:2311)。**该缺陷在干净基座就存在。**
+- **影响机制(精确)**:manual-buy 的 live 下单用 `side`(BUY/SELL)非 `direction`,故垃圾 direction **不阻断 venue 下单**;但下游 `_direction_outcome_index` 对垃圾值返回 None → 仓位对账永远跳过、永不平仓;shadow 侧 `_direction_to_position_side` raise → `record_orchestrator_shadow_fill_failed`,连账本都不建。**净效果:manual-buy 的体育单成为永久孤儿单 + 无法结算。**
+- **修复点**:manual-buy 在写入前校验/规范化 `pos.outcome`(边界校验),叠加 CONFIRMED-2 的 direction 字段 DB 约束(纵深防御)。
 
 ### 🔴 CONFIRMED-3:实盘无独立现金分录账本
 
@@ -319,7 +324,7 @@ scanner(16)、crypto(8)、traders(2)、news(1)、weather(1)、sports(1)、manual
 
 ## 待核实清单(下一轮针对干净基座)
 
-- [ ] 干净基座的钱包共识(`traders_confluence`)/ manual-buy 路径是否产生非规范 direction(你在 pmr 版遇到的"信号没法下单"是否在基座复现)。
+- [x] ✅ **已核实**:钱包共识(`traders_confluence.py:575`)direction **安全**;manual-buy(`routes_traders.py:2268`)**有 bug**(垃圾 direction,基座就存在,见 CONFIRMED-2)。「钱包共识信号没法下单」**不是 direction 问题**,需另查(门禁/共识阈值)。
 - [ ] 候选-4/5/7/9 等标🟠🟡项逐条核实,升级为 CONFIRMED 或排除。
 - [ ] `close_orchestrator_shadow_fill` 修复方案:开开关 vs 改口径,需先定 PnL 权威表。
 - [ ] live_risk_clamps 各 `*_cap` 在 worker/session_engine 的确切落地点。
