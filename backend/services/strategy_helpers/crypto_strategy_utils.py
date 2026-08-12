@@ -18,6 +18,7 @@ from services.strategies.crypto_strategy_utils import (  # noqa: F401
     default_max_market_data_age_ms,
     default_max_oracle_age_ms,
     default_min_seconds_left_for_entry,
+    estimate_p_win,
     fee_aware_min_edge_pct,
     history_cancel_peak,
     market_ml_probability_yes,
