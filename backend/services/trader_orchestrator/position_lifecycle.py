@@ -15,7 +15,6 @@ from models.database import AsyncSessionLocal, LiveTradingOrder, LiveTradingPosi
 from services.polymarket import polymarket_client
 from services.runtime_signal_queue import publish_signal_batch
 from services.signal_bus import make_dedupe_key, upsert_trade_signal
-from services.simulation import simulation_service
 from services.strategy_sdk import StrategySDK
 from services.live_execution_service import live_execution_service
 from services.live_pressure import is_db_pressure_active
@@ -1231,10 +1230,8 @@ def _is_rapid_close_trigger(close_trigger: Any) -> bool:
 def _extract_leg_token_id(payload: Any) -> str:
     """Pull the leg's token_id out of a TraderOrder payload.
 
-    Mirrors the lookup ``_shadow_ledger_token_id`` performs in the
-    worker so the lifecycle reconciler can resolve a bare
-    ``direction='buy'`` order back to a binary outcome index without
-    threading the worker helper through.
+    Lets the lifecycle reconciler resolve a bare ``direction='buy'``
+    order back to a binary outcome index from the order payload alone.
     """
 
     if not isinstance(payload, dict):
@@ -4598,7 +4595,6 @@ async def reconcile_shadow_positions(
     max_age_hours: Optional[int] = None,
     order_ids: Optional[list[str]] = None,
     reason: str = "shadow_position_lifecycle",
-    enable_simulation_ledger: bool = False,
 ) -> dict[str, Any]:
     params = dict(trader_params or {})
     mode_key = "shadow"
@@ -5057,52 +5053,6 @@ async def reconcile_shadow_positions(
         pnl = proceeds - notional
         next_status = _status_for_close(pnl=pnl, close_trigger=close_trigger)
 
-        simulation_close: dict[str, Any] | None = None
-        simulation_ledger = payload.get("simulation_ledger")
-        if not dry_run and enable_simulation_ledger and isinstance(simulation_ledger, dict):
-            sim_account_id = str(simulation_ledger.get("account_id") or "").strip()
-            sim_trade_id = str(simulation_ledger.get("trade_id") or "").strip()
-            sim_position_id = str(simulation_ledger.get("position_id") or "").strip()
-            if sim_account_id and sim_trade_id and sim_position_id:
-                try:
-                    simulation_close = await simulation_service.close_orchestrator_shadow_fill(
-                        account_id=sim_account_id,
-                        trade_id=sim_trade_id,
-                        position_id=sim_position_id,
-                        close_price=float(close_price),
-                        close_trigger=close_trigger,
-                        price_source=price_source,
-                        reason=reason,
-                        session=session,
-                        commit=False,
-                    )
-                    if simulation_close.get("closed"):
-                        proceeds = float(simulation_close.get("actual_payout", proceeds))
-                        pnl = float(simulation_close.get("actual_pnl", pnl))
-                        next_status = str(simulation_close.get("trade_status") or next_status)
-                    elif simulation_close.get("already_closed"):
-                        existing_status = str(simulation_close.get("trade_status") or "")
-                        if existing_status:
-                            next_status = existing_status
-                        pnl = float(simulation_close.get("actual_pnl", pnl))
-                        proceeds = float(simulation_close.get("actual_payout", proceeds))
-                except Exception as exc:
-                    skipped += 1
-                    skipped_reasons["simulation_close_error"] = (
-                        int(skipped_reasons.get("simulation_close_error", 0)) + 1
-                    )
-                    details.append(
-                        {
-                            "order_id": row.id,
-                            "market_id": row.market_id,
-                            "direction": row.direction,
-                            "close_trigger": close_trigger,
-                            "reason": "simulation_close_error",
-                            "error": str(exc),
-                        }
-                    )
-                    continue
-
         total_realized_pnl += pnl
         by_status[next_status] = int(by_status.get(next_status, 0)) + 1
 
@@ -5124,7 +5074,6 @@ async def reconcile_shadow_positions(
             "trailing_stop_trigger_price": trailing_trigger_price,
             "highest_price_seen": _state_price_floor(highest_price),
             "lowest_price_seen": _state_price_floor(lowest_price),
-            "simulation_close": simulation_close,
         }
         details.append(detail)
         would_close += 1
@@ -5146,8 +5095,6 @@ async def reconcile_shadow_positions(
             "closed_at": _iso_utc(now),
             "reason": reason,
         }
-        if simulation_close is not None:
-            payload["position_close"]["simulation_close"] = simulation_close
 
         if _exit_instance is not None and hasattr(_exit_instance, "record_trade_outcome"):
             try:

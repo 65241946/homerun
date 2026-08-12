@@ -2124,11 +2124,6 @@ async def test_run_trader_once_prefilters_mismatched_source_strategy_type(monkey
     monkeypatch.setattr(trader_orchestrator_worker, "AsyncSessionLocal", lambda: _DummySessionContext())
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(
             return_value={
@@ -2259,11 +2254,6 @@ async def test_run_trader_once_emits_filtered_heartbeat_for_crypto_scope_prefilt
     monkeypatch.setattr(trader_orchestrator_worker, "AsyncSessionLocal", lambda: _DummySessionContext())
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(
             return_value={
@@ -2353,7 +2343,6 @@ async def test_run_trader_once_persists_heartbeat_when_idle_gate_short_circuits(
 
     commit_mock = AsyncMock(return_value=None)
     create_event_mock = AsyncMock(return_value=None)
-    backfill_mock = AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []})
     reconcile_mock = AsyncMock(
         return_value={
             "matched": 0,
@@ -2370,11 +2359,6 @@ async def test_run_trader_once_persists_heartbeat_when_idle_gate_short_circuits(
     monkeypatch.setattr(trader_orchestrator_worker, "AsyncSessionLocal", lambda: _DummySessionContext())
     monkeypatch.setattr(trader_orchestrator_worker, "_commit_with_retry", commit_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "create_trader_event", create_event_mock)
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        backfill_mock,
-    )
     monkeypatch.setattr(trader_orchestrator_worker, "reconcile_shadow_positions", reconcile_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "sync_trader_position_inventory", sync_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "get_open_position_count_for_trader", open_positions_mock)
@@ -2410,7 +2394,6 @@ async def test_run_trader_once_persists_heartbeat_when_idle_gate_short_circuits(
     assert orders_written == 0
     create_event_mock.assert_awaited_once()
     assert create_event_mock.await_args.kwargs["event_type"] == "cycle_heartbeat"
-    backfill_mock.assert_awaited_once()
     reconcile_mock.assert_awaited_once()
     sync_mock.assert_awaited_once()
     open_positions_mock.assert_not_awaited()
@@ -2423,7 +2406,6 @@ async def test_run_trader_once_runs_live_execution_session_maintenance(monkeypat
 
     commit_mock = AsyncMock(return_value=None)
     create_event_mock = AsyncMock(return_value=None)
-    backfill_mock = AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []})
     shadow_reconcile_mock = AsyncMock(
         return_value={
             "matched": 0,
@@ -2447,11 +2429,6 @@ async def test_run_trader_once_runs_live_execution_session_maintenance(monkeypat
     monkeypatch.setattr(trader_orchestrator_worker, "AsyncSessionLocal", lambda: _DummySessionContext())
     monkeypatch.setattr(trader_orchestrator_worker, "_commit_with_retry", commit_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "create_trader_event", create_event_mock)
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        backfill_mock,
-    )
     monkeypatch.setattr(trader_orchestrator_worker, "reconcile_shadow_positions", shadow_reconcile_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "sync_trader_position_inventory", sync_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "get_open_position_count_for_trader", open_positions_mock)
@@ -2491,7 +2468,6 @@ async def test_run_trader_once_runs_live_execution_session_maintenance(monkeypat
     assert decisions_written == 0
     assert orders_written == 0
     assert reconcile_calls == [{"mode": "live", "trader_id": trader_id}]
-    backfill_mock.assert_not_awaited()
     shadow_reconcile_mock.assert_not_awaited()
     sync_mock.assert_not_awaited()
     open_positions_mock.assert_not_awaited()
@@ -2510,11 +2486,6 @@ async def test_run_trader_once_persists_heartbeat_when_signal_queue_is_empty(mon
 
     monkeypatch.setattr(trader_orchestrator_worker, "AsyncSessionLocal", lambda: _DummySessionContext())
     monkeypatch.setattr(trader_orchestrator_worker, "_trader_idle_maintenance_last_run", {})
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
     monkeypatch.setattr(
         "services.trader_orchestrator.position_lifecycle.reconcile_live_positions",
         AsyncMock(return_value={"matched": 0, "closed": 0, "held": 0, "skipped": 0, "total_realized_pnl": 0.0, "by_status": {}}),
@@ -2579,7 +2550,6 @@ async def test_run_trader_once_reconciles_positions_when_source_configs_missing(
     commit_mock = AsyncMock(return_value=None)
     create_event_mock = AsyncMock(return_value=None)
     list_signals_mock = AsyncMock(return_value=[])
-    backfill_mock = AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []})
     reconcile_mock = AsyncMock(
         return_value={
             "matched": 0,
@@ -2597,11 +2567,6 @@ async def test_run_trader_once_reconciles_positions_when_source_configs_missing(
     monkeypatch.setattr(trader_orchestrator_worker, "AsyncSessionLocal", lambda: _DummySessionContext())
     monkeypatch.setattr(trader_orchestrator_worker, "_commit_with_retry", commit_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "create_trader_event", create_event_mock)
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        backfill_mock,
-    )
     monkeypatch.setattr(trader_orchestrator_worker, "reconcile_shadow_positions", reconcile_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "sync_trader_position_inventory", sync_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "get_open_position_count_for_trader", open_positions_mock)
@@ -2629,7 +2594,6 @@ async def test_run_trader_once_reconciles_positions_when_source_configs_missing(
     assert orders_written == 0
     create_event_mock.assert_awaited_once()
     assert create_event_mock.await_args.kwargs["event_type"] == "cycle_heartbeat"
-    backfill_mock.assert_awaited_once()
     reconcile_mock.assert_awaited_once()
     assert reconcile_mock.await_args.kwargs["trader_params"] == {}
     sync_mock.assert_awaited_once()
@@ -2644,7 +2608,6 @@ async def test_run_trader_once_skips_heavy_maintenance_when_manage_only_cycle_is
 
     commit_mock = AsyncMock(return_value=None)
     create_event_mock = AsyncMock(return_value=None)
-    backfill_mock = AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []})
     reconcile_mock = AsyncMock(return_value={"matched": 0, "closed": 0, "held": 0, "skipped": 0, "total_realized_pnl": 0.0, "by_status": {}})
     sync_mock = AsyncMock(return_value={})
     cursor_mock = AsyncMock(return_value=(None, None))
@@ -2653,11 +2616,6 @@ async def test_run_trader_once_skips_heavy_maintenance_when_manage_only_cycle_is
     monkeypatch.setattr(trader_orchestrator_worker, "AsyncSessionLocal", lambda: _DummySessionContext())
     monkeypatch.setattr(trader_orchestrator_worker, "_commit_with_retry", commit_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "create_trader_event", create_event_mock)
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        backfill_mock,
-    )
     monkeypatch.setattr(trader_orchestrator_worker, "reconcile_shadow_positions", reconcile_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "sync_trader_position_inventory", sync_mock)
     monkeypatch.setattr(trader_orchestrator_worker, "get_trader_signal_cursor", cursor_mock)
@@ -2690,7 +2648,6 @@ async def test_run_trader_once_skips_heavy_maintenance_when_manage_only_cycle_is
     assert orders_written == 0
     assert processed_signals == 0
     create_event_mock.assert_not_awaited()
-    backfill_mock.assert_not_awaited()
     reconcile_mock.assert_not_awaited()
     sync_mock.assert_not_awaited()
     cursor_mock.assert_not_awaited()
@@ -3630,11 +3587,6 @@ async def test_run_trader_once_blocks_stacking_when_allow_averaging_false(monkey
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(
             return_value={
@@ -3800,18 +3752,6 @@ async def test_run_trader_once_claims_live_signal_before_submit(monkeypatch):
         trader_orchestrator_worker,
         "evaluate_risk",
         lambda **_: SimpleNamespace(allowed=True, reason="ok", checks=[]),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(
-            return_value={
-                "attempted": 0,
-                "backfilled": 0,
-                "skipped": 0,
-                "errors": [],
-            }
-        ),
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
@@ -4002,18 +3942,6 @@ async def test_run_trader_once_persists_blocked_decision_when_db_stacking_verifi
         trader_orchestrator_worker,
         "evaluate_risk",
         lambda **_: SimpleNamespace(allowed=True, reason="ok", checks=[]),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(
-            return_value={
-                "attempted": 0,
-                "backfilled": 0,
-                "skipped": 0,
-                "errors": [],
-            }
-        ),
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
@@ -4374,11 +4302,6 @@ async def test_run_trader_once_allows_reentry_when_allow_averaging_true(monkeypa
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(
             return_value={
@@ -4671,11 +4594,6 @@ async def test_run_trader_once_marks_signal_skipped_when_strategy_skips(monkeypa
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(
             return_value={
@@ -4871,11 +4789,6 @@ async def test_run_trader_once_blocks_unavailable_strategy_only(monkeypatch):
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(
             return_value={
@@ -5044,11 +4957,6 @@ async def test_run_trader_once_uses_cached_live_context_builder_for_trigger_cycl
         trader_orchestrator_worker,
         "evaluate_risk",
         lambda **_: SimpleNamespace(allowed=True, reason="ok", checks=[]),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
@@ -5227,11 +5135,6 @@ async def test_run_trader_once_trigger_cycle_fetches_full_live_context_when_stri
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(return_value={"matched": 0, "closed": 0, "held": 0, "skipped": 0, "total_realized_pnl": 0.0, "by_status": {}}),
     )
@@ -5348,11 +5251,6 @@ async def test_run_trader_once_defers_signals_when_strict_ws_context_unavailable
         trader_orchestrator_worker,
         "evaluate_risk",
         lambda **_: SimpleNamespace(allowed=True, reason="ok", checks=[]),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
@@ -5522,11 +5420,6 @@ async def test_run_trader_once_uses_strategy_configured_strict_sources_for_live_
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(return_value={"matched": 0, "closed": 0, "held": 0, "skipped": 0, "total_realized_pnl": 0.0, "by_status": {}}),
     )
@@ -5692,11 +5585,6 @@ async def test_run_trader_once_loads_strict_scanner_live_context_from_cache(monk
         trader_orchestrator_worker,
         "evaluate_risk",
         lambda **_: SimpleNamespace(allowed=True, reason="ok", checks=[]),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
@@ -5888,11 +5776,6 @@ async def test_run_trader_once_uses_scanner_signal_market_snapshot_when_live_con
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(return_value={"matched": 0, "closed": 0, "held": 0, "skipped": 0, "total_realized_pnl": 0.0, "by_status": {}}),
     )
@@ -6074,11 +5957,6 @@ async def test_run_trader_once_uses_scanner_signal_created_at_when_payload_times
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(return_value={"matched": 0, "closed": 0, "held": 0, "skipped": 0, "total_realized_pnl": 0.0, "by_status": {}}),
     )
@@ -6213,11 +6091,6 @@ async def test_run_trader_once_defers_signals_when_strict_ws_release_is_stale(mo
         trader_orchestrator_worker,
         "evaluate_risk",
         lambda **_: SimpleNamespace(allowed=True, reason="ok", checks=[]),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
@@ -6415,11 +6288,6 @@ async def test_run_trader_once_uses_fresh_scanner_row_timestamp_for_strict_ws_re
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
         "reconcile_shadow_positions",
         AsyncMock(return_value={"matched": 0, "closed": 0, "held": 0, "skipped": 0, "total_realized_pnl": 0.0, "by_status": {}}),
     )
@@ -6551,11 +6419,6 @@ async def test_run_trader_once_prefetches_strategy_metadata_once_per_source(monk
         trader_orchestrator_worker,
         "evaluate_risk",
         lambda **_: SimpleNamespace(allowed=True, reason="ok", checks=[]),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
@@ -6708,11 +6571,6 @@ async def test_run_trader_once_live_runtime_trigger_processes_runtime_trigger_ba
         trader_orchestrator_worker,
         "evaluate_risk",
         lambda **_: SimpleNamespace(allowed=True, reason="ok", checks=[]),
-    )
-    monkeypatch.setattr(
-        trader_orchestrator_worker,
-        "_backfill_simulation_ledger_for_active_shadow_orders",
-        AsyncMock(return_value={"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}),
     )
     monkeypatch.setattr(
         trader_orchestrator_worker,
