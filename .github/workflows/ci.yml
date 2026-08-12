@@ -38,6 +38,10 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python scripts/ci/check_no_hardcoded_fill_constants.py
 
+      - name: Guard against undeployed worker planes
+        working-directory: ${{ github.workspace }}
+        run: python scripts/ci/check_worker_plane_coverage.py
+
   backend-test:
     name: Backend Tests
     runs-on: ubuntu-latest
