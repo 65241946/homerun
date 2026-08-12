@@ -98,7 +98,12 @@ def test_ctf_detect_and_evaluate_share_configured_edge_threshold():
 def test_news_edge_detect_and_evaluate_share_configured_thresholds():
     strategy = NewsEdgeStrategy()
     detector_payload = {
-        "edge_percent": 4.0,
+        "edge_percent": 6.0,
+        "model_probability": 0.56,
+        "model_probability_ci_low": 0.51,
+        "model_probability_ci_high": 0.61,
+        "market_price": 0.50,
+        "category": "geopolitics",
         "confidence": 0.80,
         "supporting_articles": [
             {"source": "source-a"},
