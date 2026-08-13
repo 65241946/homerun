@@ -12,10 +12,14 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from models.database import Base, Trader
+from services.strategy_sdk import StrategySDK
+from services.trader_orchestrator.templates import TRADER_TEMPLATES
 from services.trader_orchestrator_state import (
     create_trader,
+    create_trader_from_template,
     delete_trader,
     get_orchestrator_overview,
+    list_trader_templates,
     list_traders,
     update_trader,
 )
@@ -326,3 +330,59 @@ async def test_update_trader_rejects_unknown_strategy_key(postgres_session_facto
                     ],
                 },
             )
+
+
+def test_every_trader_template_survives_source_config_normalization():
+    """``GET /traders/templates`` normalizes every template to build one response.
+
+    So a single template that fails normalization does not degrade to
+    "that preset is missing" — it raises out of the list comprehension and
+    takes the whole endpoint down with it.  ``btc_eth_full_stack`` carried
+    three ``crypto`` source_configs from the legacy multi-mode design,
+    which the one-strategy-per-source rule rejects, so the endpoint
+    returned 500 for every caller and the UI's template picker had nothing
+    to show.
+    """
+    templates = list_trader_templates()
+
+    assert len(templates) == len(TRADER_TEMPLATES)
+    for template in templates:
+        # ``_validate_source_configs`` requires exactly one entry, so a
+        # template with two is un-creatable even when its source_keys are
+        # distinct — ``scanner_weather`` bundled a scanner and a weather
+        # config and cleared normalization only to be rejected at create.
+        assert len(template["source_configs"]) == 1, (
+            f"{template['id']} bundles {len(template['source_configs'])} source_configs; "
+            "a trader runs one strategy on one source"
+        )
+
+
+@pytest.mark.asyncio
+async def test_every_trader_template_can_actually_be_created(postgres_session_factory):
+    """Listing a preset the API cannot instantiate is a dead button.
+
+    Normalization is not the only thing standing between a template and a
+    trader — ``create_trader`` also validates strategy keys against the
+    catalog — so this exercises the real create path for every preset
+    rather than asserting on the template dicts.
+    """
+    defaults = StrategySDK.TRADER_RISK_DEFAULTS
+
+    async with postgres_session_factory() as session:
+        for template in TRADER_TEMPLATES:
+            trader = await create_trader_from_template(session, template["id"])
+
+            assert trader["metadata"]["template_id"] == template["id"]
+
+            # Risk limits come back fully normalized, so a cap the template
+            # never mentioned still has a value.  ``max_spread_bps`` is the
+            # one that matters most: its gate reads a missing cap as "knob
+            # off", so an unnormalized row would silently run unbounded.
+            limits = trader["risk_limits"]
+            missing = sorted(set(defaults) - set(limits))
+            assert not missing, f"{template['id']} created without defaults: {missing}"
+            assert limits["max_spread_bps"] == defaults["max_spread_bps"]
+
+            # The template still wins wherever it sets a value.
+            for key, value in (template.get("risk_limits") or {}).items():
+                assert limits[key] == value, f"{template['id']} lost template value for {key}"

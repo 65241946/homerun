@@ -9,7 +9,7 @@ import math
 
 import pytest
 
-from backend.services.markout.curves import (
+from services.markout.curves import (
     Cohort,
     Denominator,
     FillObservation,
