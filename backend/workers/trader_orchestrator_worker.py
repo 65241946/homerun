@@ -6236,7 +6236,15 @@ async def _run_trader_once_inner(
                         reason=ws_prewarm_reason,
                         required_token_ids=required_token_ids,
                     )
-                    break
+                    # Skip only this signal.  ``break`` would abandon every
+                    # remaining signal in the batch — including crypto and
+                    # scanner signals that already have fresh WS quotes — and
+                    # ``ws_token_id_missing`` never self-resolves, so one
+                    # token-less traders signal would starve the batch every
+                    # cycle until its TTL expires.  ``defer_signal_processing``
+                    # already ends the outer batch loop, matching the existing
+                    # strict-pricing handler below.
+                    continue
 
                 try:
                     _enter_stage("signal_persist")
