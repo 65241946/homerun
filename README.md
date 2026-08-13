@@ -288,6 +288,10 @@ This software can drive real-money trading decisions.
 - Start in shadow mode and graduate carefully — and watch the triangulation panel for backtest/shadow/live PnL divergence
 - Nothing in this repository is financial advice
 
+## Docs & analysis
+
+Prior architecture analysis, regression criteria, and design specs live in [`docs/`](./docs/README.md) — start there before changing the orchestrator, settlement, or worker planes.
+
 ## Contributing
 
 Read [`docs/CONTRIBUTING.md`](./docs/CONTRIBUTING.md) &nbsp;&bull;&nbsp; Security: [`docs/SECURITY.md`](./docs/SECURITY.md)
