@@ -551,7 +551,21 @@ class TradersCopyTradeStrategy(BaseStrategy):
 
     def evaluate(self, signal: Any, context: dict[str, Any]) -> StrategyDecision:
         context_payload = context if isinstance(context, dict) else {}
-        params = self.config
+        # ``context["params"]`` is the strategy's DB config with this trader's
+        # ``strategy_params`` layered on top (the orchestrator's
+        # ``_merged_eval_params``).  It must win: the instance is a shared
+        # singleton, so evaluating off ``self.config`` would apply one global
+        # config to every trader and silently drop per-trader tuning.  When a
+        # caller supplies no params — backtests and direct unit calls — the
+        # already-validated ``self.config`` is used as-is, so the common
+        # orchestrator path validates once per signal and the paramless path
+        # not at all.
+        raw_params = context_payload.get("params")
+        params = (
+            validate_traders_copy_trade_config(raw_params)
+            if isinstance(raw_params, dict) and raw_params
+            else self.config
+        )
         payload = signal.payload_json if isinstance(getattr(signal, "payload_json", None), dict) else {}
         strategy_context = payload.get("strategy_context") if isinstance(payload.get("strategy_context"), dict) else {}
         copy_event = strategy_context.get("copy_event") if isinstance(strategy_context.get("copy_event"), dict) else {}

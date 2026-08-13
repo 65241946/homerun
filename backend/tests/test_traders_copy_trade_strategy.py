@@ -378,3 +378,41 @@ def test_copy_sells_mirror_inventory_reduction_path(monkeypatch):
     assert next(check for check in decision.checks if check.key == "sell_inventory").passed
     assert next(check for check in decision.checks if check.key == "sell_inventory_fraction").passed
     assert decision.size_usd == pytest.approx(4.0 * 0.62)
+
+
+def test_per_trader_params_override_shared_instance_config(monkeypatch):
+    """context['params'] must win over the shared singleton's own config.
+
+    The strategy instance is a process-wide singleton, so evaluating off
+    ``self.config`` applies one global config to every trader and silently
+    discards per-trader ``strategy_params``.  The orchestrator layers those
+    on top in ``_merged_eval_params`` and passes the result as
+    ``context['params']`` — this pins that the layered value is the one that
+    actually gates the decision.
+    """
+    now = datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(copy_trade_module, "utcnow", lambda: now)
+
+    strategy = TradersCopyTradeStrategy()
+    # Global config is permissive: the signal's $15.50 clears a $10 floor.
+    strategy.configure({"min_source_notional_usd": 10.0})
+    signal = _evaluation_signal(now=now, age_seconds=1)
+    trader = {"risk_limits": {"max_trade_notional_usd": 100.0}}
+
+    strict = strategy.evaluate(
+        signal,
+        {"mode": "shadow", "trader": trader, "params": {"min_source_notional_usd": 20.0}},
+    )
+    assert strict.decision == "skipped"
+    assert not next(c for c in strict.checks if c.key == "min_notional").passed
+
+    permissive = strategy.evaluate(
+        signal,
+        {"mode": "shadow", "trader": trader, "params": {"min_source_notional_usd": 5.0}},
+    )
+    assert permissive.decision == "selected"
+    assert next(c for c in permissive.checks if c.key == "min_notional").passed
+
+    # No params supplied (backtest / direct call): fall back to self.config.
+    fallback = strategy.evaluate(signal, {"mode": "shadow", "trader": trader})
+    assert fallback.decision == "selected"
