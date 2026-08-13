@@ -1587,3 +1587,75 @@ def test_snapshot_ready_for_runtime_accepts_current_fresh_scanner_quote_after_st
 
     assert runtime._snapshot_ready_for_runtime(snapshot) is True
     assert seen_max_age_seconds[-1] == pytest.approx(15.0)
+
+
+@pytest.mark.asyncio
+async def test_prewarm_execution_signals_bounds_a_hung_subscribe(monkeypatch):
+    """The subscribe+seed step must not be able to outlive the trader cycle.
+
+    ``_ensure_hot_subscriptions`` awaits a WS connect, a subscribe
+    round-trip and up to eight REST order-book fetches, each a 30s httpx
+    timeout with four retries behind a shared rate limiter.  Every other
+    caller schedules it as a detached task for exactly that reason; this
+    one awaits it inline on the trading hot path, inside a cycle whose
+    whole soft budget is 30s.  Unbounded, one throttled CLOB endpoint
+    parks the cycle for minutes and starves every sibling trader.
+
+    On timeout the batch is not blanket-failed: tokens a previous cycle
+    already subscribed still have live quotes, so each signal is judged
+    on its actual quote state.
+    """
+    hang_forever = asyncio.Event()
+
+    async def _hanging_subscribe(token_ids):
+        await hang_forever.wait()
+
+    class _Cache:
+        def is_fresh(self, token_id: str, *, max_age_seconds: float | None = None) -> bool:
+            return token_id == "fresh-token"
+
+        def get_mid_price(self, token_id: str):
+            return 0.42 if token_id == "fresh-token" else None
+
+    feed_manager = SimpleNamespace(
+        _started=True,
+        cache=_Cache(),
+        get_order_book=AsyncMock(return_value=None),
+        polymarket_feed=SimpleNamespace(
+            subscribe=_hanging_subscribe,
+            _subscribed_assets=set(),
+        ),
+    )
+    monkeypatch.setattr("services.intent_runtime.get_feed_manager", lambda: feed_manager)
+
+    runtime = IntentRuntime()
+    signals = [
+        SimpleNamespace(
+            id="fresh-signal",
+            source="traders",
+            direction="buy_yes",
+            required_token_ids=["fresh-token"],
+            payload_json={},
+        ),
+        SimpleNamespace(
+            id="slow-signal",
+            source="traders",
+            direction="buy_yes",
+            required_token_ids=["slow-token"],
+            payload_json={},
+        ),
+    ]
+
+    # The outer bound is 60x the inner one: if the inner bound is missing
+    # this raises TimeoutError instead of hanging out the CI job.
+    failures = await asyncio.wait_for(
+        runtime.prewarm_execution_signals(
+            signals,
+            timeout_seconds=0.0,
+            subscribe_timeout_seconds=0.05,
+        ),
+        timeout=3.0,
+    )
+
+    assert failures == {"slow-signal": "ws_subscribe_timeout"}
+    hang_forever.set()
