@@ -117,6 +117,19 @@ _RUNTIME_LANE_BY_SOURCE = {"crypto": "crypto"}
 _PREWARM_SOURCES = {"scanner"}
 _PREWARM_WAIT_TIMEOUT_SECONDS = 0.5
 _PREWARM_WAIT_POLL_SECONDS = 0.01
+# Hard ceiling on the subscribe+seed step when it is awaited inline on the
+# trading cycle.  Every other caller schedules ``_ensure_hot_subscriptions``
+# as a detached task precisely because it is unbounded: it can await a WS
+# connect, a subscribe round-trip, and up to
+# ``_HOT_SUBSCRIPTION_SEED_CONCURRENCY`` REST order-book fetches, each of
+# which is a 30s httpx timeout × 4 retries behind a shared rate limiter.
+# Awaited inline that is minutes, inside a trader cycle whose whole soft
+# budget is 30s — the cycle blows its timeout, holds its inflight slot, and
+# starves sibling traders.  2s is generous for a subscribe plus a couple of
+# seeds; past that the tokens are simply reported unsubscribed and their
+# signals defer to the next cycle, which is the outcome the caller already
+# handles.
+_EXECUTION_PREWARM_SUBSCRIBE_TIMEOUT_SECONDS = 2.0
 _SIGNAL_PUBLICATION_BATCH_SIZE = 200
 # Lookback for terminal-signal reactivation.  Was 24h, but production
 # (5 h soak, 5/2026/05) hit 5 GB RSS — terminal signals lingered for a
@@ -1328,6 +1341,7 @@ class IntentRuntime:
         signals: list[Any],
         *,
         timeout_seconds: float = _PREWARM_WAIT_TIMEOUT_SECONDS,
+        subscribe_timeout_seconds: float = _EXECUTION_PREWARM_SUBSCRIBE_TIMEOUT_SECONDS,
     ) -> dict[str, str]:
         """Subscribe executable signal tokens and report bounded-wait failures.
 
@@ -1335,6 +1349,10 @@ class IntentRuntime:
         context is built.  Producer-side prewarming is not sufficient for
         cross-plane ``traders`` signals because each process owns a distinct
         feed manager and subscription set.
+
+        Both waits are bounded: ``subscribe_timeout_seconds`` caps the
+        subscribe+seed step and ``timeout_seconds`` caps the poll for fresh
+        quotes.  Neither can hold the trader cycle open.
         """
         required_by_signal: dict[str, tuple[str, list[str]]] = {}
         all_token_ids: list[str] = []
@@ -1365,7 +1383,24 @@ class IntentRuntime:
                 all_token_ids.append(token_id)
 
         if all_token_ids:
-            await self._ensure_hot_subscriptions(all_token_ids)
+            # Bounded: this is the one call site that awaits the helper on
+            # the trading hot path, so it must not be able to outlive the
+            # cycle.  On timeout fall through rather than fail the batch —
+            # tokens subscribed by an earlier cycle still have live quotes
+            # and price cleanly, and the wait loop below judges each signal
+            # on its actual quote state instead of blanket-deferring.
+            try:
+                await asyncio.wait_for(
+                    self._ensure_hot_subscriptions(all_token_ids),
+                    timeout=subscribe_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Execution prewarm subscribe timed out",
+                    token_count=len(all_token_ids),
+                    signal_count=len(required_by_signal),
+                    timeout_seconds=subscribe_timeout_seconds,
+                )
 
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         while required_by_signal:
