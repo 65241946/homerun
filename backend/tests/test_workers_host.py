@@ -81,6 +81,14 @@ async def test_initialize_services_schedules_live_execution_in_background(monkey
     async def fake_memory_loop():
         await release.wait()
 
+    # ``_initialize_live_execution_background`` returns immediately when
+    # ``is_ready()`` — before it ever reaches ``initialize``.  The service is
+    # a module-level singleton, so an earlier test that leaves it ready makes
+    # this one hang on ``started.wait()`` for reasons that have nothing to do
+    # with the code under test.  Pin the precondition instead of inheriting it.
+    monkeypatch.setattr(host.live_execution_service, "is_ready", lambda: False)
+    monkeypatch.setattr(host.live_execution_service, "get_last_init_error", lambda: None)
+    monkeypatch.setattr(host.live_execution_service, "set_read_only", lambda _value: None)
     monkeypatch.setattr(host.live_execution_service, "initialize", fake_live_initialize)
     monkeypatch.setattr(database_module, "start_pool_watchdog", lambda: asyncio.create_task(fake_watchdog()))
     monkeypatch.setattr("utils.memory_diagnostic.memory_diagnostic_loop", fake_memory_loop)

@@ -202,13 +202,27 @@ def test_zero_copy_delay_preserves_existing_freshness_behavior(monkeypatch, age_
 
 
 def test_pathological_copy_delay_logs_explicit_warning(caplog):
-    with caplog.at_level(logging.WARNING):
+    # Attach caplog's handler to the module's own logger rather than
+    # asserting through the root.  This module is the one place in the
+    # codebase using stdlib ``logging.getLogger`` instead of
+    # ``utils.logger.get_logger``, and whichever test configures the
+    # app's logging first can leave the root without the handler caplog
+    # reads — so a root-level assertion passes or fails depending on
+    # collection order, not on behaviour.
+    module_logger = copy_trade_module.logger
+    previous_level = module_logger.level
+    module_logger.addHandler(caplog.handler)
+    module_logger.setLevel(logging.WARNING)
+    try:
         validate_traders_copy_trade_config(
             {
                 "copy_delay_seconds": 30,
                 "max_signal_age_seconds_hard_ceiling": 30,
             }
         )
+    finally:
+        module_logger.removeHandler(caplog.handler)
+        module_logger.setLevel(previous_level)
 
     assert "copy_delay_seconds" in caplog.text
     assert "hard ceiling" in caplog.text
