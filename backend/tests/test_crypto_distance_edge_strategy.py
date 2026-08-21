@@ -31,7 +31,7 @@ from services.ws_feeds import FeedManager, get_feed_manager
 # A 15-minute cycle ending at this fixed UTC timestamp (epoch millis).
 END_MS = 2_000_000_000_000  # arbitrary far-future ms
 CYCLE_MS = 900_000
-# Comfortably mid-cycle, well above the 10s min-seconds-to-resolution.
+# Comfortably mid-cycle, well above the 60s min-seconds-to-resolution.
 NOW_MS = END_MS - 300_000
 
 # CLOB token IDs are 50+ char hex strings on Polymarket — match length.
@@ -56,7 +56,9 @@ def fresh_cache():
 @pytest.fixture
 def strategy():
     s = CryptoDistanceEdgeStrategy()
-    s.configure({})  # use defaults (BTC only)
+    # Most tests isolate non-EV gates; provide an explicit researched uplift so
+    # those cases can reach the gate under test after the new positive-EV check.
+    s.configure({"edge_uplift_pct": 5.0})
     return s
 
 
@@ -120,6 +122,7 @@ def test_config_schema_exposes_all_user_knobs():
         "enabled",
         "assets",
         "distance_cost_tiers",
+        "distance_cost_tiers_bps",
         "max_cost_cents",
         "bet_size_usd",
         "min_seconds_to_resolution",
@@ -275,7 +278,7 @@ def test_skipped_when_oracle_source_not_chainlink(strategy, fresh_cache):
 def test_skipped_when_too_close_to_resolution(strategy, fresh_cache):
     _seed_book(fresh_cache, YES_TOKEN, ask_price=0.86)
     market = _build_market_dict()
-    now_ms = END_MS - 5_000  # only 5s left; default floor is 10s
+    now_ms = END_MS - 5_000  # only 5s left; default floor is 60s
     assert strategy._evaluate_market(market, now_ms=now_ms) is None
 
 
@@ -363,3 +366,46 @@ def test_edge_uplift_lifts_confidence_above_implied(fresh_cache):
     assert opp is not None
     # win prob = implied 0.86 + 0.05 uplift = 0.91
     assert opp.strategy_context["win_prob_estimate"] == pytest.approx(0.91, abs=1e-6)
+
+
+def test_default_implied_probability_rejects_negative_fee_adjusted_ev(fresh_cache):
+    s = CryptoDistanceEdgeStrategy()
+    s.configure({})
+    _seed_book(fresh_cache, YES_TOKEN, ask_price=0.86)
+    market = _build_market_dict(spot=BTC_REF + 250.0)
+    assert s._evaluate_market(market, now_ms=NOW_MS) is None
+
+
+def test_oracle_history_probability_can_clear_positive_ev_gate(fresh_cache):
+    s = CryptoDistanceEdgeStrategy()
+    s.configure({})
+    _seed_book(fresh_cache, YES_TOKEN, ask_price=0.86)
+    market = _build_market_dict(spot=BTC_REF + 250.0)
+    market["oracle_history"] = [
+        {"t": NOW_MS - 20_000, "p": BTC_REF + 240.0},
+        {"t": NOW_MS - 10_000, "p": BTC_REF + 245.0},
+        {"t": NOW_MS, "p": BTC_REF + 250.0},
+    ]
+    opp = s._evaluate_market(market, now_ms=NOW_MS)
+    assert opp is not None
+    assert opp.strategy_context["win_prob_estimate"] > 0.86
+
+
+def test_bps_tiers_take_priority_over_usd_tiers(fresh_cache):
+    s = CryptoDistanceEdgeStrategy()
+    s.configure({
+        "edge_uplift_pct": 5.0,
+        "distance_cost_tiers_bps": [
+            {"distance_bps": 10.0, "min_cost_cents": 80.0},
+            {"distance_bps": 20.0, "min_cost_cents": 85.0},
+        ],
+        "distance_cost_tiers": [
+            {"distance_usd": 1.0, "min_cost_cents": 99.0},
+        ],
+    })
+    _seed_book(fresh_cache, YES_TOKEN, ask_price=0.86)
+    market = _build_market_dict(spot=BTC_REF + 250.0)  # 25 bps
+    opp = s._evaluate_market(market, now_ms=NOW_MS)
+    assert opp is not None
+    assert opp.strategy_context["tier_basis"] == "bps"
+    assert opp.strategy_context["tier_distance_bps"] == pytest.approx(20.0)

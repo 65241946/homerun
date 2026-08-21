@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, type ReactNode, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, lazy, memo, Suspense, type ReactNode, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -5345,7 +5345,7 @@ type TradingPanelProps = {
   isConnected?: boolean
 }
 
-export default function TradingPanel({ isConnected = false }: TradingPanelProps = {}) {
+function TradingPanel({ isConnected = false }: TradingPanelProps = {}) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const [selectedAccountId, setSelectedAccountId] = useAtom(selectedAccountIdAtom)
@@ -8967,6 +8967,9 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
     if (terminalSlowMode) {
       // Push to queue; timer below drains one per second.
       slowModeQueueRef.current.push(...fresh)
+      if (slowModeQueueRef.current.length > terminalMaxRows) {
+        slowModeQueueRef.current.splice(0, slowModeQueueRef.current.length - terminalMaxRows)
+      }
       if (slowModeTimerRef.current == null) {
         slowModeTimerRef.current = window.setInterval(() => {
           const next = slowModeQueueRef.current.shift()
@@ -8989,6 +8992,12 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
         merged.sort((a, b) => toTs(b.ts) - toTs(a.ts))
         return merged.slice(0, terminalMaxRows)
       })
+    }
+    if (seen.size > TERMINAL_ACTIVITY_MAX_ROWS * 4) {
+      seenIdsRef.current = new Set(
+        [...filteredTraderActivityRows, ...displayedActivityRows, ...slowModeQueueRef.current]
+          .map((row) => `${row.kind}:${row.id}`)
+      )
     }
   }, [filteredTraderActivityRows, terminalPaused, terminalSlowMode, terminalMaxRows, displayedActivityRows.length])
 
@@ -13425,5 +13434,5 @@ export default function TradingPanel({ isConnected = false }: TradingPanelProps 
   )
 }
 
-
+export default memo(TradingPanel)
 

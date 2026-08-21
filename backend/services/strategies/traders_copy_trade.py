@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from utils.utcnow import utcnow  # replay-clock-aware "now" (honors backtest sim time)
@@ -15,6 +16,8 @@ from services.data_events import EventType
 from services.strategies.base import BaseStrategy, DecisionCheck, ExitDecision, StrategyDecision, _trader_size_limits
 from services.strategy_sdk import StrategySDK
 from utils.converters import coerce_bool as _coerce_bool, safe_float, to_confidence
+
+logger = logging.getLogger(__name__)
 
 # Outer safety ceiling on user-configured max_signal_age_seconds. The user's
 # UI param is authoritative within this bound (set generously high so the
@@ -35,6 +38,7 @@ TRADERS_COPY_TRADE_DEFAULTS: dict[str, Any] = {
     "max_signal_age_seconds_hard_ceiling": 600.0,
     "min_live_liquidity_usd": 150.0,
     "max_adverse_entry_drift_pct": 2.0,
+    "require_live_context": False,
     "copy_delay_seconds": 0,
     "copy_existing_positions_on_start": False,
     "copy_buys": True,
@@ -42,22 +46,16 @@ TRADERS_COPY_TRADE_DEFAULTS: dict[str, Any] = {
     "max_position_size": 1000.0,
     "proportional_sizing": True,
     "proportional_multiplier": 1.0,
-    "max_copy_drawdown_pct": 100.0,
+    "max_copy_drawdown_pct": 50.0,
     "max_copy_daily_loss_usd": 1_000_000.0,
     "max_copy_source_exposure_usd": 1_000_000.0,
     "leader_weights": {},
     "default_leader_weight": 1.0,
     "max_leader_exposure_usd": 1_000_000.0,
-    "leader_allocation_cap_pct": 100.0,
+    "leader_allocation_cap_pct": 25.0,
     "require_inventory_for_sells": True,
     "allow_partial_inventory_sells": True,
     "min_inventory_fraction": 0.25,
-    # Edge-percent calculation: edge = abs(entry_price - edge_midpoint) * edge_multiplier.
-    # The defaults (0.5, 200) preserve historical behavior (which was hardcoded
-    # in _build_copy_opportunity); exposing them as params lets users tune
-    # how aggressively the edge is scored without editing strategy code.
-    "edge_midpoint": 0.5,
-    "edge_multiplier": 200.0,
     "traders_scope": {
         "modes": ["tracked", "pool"],
         "individual_wallets": [],
@@ -80,6 +78,13 @@ TRADERS_COPY_TRADE_CONFIG_SCHEMA: dict[str, Any] = {
             "max": 100,
             "phase": "signal",
         },
+        {
+            "key": "require_live_context",
+            "label": "Require Live Context",
+            "type": "boolean",
+            "phase": "signal",
+            "description": "Reject missing live liquidity or entry drift context; recommended for live mode.",
+        },
         {"key": "copy_delay_seconds", "label": "Copy Delay (sec)", "type": "integer", "min": 0, "max": 300, "phase": "signal"},
         {"key": "copy_existing_positions_on_start", "label": "Copy Existing Open Positions On Start", "type": "boolean"},
         {"key": "copy_buys", "label": "Copy Buys", "type": "boolean"},
@@ -88,11 +93,29 @@ TRADERS_COPY_TRADE_CONFIG_SCHEMA: dict[str, Any] = {
         {"key": "proportional_sizing", "label": "Proportional Sizing", "type": "boolean"},
         {"key": "proportional_multiplier", "label": "Proportional Multiplier", "type": "number", "min": 0.01, "max": 100},
         {"key": "max_copy_drawdown_pct", "label": "Max Copy Drawdown (%)", "type": "number", "min": 0, "max": 100},
-        {"key": "max_copy_daily_loss_usd", "label": "Max Copy Daily Loss (USD)", "type": "number", "min": 0},
-        {"key": "max_copy_source_exposure_usd", "label": "Max Copy Source Exposure (USD)", "type": "number", "min": 0},
+        {
+            "key": "max_copy_daily_loss_usd",
+            "label": "Max Copy Daily Loss (USD)",
+            "type": "number",
+            "min": 0,
+            "description": "上线实盘前必须按账户规模设置",
+        },
+        {
+            "key": "max_copy_source_exposure_usd",
+            "label": "Max Copy Source Exposure (USD)",
+            "type": "number",
+            "min": 0,
+            "description": "上线实盘前必须按账户规模设置",
+        },
         {"key": "leader_weights", "label": "Leader Weights", "type": "object"},
         {"key": "default_leader_weight", "label": "Default Leader Weight", "type": "number", "min": 0, "max": 100},
-        {"key": "max_leader_exposure_usd", "label": "Max Leader Exposure (USD)", "type": "number", "min": 0},
+        {
+            "key": "max_leader_exposure_usd",
+            "label": "Max Leader Exposure (USD)",
+            "type": "number",
+            "min": 0,
+            "description": "上线实盘前必须按账户规模设置",
+        },
         {
             "key": "leader_allocation_cap_pct",
             "label": "Leader Allocation Cap (%)",
@@ -103,24 +126,6 @@ TRADERS_COPY_TRADE_CONFIG_SCHEMA: dict[str, Any] = {
         {"key": "require_inventory_for_sells", "label": "Require Inventory For Sells", "type": "boolean"},
         {"key": "allow_partial_inventory_sells", "label": "Allow Partial Inventory Sells", "type": "boolean"},
         {"key": "min_inventory_fraction", "label": "Min Inventory Fraction", "type": "number", "min": 0, "max": 1},
-        {
-            "key": "edge_midpoint",
-            "label": "Edge Midpoint",
-            "type": "number",
-            "min": 0,
-            "max": 1,
-            "phase": "signal",
-            "description": "Reference price (0-1) used for edge calculation: edge = abs(entry_price - midpoint) * multiplier. Default 0.5.",
-        },
-        {
-            "key": "edge_multiplier",
-            "label": "Edge Multiplier",
-            "type": "number",
-            "min": 0,
-            "max": 1000,
-            "phase": "signal",
-            "description": "Multiplier applied to the price-vs-midpoint distance to compute edge_percent. Default 200.",
-        },
         {
             "key": "traders_scope",
             "label": "Wallet Scope",
@@ -175,8 +180,10 @@ def validate_traders_copy_trade_config(config: Any) -> dict[str, Any]:
         "min_source_notional_usd",
         "max_entry_price",
         "max_signal_age_seconds",
+        "max_signal_age_seconds_hard_ceiling",
         "min_live_liquidity_usd",
         "max_adverse_entry_drift_pct",
+        "require_live_context",
         "copy_delay_seconds",
         "copy_existing_positions_on_start",
         "copy_buys",
@@ -194,8 +201,6 @@ def validate_traders_copy_trade_config(config: Any) -> dict[str, Any]:
         "require_inventory_for_sells",
         "allow_partial_inventory_sells",
         "min_inventory_fraction",
-        "edge_midpoint",
-        "edge_multiplier",
         "traders_scope",
         "max_opportunities",
         "retention_max_opportunities",
@@ -213,16 +218,35 @@ def validate_traders_copy_trade_config(config: Any) -> dict[str, Any]:
     cfg["min_source_notional_usd"] = _coerce_float(cfg.get("min_source_notional_usd"), 10.0, 0.0, 1_000_000.0)
     cfg["max_entry_price"] = _coerce_float(cfg.get("max_entry_price"), 0.98, 0.0, 1.0)
     cfg["max_signal_age_seconds"] = _coerce_int(cfg.get("max_signal_age_seconds"), 5, 1, 600)
+    cfg["max_signal_age_seconds_hard_ceiling"] = _coerce_float(
+        cfg.get("max_signal_age_seconds_hard_ceiling"),
+        _MAX_LIVE_COPY_SIGNAL_AGE_SECONDS_HARD_CEILING,
+        1.0,
+        _MAX_LIVE_COPY_SIGNAL_AGE_SECONDS_HARD_CEILING,
+    )
     cfg["min_live_liquidity_usd"] = _coerce_float(cfg.get("min_live_liquidity_usd"), 150.0, 0.0, 1_000_000_000.0)
     cfg["max_adverse_entry_drift_pct"] = _coerce_float(cfg.get("max_adverse_entry_drift_pct"), 2.0, 0.0, 100.0)
+    cfg["require_live_context"] = _coerce_bool(cfg.get("require_live_context"), False)
     cfg["copy_delay_seconds"] = _coerce_int(cfg.get("copy_delay_seconds"), 0, 0, 300)
+    if cfg["copy_delay_seconds"] >= cfg["max_signal_age_seconds_hard_ceiling"]:
+        logger.warning(
+            "copy_delay_seconds=%ss is greater than or equal to the max signal age hard ceiling=%ss; "
+            "the live-copy freshness window is empty",
+            cfg["copy_delay_seconds"],
+            cfg["max_signal_age_seconds_hard_ceiling"],
+        )
     cfg["copy_existing_positions_on_start"] = _coerce_bool(cfg.get("copy_existing_positions_on_start"), False)
     cfg["copy_buys"] = _coerce_bool(cfg.get("copy_buys"), True)
     cfg["copy_sells"] = _coerce_bool(cfg.get("copy_sells"), True)
     cfg["max_position_size"] = _coerce_float(cfg.get("max_position_size"), 1000.0, 1.0, 1_000_000.0)
     cfg["proportional_sizing"] = _coerce_bool(cfg.get("proportional_sizing"), True)
     cfg["proportional_multiplier"] = _coerce_float(cfg.get("proportional_multiplier"), 1.0, 0.01, 100.0)
-    cfg["max_copy_drawdown_pct"] = _coerce_float(cfg.get("max_copy_drawdown_pct"), 100.0, 0.0, 100.0)
+    cfg["max_copy_drawdown_pct"] = _coerce_float(
+        cfg.get("max_copy_drawdown_pct"),
+        TRADERS_COPY_TRADE_DEFAULTS["max_copy_drawdown_pct"],
+        0.0,
+        100.0,
+    )
     cfg["max_copy_daily_loss_usd"] = _coerce_float(cfg.get("max_copy_daily_loss_usd"), 1_000_000.0, 0.0, 100_000_000.0)
     cfg["max_copy_source_exposure_usd"] = _coerce_float(
         cfg.get("max_copy_source_exposure_usd"), 1_000_000.0, 0.0, 100_000_000.0
@@ -236,12 +260,15 @@ def validate_traders_copy_trade_config(config: Any) -> dict[str, Any]:
     cfg["max_leader_exposure_usd"] = _coerce_float(
         cfg.get("max_leader_exposure_usd"), 1_000_000.0, 0.0, 100_000_000.0
     )
-    cfg["leader_allocation_cap_pct"] = _coerce_float(cfg.get("leader_allocation_cap_pct"), 100.0, 0.0, 100.0)
+    cfg["leader_allocation_cap_pct"] = _coerce_float(
+        cfg.get("leader_allocation_cap_pct"),
+        TRADERS_COPY_TRADE_DEFAULTS["leader_allocation_cap_pct"],
+        0.0,
+        100.0,
+    )
     cfg["require_inventory_for_sells"] = _coerce_bool(cfg.get("require_inventory_for_sells"), True)
     cfg["allow_partial_inventory_sells"] = _coerce_bool(cfg.get("allow_partial_inventory_sells"), True)
     cfg["min_inventory_fraction"] = _coerce_float(cfg.get("min_inventory_fraction"), 0.25, 0.0, 1.0)
-    cfg["edge_midpoint"] = _coerce_float(cfg.get("edge_midpoint"), 0.5, 0.0, 1.0)
-    cfg["edge_multiplier"] = _coerce_float(cfg.get("edge_multiplier"), 200.0, 0.0, 1000.0)
     cfg["traders_scope"] = StrategySDK.validate_trader_scope_config(cfg.get("traders_scope"))
     return StrategySDK.normalize_strategy_retention_config(cfg)
 
@@ -357,29 +384,23 @@ class TradersCopyTradeStrategy(BaseStrategy):
             copy_event.get("wallet_address")
             or source_trade.get("wallet_address")
         )
-        confidence = to_confidence(copy_event.get("confidence"), 0.70)
+        confidence = to_confidence(
+            copy_event.get("confidence"),
+            TRADERS_COPY_TRADE_DEFAULTS["min_confidence"],
+        )
         source_notional = safe_float(source_trade.get("source_notional_usd"), 0.0)
         if source_notional <= 0.0:
             source_notional = max(0.0, entry_price * size)
 
-        # Edge-percent calculation reads its midpoint and multiplier from
-        # the strategy config so the user can tune them in the bot's
-        # strategy params editor without editing this code.
-        cfg = getattr(self, "config", None) or {}
-        edge_midpoint = safe_float(cfg.get("edge_midpoint"), 0.5)
-        edge_multiplier = safe_float(cfg.get("edge_multiplier"), 200.0)
-        edge_percent = (
-            max(0.0, abs(edge_midpoint - entry_price) * edge_multiplier)
-            if 0.0 <= entry_price <= 1.0
-            else 0.0
-        )
-        expected_payout = min(1.0, entry_price + max(0.01, edge_percent / 100.0))
+        edge_ev = confidence - entry_price
+        edge_percent = max(0.0, edge_ev / entry_price * 100.0) if entry_price > 0.0 else 0.0
+        expected_payout = min(1.0, max(0.0, confidence))
+        copy_event_timestamp = _to_utc(copy_event.get("timestamp"))
         detected_at = _to_utc(
             copy_event.get("detected_at")
             or source_trade.get("detected_at")
-            or copy_event.get("timestamp")
-            or source_trade.get("timestamp")
-        ) or utcnow()
+        ) or copy_event_timestamp or _to_utc(source_trade.get("timestamp")) or utcnow()
+        resolution_date = _to_utc(market.get("end_date") or market.get("endDate"))
 
         source_item_id = str(payload.get("source_item_id") or "").strip()
         if not source_item_id:
@@ -401,11 +422,7 @@ class TradersCopyTradeStrategy(BaseStrategy):
             "order_hash": str(copy_event.get("order_hash") or ""),
             "log_index": int(copy_event.get("log_index") or 0),
             "block_number": int(copy_event.get("block_number") or 0),
-            "timestamp": (
-                _to_utc(copy_event.get("timestamp")).isoformat()
-                if _to_utc(copy_event.get("timestamp")) is not None
-                else None
-            ),
+            "timestamp": copy_event_timestamp.isoformat() if copy_event_timestamp is not None else None,
             "detected_at": detected_at.isoformat(),
             "latency_ms": max(0.0, safe_float(copy_event.get("latency_ms"), 0.0)),
             "confidence": confidence,
@@ -489,7 +506,7 @@ class TradersCopyTradeStrategy(BaseStrategy):
             detected_at=detected_at,
             last_detected_at=detected_at,
             last_seen_at=detected_at,
-            resolution_date=detected_at + timedelta(minutes=15),
+            **({"resolution_date": resolution_date} if resolution_date is not None else {}),
             positions_to_take=[
                 {
                     "action": execution_side,
@@ -534,7 +551,21 @@ class TradersCopyTradeStrategy(BaseStrategy):
 
     def evaluate(self, signal: Any, context: dict[str, Any]) -> StrategyDecision:
         context_payload = context if isinstance(context, dict) else {}
-        params = validate_traders_copy_trade_config(context_payload.get("params") or {})
+        # ``context["params"]`` is the strategy's DB config with this trader's
+        # ``strategy_params`` layered on top (the orchestrator's
+        # ``_merged_eval_params``).  It must win: the instance is a shared
+        # singleton, so evaluating off ``self.config`` would apply one global
+        # config to every trader and silently drop per-trader tuning.  When a
+        # caller supplies no params — backtests and direct unit calls — the
+        # already-validated ``self.config`` is used as-is, so the common
+        # orchestrator path validates once per signal and the paramless path
+        # not at all.
+        raw_params = context_payload.get("params")
+        params = (
+            validate_traders_copy_trade_config(raw_params)
+            if isinstance(raw_params, dict) and raw_params
+            else self.config
+        )
         payload = signal.payload_json if isinstance(getattr(signal, "payload_json", None), dict) else {}
         strategy_context = payload.get("strategy_context") if isinstance(payload.get("strategy_context"), dict) else {}
         copy_event = strategy_context.get("copy_event") if isinstance(strategy_context.get("copy_event"), dict) else {}
@@ -588,18 +619,27 @@ class TradersCopyTradeStrategy(BaseStrategy):
         if live_entry_price is not None and live_entry_price > 0.0:
             entry_price = live_entry_price
             entry_price_source = "live_market"
-        confidence = to_confidence(getattr(signal, "confidence", copy_event.get("confidence")), 0.0)
+        confidence = to_confidence(
+            getattr(signal, "confidence", copy_event.get("confidence")),
+            TRADERS_COPY_TRADE_DEFAULTS["min_confidence"],
+        )
         source_notional = safe_float(source_trade.get("source_notional_usd"), 0.0)
         if source_notional <= 0.0:
             source_size = safe_float(copy_event.get("size"), 0.0)
             sizing_price = signal_entry_price if signal_entry_price > 0.0 else entry_price
             source_notional = max(0.0, source_size * max(0.0, sizing_price))
 
-        max_copy_drawdown_pct = safe_float(params.get("max_copy_drawdown_pct"), 100.0)
+        max_copy_drawdown_pct = safe_float(
+            params.get("max_copy_drawdown_pct"),
+            TRADERS_COPY_TRADE_DEFAULTS["max_copy_drawdown_pct"],
+        )
         max_copy_daily_loss_usd = safe_float(params.get("max_copy_daily_loss_usd"), 1_000_000.0)
         max_copy_source_exposure_usd = safe_float(params.get("max_copy_source_exposure_usd"), 1_000_000.0)
         max_leader_exposure_usd = safe_float(params.get("max_leader_exposure_usd"), 1_000_000.0)
-        leader_allocation_cap_pct = safe_float(params.get("leader_allocation_cap_pct"), 100.0)
+        leader_allocation_cap_pct = safe_float(
+            params.get("leader_allocation_cap_pct"),
+            TRADERS_COPY_TRADE_DEFAULTS["leader_allocation_cap_pct"],
+        )
         leader_weights = (
             params.get("leader_weights")
             if isinstance(params.get("leader_weights"), dict)
@@ -633,8 +673,12 @@ class TradersCopyTradeStrategy(BaseStrategy):
                 _MAX_LIVE_COPY_SIGNAL_AGE_SECONDS_HARD_CEILING,
             ),
         )
-        max_signal_age_seconds = min(hard_ceiling, requested_max_signal_age_seconds)
-        age_seconds = max_signal_age_seconds + 1.0
+        copy_delay_seconds = max(0.0, safe_float(params.get("copy_delay_seconds"), 0.0))
+        effective_max_age_seconds = min(
+            hard_ceiling,
+            copy_delay_seconds + requested_max_signal_age_seconds,
+        )
+        age_seconds = effective_max_age_seconds + 1.0
         if detected_at is not None:
             age_seconds = max(0.0, (utcnow() - detected_at).total_seconds())
 
@@ -679,10 +723,15 @@ class TradersCopyTradeStrategy(BaseStrategy):
 
         copy_buys = bool(params.get("copy_buys", True))
         copy_sells = bool(params.get("copy_sells", True))
-        copy_delay_seconds = max(0.0, safe_float(params.get("copy_delay_seconds"), 0.0))
+        require_live_context = bool(
+            params.get("require_live_context", TRADERS_COPY_TRADE_DEFAULTS["require_live_context"])
+        )
         min_live_liquidity_usd = max(0.0, safe_float(params.get("min_live_liquidity_usd"), 150.0))
         live_liquidity = safe_float(live_market.get("liquidity_usd"), None)
-        liquidity_passed = live_liquidity is None or live_liquidity >= min_live_liquidity_usd
+        if require_live_context:
+            liquidity_passed = live_liquidity is not None and live_liquidity >= min_live_liquidity_usd
+        else:
+            liquidity_passed = live_liquidity is None or live_liquidity >= min_live_liquidity_usd
         max_adverse_entry_drift_pct = max(0.0, safe_float(params.get("max_adverse_entry_drift_pct"), 2.0))
         entry_drift_pct = safe_float(live_market.get("entry_price_delta_pct"), None)
         adverse_entry_drift_pct = None
@@ -693,7 +742,16 @@ class TradersCopyTradeStrategy(BaseStrategy):
                 adverse_entry_drift_pct = max(0.0, -entry_drift_pct)
             else:
                 adverse_entry_drift_pct = abs(entry_drift_pct)
-        drift_passed = adverse_entry_drift_pct is None or adverse_entry_drift_pct <= max_adverse_entry_drift_pct
+        if require_live_context:
+            drift_passed = (
+                adverse_entry_drift_pct is not None
+                and adverse_entry_drift_pct <= max_adverse_entry_drift_pct
+            )
+        else:
+            drift_passed = (
+                adverse_entry_drift_pct is None
+                or adverse_entry_drift_pct <= max_adverse_entry_drift_pct
+            )
 
         checks = [
             DecisionCheck("source", "Source is traders", source == "traders", detail="requires source=traders"),
@@ -788,10 +846,10 @@ class TradersCopyTradeStrategy(BaseStrategy):
             DecisionCheck(
                 "max_age",
                 "Signal freshness",
-                age_seconds <= max_signal_age_seconds,
+                age_seconds <= effective_max_age_seconds,
                 score=age_seconds,
                 detail=(
-                    f"max={max_signal_age_seconds:.0f}s "
+                    f"max={effective_max_age_seconds:.0f}s "
                     f"requested={requested_max_signal_age_seconds:.0f}s"
                 ),
             ),

@@ -35,6 +35,22 @@ def test_validate_strategy_source_rejects_blocked_import():
     assert any("Blocked import" in err for err in validation["errors"])
 
 
+def test_validate_strategy_source_accepts_ml_capability_import():
+    source_code = "\n".join(
+        [
+            "from services.strategies.base import BaseStrategy",
+            "from services.ml import MLCapability",
+            "",
+            "class MLCapabilityStrategy(BaseStrategy):",
+            "    ml_capability = MLCapability(task_key='test', label='Test')",
+            "    def detect(self, events, markets, prices):",
+            "        return []",
+        ]
+    )
+    validation = validate_strategy_source(source_code, "MLCapabilityStrategy")
+    assert validation["valid"] is True
+
+
 def test_validate_strategy_source_accepts_detect_async_only_strategy():
     source_code = "\n".join(
         [

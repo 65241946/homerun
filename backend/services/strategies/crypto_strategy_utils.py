@@ -99,12 +99,33 @@ def spread_pct_from_row(row: dict[str, Any]) -> float:
 
 def taker_fee_pct(entry_price: float) -> float:
     price = clamp(float(entry_price), 0.0001, 0.9999)
-    return 0.25 * ((price * (1.0 - price)) ** 2)
+    return polymarket_taker_fee_pct(price, category="crypto")
 
 
 def bounded_sigmoid(z: float) -> float:
     bounded = clamp(float(z), -60.0, 60.0)
     return 1.0 / (1.0 + math.exp(-bounded))
+
+
+def estimate_p_win(
+    diff_pct: float,
+    elapsed_ratio: float,
+    *,
+    base_scale: float,
+    min_scale: float,
+    prob_min: float,
+    prob_max: float,
+) -> float:
+    """Estimate binary win probability from an oracle-price divergence.
+
+    Crypto strategies share a 0.30 lower confidence-clamp convention; that
+    clamp must remain below each strategy's default ``min_confidence`` so the
+    confidence gate, rather than the clamp, remains authoritative.
+    """
+    elapsed = clamp(float(elapsed_ratio), 0.0, 1.0)
+    scale = max(float(min_scale), float(base_scale) * (1.0 - elapsed))
+    probability = bounded_sigmoid(float(diff_pct) / scale)
+    return clamp(probability, float(prob_min), float(prob_max))
 
 
 def normalize_ratio(value: Any) -> float | None:
@@ -322,7 +343,58 @@ def fee_aware_min_edge_pct(price: float, multiplier: float = 2.0) -> float:
     fees by ``multiplier``× at the given entry price. Returns a percentage so
     callers can compare directly against existing edge fields that are also
     expressed in percent."""
-    return polymarket_taker_fee_pct(price) * 100.0 * float(multiplier)
+    return polymarket_taker_fee_pct(price, category="crypto") * 100.0 * float(multiplier)
+
+
+def realized_vol_per_sec(
+    history: Any,
+    *,
+    now_ms: float,
+    lookback_seconds: float,
+    min_intervals: int,
+    min_span_seconds: float,
+) -> tuple[float | None, int, float]:
+    """Canonical realized volatility per second from irregular oracle samples."""
+    if not isinstance(history, list) or len(history) < 2:
+        return None, 0, 0.0
+    cutoff_ms = now_ms - lookback_seconds * 1000.0
+    points: list[tuple[float, float]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        timestamp_ms = safe_float(item.get("t"), None)
+        price = safe_float(item.get("p"), None)
+        if (
+            timestamp_ms is None
+            or price is None
+            or price <= 0.0
+            or timestamp_ms < cutoff_ms
+            or timestamp_ms > now_ms + 1000.0
+        ):
+            continue
+        points.append((timestamp_ms, price))
+    if len(points) < min_intervals + 1:
+        return None, max(0, len(points) - 1), 0.0
+    points.sort(key=lambda point: point[0])
+    span_seconds = (points[-1][0] - points[0][0]) / 1000.0
+    sum_squared_returns = 0.0
+    sum_seconds = 0.0
+    usable_intervals = 0
+    for (t0, p0), (t1, p1) in zip(points, points[1:]):
+        delta_seconds = (t1 - t0) / 1000.0
+        if delta_seconds <= 0.0 or delta_seconds > 60.0:
+            continue
+        log_return = math.log(p1 / p0)
+        sum_squared_returns += log_return * log_return
+        sum_seconds += delta_seconds
+        usable_intervals += 1
+    if (
+        usable_intervals < min_intervals
+        or sum_seconds <= 0.0
+        or span_seconds < min_span_seconds
+    ):
+        return None, usable_intervals, span_seconds
+    return math.sqrt(sum_squared_returns / sum_seconds), usable_intervals, span_seconds
 
 
 # ---------------------------------------------------------------------------

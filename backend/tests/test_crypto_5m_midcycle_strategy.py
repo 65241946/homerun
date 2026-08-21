@@ -123,6 +123,7 @@ def test_config_schema_exposes_all_user_knobs():
         "midcycle_seconds",
         "min_seconds_to_resolution",
         "max_oracle_age_ms",
+        "win_prob_estimate",
     } <= keys
 
 
@@ -396,3 +397,31 @@ def test_happy_path_opportunity_carries_full_context(strategy, fresh_cache):
     assert ctx["distance_bps"] == pytest.approx(20.0, rel=1e-3)
     assert ctx["oracle_source"] == "chainlink"
     assert ctx["bet_size_usd"] == pytest.approx(15.0)
+    assert ctx["taker_fee"] > 0.0
+    assert ctx["net_ev_per_share"] == pytest.approx(
+        ctx["win_prob_estimate"] - ctx["vwap_price"] - ctx["taker_fee"]
+    )
+
+
+def test_configured_win_probability_is_used_as_history_fallback(fresh_cache):
+    s = Crypto5mMidcycleStrategy()
+    s.configure({"win_prob_estimate": 0.67})
+    _seed_book(fresh_cache, YES_TOKEN, ask_price=0.55)
+    opp = s._evaluate_market(_build_market_dict(), now_ms=MIDCYCLE_MS)
+    assert opp is not None
+    assert opp.strategy_context["win_prob_estimate"] == pytest.approx(0.67)
+
+
+def test_oracle_history_probability_overrides_configured_fallback(fresh_cache):
+    s = Crypto5mMidcycleStrategy()
+    s.configure({"win_prob_estimate": 0.51})
+    _seed_book(fresh_cache, YES_TOKEN, ask_price=0.55)
+    market = _build_market_dict()
+    market["oracle_history"] = [
+        {"t": MIDCYCLE_MS - 20_000, "p": 100.18},
+        {"t": MIDCYCLE_MS - 10_000, "p": 100.19},
+        {"t": MIDCYCLE_MS, "p": 100.20},
+    ]
+    opp = s._evaluate_market(market, now_ms=MIDCYCLE_MS)
+    assert opp is not None
+    assert opp.strategy_context["win_prob_estimate"] > 0.51

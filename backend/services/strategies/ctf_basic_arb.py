@@ -81,6 +81,16 @@ class CTFBasicArbStrategy(BaseStrategy):
         "min_position_size": 10.0,
     }
 
+    @property
+    def pipeline_defaults(self) -> dict[str, Any]:
+        config = getattr(self, "config", {}) or {}
+        return {
+            "min_edge_percent": config.get(
+                "min_edge_percent",
+                self.default_config["min_edge_percent"],
+            ),
+        }
+
     @staticmethod
     def _quotes_for_market(market: Market, prices: dict[str, dict]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         token_ids = list(getattr(market, "clob_token_ids", []) or [])
@@ -267,7 +277,11 @@ class CTFBasicArbStrategy(BaseStrategy):
             return None
 
         proceeds = yes_bid + no_bid
-        fee_per_share = polymarket_taker_fee(yes_bid) + polymarket_taker_fee(no_bid)
+        category = event.category if event else None
+        fee_per_share = polymarket_taker_fee(yes_bid, category=category) + polymarket_taker_fee(
+            no_bid,
+            category=category,
+        )
         net_proceeds = proceeds - fee_per_share - self._gas_per_share(config)
         edge_percent = (net_proceeds - 1.0) * 100.0
         min_edge_percent = max(0.0, to_float(config.get("min_edge_percent", 0.60), 0.60))
@@ -355,7 +369,11 @@ class CTFBasicArbStrategy(BaseStrategy):
             return None
 
         buy_cost = yes_ask + no_ask
-        fee_per_share = polymarket_taker_fee(yes_ask) + polymarket_taker_fee(no_ask)
+        category = event.category if event else None
+        fee_per_share = polymarket_taker_fee(yes_ask, category=category) + polymarket_taker_fee(
+            no_ask,
+            category=category,
+        )
         total_cost = buy_cost + fee_per_share + self._gas_per_share(config)
         edge_percent = (1.0 - total_cost) * 100.0
         min_edge_percent = max(0.0, to_float(config.get("min_edge_percent", 0.60), 0.60))

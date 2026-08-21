@@ -72,7 +72,9 @@ class CryptoEntropyMakerStrategy(BaseStrategy):
     default_config = {
         "min_edge_percent": 1.0,
         "min_confidence": 0.40,
-        "min_entropy": 0.82,
+        # H(0.80)=0.722, so 0.82 was mathematically incompatible with the
+        # default min_entry_price=0.80. Keep the knob, disabled by default.
+        "min_entropy": 0.0,
         "min_spread_pct": 0.006,
         "max_spread_pct": 0.065,
         "max_spread_widening_bps": 22.0,
@@ -126,6 +128,7 @@ class CryptoEntropyMakerStrategy(BaseStrategy):
     def __init__(self) -> None:
         super().__init__()
         self.min_profit = 0.0
+        self._last_rejection_reason: str | None = None
 
     @staticmethod
     def _row_market(row: dict[str, Any]) -> Market | None:
@@ -133,8 +136,11 @@ class CryptoEntropyMakerStrategy(BaseStrategy):
 
     def _score_market(self, row: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any] | None:
         gates: list[GateResult] = []
+        self._last_rejection_reason = None
 
         def _emit_reject(verbosity: str = MURMUR) -> None:
+            failed_gate = next((gate for gate in reversed(gates) if gate.passed is False), None)
+            self._last_rejection_reason = failed_gate.name if failed_gate else "scoring_gate_failed"
             emit_evaluation_nowait(
                 strategy_slug="crypto_entropy_maker",
                 market=row,
@@ -213,7 +219,7 @@ class CryptoEntropyMakerStrategy(BaseStrategy):
         prob_yes = up_price / total if total > 0 else 0.5
         entropy = _probability_entropy(prob_yes)
 
-        min_entropy = max(0.0, min(1.0, to_float(cfg.get("min_entropy", 0.82), 0.82)))
+        min_entropy = max(0.0, min(1.0, to_float(cfg.get("min_entropy", 0.0), 0.0)))
         entropy_ok = entropy >= min_entropy
         gates.append(GateResult(
             "min_entropy", "Min binary entropy", entropy_ok,
@@ -421,7 +427,7 @@ class CryptoEntropyMakerStrategy(BaseStrategy):
         if not fee_clearance_ok:
             _emit_reject(MURMUR)
             return None
-        taker_fee_pct_value = polymarket_taker_fee_pct(entry_price) * 100.0
+        taker_fee_pct_value = polymarket_taker_fee_pct(entry_price, category="crypto") * 100.0
 
         # Confidence
         confidence = clamp(
@@ -429,17 +435,17 @@ class CryptoEntropyMakerStrategy(BaseStrategy):
             + clamp(entropy - 0.5, 0, 0.20)
             + clamp(abs(diff_pct or 0) / 10.0, 0, 0.15)
             + clamp((1 - (spread or 0) / 0.065) * 0.08, 0, 0.08),
-            0.40,
+            0.30,
             0.92,
         )
         if cancel_recovery is not None:
-            confidence = clamp(confidence + clamp(cancel_recovery * 0.12, 0.0, 0.08), 0.40, 0.92)
+            confidence = clamp(confidence + clamp(cancel_recovery * 0.12, 0.0, 0.08), 0.30, 0.92)
         if flow_imbalance is not None:
-            confidence = clamp(confidence + clamp(flow_imbalance * 0.08, 0.0, 0.05), 0.40, 0.92)
+            confidence = clamp(confidence + clamp(flow_imbalance * 0.08, 0.0, 0.05), 0.30, 0.92)
         if recent_move_zscore is not None:
             confidence = clamp(
                 confidence + clamp(abs(recent_move_zscore) / 6.0, 0.0, 0.04),
-                0.40,
+                0.30,
                 0.92,
             )
 
@@ -584,120 +590,6 @@ class CryptoEntropyMakerStrategy(BaseStrategy):
         }
         return opp
 
-    def _rejection_reason(self, row: dict[str, Any], cfg: dict[str, Any]) -> str:
-        up_price = safe_float(row.get("up_price"), None)
-        down_price = safe_float(row.get("down_price"), None)
-        if up_price is None or down_price is None:
-            return "missing_prices"
-        if not (0.0 < up_price < 1.0 and 0.0 < down_price < 1.0):
-            return "invalid_prices"
-
-        total = up_price + down_price
-        prob_yes = up_price / total if total > 0 else 0.5
-        entropy = _probability_entropy(prob_yes)
-        min_entropy = max(0.0, min(1.0, to_float(cfg.get("min_entropy", 0.82), 0.82)))
-        if entropy < min_entropy:
-            return "low_entropy"
-
-        spread = safe_float(row.get("spread"), None)
-        min_spread_pct = max(0.0, min(1.0, to_float(cfg.get("min_spread_pct", 0.006), 0.006)))
-        max_spread_pct = max(min_spread_pct, min(1.0, to_float(cfg.get("max_spread_pct", 0.065), 0.065)))
-        if spread is None:
-            return "missing_spread"
-        if spread < min_spread_pct:
-            return "spread_too_narrow"
-        if spread > max_spread_pct:
-            return "spread_too_wide"
-
-        cancel_rate_30s = normalize_ratio(row.get("cancel_rate_30s") or row.get("maker_cancel_rate_30s"))
-        max_cancel_rate_30s = max(0.0, min(1.0, to_float(cfg.get("max_cancel_rate_30s", 0.75), 0.75)))
-        if cancel_rate_30s is not None and cancel_rate_30s > max_cancel_rate_30s:
-            return "cancel_rate_too_high"
-
-        spread_widening_bps = safe_float(row.get("spread_widening_bps"), None)
-        max_spread_widening_bps = max(0.0, to_float(cfg.get("max_spread_widening_bps", 22.0), 22.0))
-        if spread_widening_bps is not None and spread_widening_bps > max_spread_widening_bps:
-            return "spread_widening"
-
-        liquidity = max(0.0, float(safe_float(row.get("liquidity"), 0.0) or 0.0))
-        min_liquidity_usd = max(0.0, to_float(cfg.get("min_liquidity_usd", 1000.0), 1000.0))
-        if liquidity < min_liquidity_usd:
-            return "low_liquidity"
-
-        oracle_price = safe_float(row.get("oracle_price"), None)
-        price_to_beat = safe_float(row.get("price_to_beat"), None)
-        if oracle_price is not None and price_to_beat is not None and price_to_beat > 0:
-            diff_pct = ((oracle_price - price_to_beat) / price_to_beat) * 100.0
-            direction = "buy_yes" if diff_pct > 0.0 else "buy_no"
-        else:
-            direction = "buy_yes" if up_price < 0.5 else "buy_no"
-            diff_pct = abs(0.5 - up_price) * 100.0
-
-        entry_price = float(up_price if direction == "buy_yes" else down_price)
-        max_entry_price = clamp(to_float(cfg.get("max_entry_price", 0.92), 0.92), 0.05, 0.99)
-        min_entry_price = clamp(to_float(cfg.get("min_entry_price", 0.80), 0.80), 0.0, max_entry_price)
-        if entry_price <= 0.0 or entry_price >= 1.0:
-            return "invalid_entry_price"
-        if entry_price < min_entry_price:
-            return "entry_price_too_low"
-        if entry_price > max_entry_price:
-            return "entry_price_too_high"
-
-        entropy_multiplier = 0.55 + (0.80 * entropy)
-        edge = abs(diff_pct) * entropy_multiplier
-        cancel_recovery = None
-        prior_peak_cancel_rate = normalize_ratio(row.get("cancel_peak_2m"))
-        if prior_peak_cancel_rate is None:
-            prior_peak_cancel_rate = history_cancel_peak(row.get("history_tail"))
-        min_prior_peak_cancel_rate = max(0.0, min(1.0, to_float(cfg.get("min_prior_peak_cancel_rate", 0.80), 0.80)))
-        min_cancel_drop = max(0.0, min(1.0, to_float(cfg.get("min_cancel_drop", 0.14), 0.14)))
-        if cancel_rate_30s is not None and prior_peak_cancel_rate is not None:
-            recovered = prior_peak_cancel_rate - cancel_rate_30s
-            if prior_peak_cancel_rate >= min_prior_peak_cancel_rate and recovered >= min_cancel_drop:
-                cancel_recovery = recovered
-        if cancel_recovery is not None:
-            edge += cancel_recovery * 5.0
-
-        flow_imbalance = normalize_signed_ratio(row.get("flow_imbalance") or row.get("orderflow_imbalance"))
-        if flow_imbalance is not None:
-            flow_imbalance = abs(flow_imbalance)
-        min_orderflow_alignment = max(0.0, min(1.0, to_float(cfg.get("min_orderflow_alignment", 0.05), 0.05)))
-        if flow_imbalance is not None and flow_imbalance < min_orderflow_alignment:
-            flow_imbalance = None
-        if flow_imbalance is not None:
-            edge += flow_imbalance * 1.5
-
-        recent_move_zscore = safe_float(row.get("recent_move_zscore"), None)
-        min_recent_move_zscore = max(0.0, to_float(cfg.get("min_recent_move_zscore", 1.25), 1.25))
-        if recent_move_zscore is not None and abs(recent_move_zscore) < min_recent_move_zscore:
-            recent_move_zscore = None
-        if recent_move_zscore is not None:
-            edge += min(3.0, abs(recent_move_zscore)) * 0.4
-
-        min_edge_percent = max(0.0, to_float(cfg.get("min_edge_percent", 1.0), 1.0))
-        if edge < min_edge_percent:
-            return "edge_too_small"
-
-        confidence = clamp(
-            0.50
-            + clamp(entropy - 0.5, 0, 0.20)
-            + clamp(abs(diff_pct or 0) / 10.0, 0, 0.15)
-            + clamp((1 - (spread or 0) / 0.065) * 0.08, 0, 0.08),
-            0.40,
-            0.92,
-        )
-        if cancel_recovery is not None:
-            confidence = clamp(confidence + clamp(cancel_recovery * 0.12, 0.0, 0.08), 0.40, 0.92)
-        if flow_imbalance is not None:
-            confidence = clamp(confidence + clamp(flow_imbalance * 0.08, 0.0, 0.05), 0.40, 0.92)
-        if recent_move_zscore is not None:
-            confidence = clamp(confidence + clamp(abs(recent_move_zscore) / 6.0, 0.0, 0.04), 0.40, 0.92)
-
-        min_confidence = to_confidence(cfg.get("min_confidence", 0.40), 0.40)
-        if confidence < min_confidence:
-            return "confidence_too_low"
-        return "filtered"
-
     def _detect_from_rows(self, rows: list[dict[str, Any]]) -> list[Opportunity]:
         cfg = dict(self.default_config)
         cfg.update(getattr(self, "config", {}) or {})
@@ -709,7 +601,7 @@ class CryptoEntropyMakerStrategy(BaseStrategy):
                 continue
             signal = self._score_market(row, cfg)
             if signal is None:
-                reason = self._rejection_reason(row, cfg)
+                reason = self._last_rejection_reason or "scoring_gate_failed"
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
                 continue
             firehose_gates = signal.get("_firehose_gates") or []
@@ -811,7 +703,7 @@ class CryptoEntropyMakerStrategy(BaseStrategy):
 
         min_edge = max(0.0, to_float(params.get("min_edge_percent", 1.0), 1.0))
         min_conf = to_confidence(params.get("min_confidence", 0.40), 0.40)
-        min_entropy = max(0.0, min(1.0, to_float(params.get("min_entropy", 0.82), 0.82)))
+        min_entropy = max(0.0, min(1.0, to_float(params.get("min_entropy", 0.0), 0.0)))
         min_spread_pct = max(0.0, min(1.0, to_float(params.get("min_spread_pct", 0.006), 0.006)))
         max_spread_pct = max(min_spread_pct, min(1.0, to_float(params.get("max_spread_pct", 0.065), 0.065)))
         max_cancel_rate_30s = max(0.0, min(1.0, to_float(params.get("max_cancel_rate_30s", 0.75), 0.75)))

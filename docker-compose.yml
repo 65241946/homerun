@@ -286,6 +286,75 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Scanner / opportunity-detection plane.  Without this the market
+  # ("scanner") and sports opportunity feeds never produce — the scanner
+  # is what classifies markets into sports/soccer/baseball/... categories,
+  # so both tabs sit permanently at 0 when this plane is absent.
+  worker-detection:
+    <<: *backend-image
+    container_name: homerun-worker-detection
+    command: ["python", "-m", "workers.host", "detection"]
+    environment:
+      <<: *backend-env
+      HOMERUN_PROCESS_ROLE: worker
+      HOMERUN_WORKER_PLANE: detection
+    volumes: *backend-volumes
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Cold reconciliation plane.  Detection-only by design (the worker reads
+  # HOMERUN_WORKER_PLANE == "reconciliation" and sets place_exits=False),
+  # so it audits settlement and terminal state without placing exits.
+  worker-reconciliation:
+    <<: *backend-image
+    container_name: homerun-worker-reconciliation
+    command: ["python", "-m", "workers.host", "reconciliation"]
+    environment:
+      <<: *backend-env
+      HOMERUN_PROCESS_ROLE: worker
+      HOMERUN_WORKER_PLANE: reconciliation
+    volumes: *backend-volumes
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Cross-cutting platform services (notifier bridge, signal cache,
+  # retention, event-loop watchdog) that aren't tied to one subsystem.
+  worker-services:
+    <<: *backend-image
+    container_name: homerun-worker-services
+    command: ["python", "-m", "workers.host", "services"]
+    environment:
+      <<: *backend-env
+      HOMERUN_PROCESS_ROLE: worker
+      HOMERUN_WORKER_PLANE: services
+    volumes: *backend-volumes
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Operator job queues — backtests, provider imports, strategy
+  # reverse-engineering, Cox PH fill-model training.  Deliberately not
+  # gated behind a trading subsystem, so backtests run even when trading
+  # is paused.
+  worker-jobs:
+    <<: *backend-image
+    container_name: homerun-worker-jobs
+    command: ["python", "-m", "workers.host", "jobs"]
+    environment:
+      <<: *backend-env
+      HOMERUN_PROCESS_ROLE: worker
+      HOMERUN_WORKER_PLANE: jobs
+    volumes: *backend-volumes
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
   # ---------------------------------------------------------------------
   # Frontend — nginx serving the built Vite bundle, proxying /api and
   # /ws to the backend.

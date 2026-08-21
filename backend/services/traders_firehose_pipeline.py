@@ -76,7 +76,10 @@ async def _resolve_traders_strategy(session: AsyncSession) -> Optional[Any]:
         logger.error("Traders strategy runtime not loaded", slug=_STRATEGY_SLUG)
         return None
 
-    config = StrategySDK.validate_trader_filter_config(_strip_internal_schema(row.config))
+    # Strategy configure/effective-config owns defaults and validation. Running
+    # the shared filter validator here would inject its 720-minute generic age
+    # default ahead of the strategy's 60-minute default.
+    config = _strip_internal_schema(row.config)
     instance = loaded.instance
     _apply_strategy_config(instance, config)
     return instance
@@ -104,7 +107,7 @@ def _apply_strategy_filter(
         logger.error("Traders strategy returned non-list firehose payload")
         return []
 
-    normalized_rows = [StrategySDK.normalize_trader_signal(dict(row)) for row in annotated if isinstance(row, dict)]
+    normalized_rows = [dict(row) for row in annotated if isinstance(row, dict)]
     passed_rows = [
         row
         for row in normalized_rows
@@ -148,9 +151,7 @@ async def apply_traders_firehose_strategy(
     if not rows:
         return []
 
-    cloned_rows: list[dict[str, Any]] = [
-        StrategySDK.normalize_trader_signal(dict(row)) for row in rows if isinstance(row, dict)
-    ]
+    cloned_rows: list[dict[str, Any]] = [dict(row) for row in rows if isinstance(row, dict)]
     if not cloned_rows:
         return []
 
@@ -169,7 +170,7 @@ async def apply_traders_firehose_strategy(
         if not isinstance(prepared, list):
             logger.error("Traders strategy returned non-list prepared firehose payload")
             return []
-        prepared_rows = [StrategySDK.normalize_trader_signal(dict(row)) for row in prepared if isinstance(row, dict)]
+        prepared_rows = [dict(row) for row in prepared if isinstance(row, dict)]
 
     return _apply_strategy_filter(
         strategy,
@@ -189,7 +190,6 @@ async def get_strategy_filtered_trader_opportunities(
     firehose_rows = await StrategySDK.get_trader_firehose_signals(
         limit=firehose_scan_limit,
         include_filtered=include_filtered,
-        include_source_context=False,
     )
     return await apply_traders_firehose_strategy(
         firehose_rows,

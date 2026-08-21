@@ -189,6 +189,107 @@ async def test_ensure_hot_subscriptions_seeds_every_missing_cache_entry(monkeypa
     assert [call.args[0] for call in seed_mock.await_args_list] == token_ids
 
 
+@pytest.mark.asyncio
+async def test_prewarm_execution_signals_subscribes_traders_token_and_reports_timeout(monkeypatch):
+    subscribe_mock = AsyncMock(return_value=None)
+
+    class _Cache:
+        def is_fresh(self, token_id: str, *, max_age_seconds: float | None = None) -> bool:
+            assert token_id == "traders-token"
+            assert max_age_seconds is not None
+            return False
+
+        def get_mid_price(self, token_id: str):
+            assert token_id == "traders-token"
+            return None
+
+    feed_manager = SimpleNamespace(
+        _started=True,
+        cache=_Cache(),
+        get_order_book=AsyncMock(return_value=None),
+        polymarket_feed=SimpleNamespace(
+            subscribe=subscribe_mock,
+            _subscribed_assets=set(),
+        ),
+    )
+    monkeypatch.setattr("services.intent_runtime.get_feed_manager", lambda: feed_manager)
+
+    runtime = IntentRuntime()
+    signal = SimpleNamespace(
+        id="traders-signal-1",
+        source="traders",
+        direction="buy_yes",
+        required_token_ids=["traders-token"],
+        payload_json={"selected_token_id": "traders-token"},
+    )
+
+    failures = await runtime.prewarm_execution_signals([signal], timeout_seconds=0.0)
+
+    subscribe_mock.assert_awaited_once_with(["traders-token"])
+    assert failures == {"traders-signal-1": "ws_subscribe_timeout"}
+
+
+@pytest.mark.asyncio
+async def test_prewarm_execution_signals_accepts_fresh_ws_price(monkeypatch):
+    subscribe_mock = AsyncMock(return_value=None)
+
+    class _Cache:
+        def is_fresh(self, token_id: str, *, max_age_seconds: float | None = None) -> bool:
+            return token_id == "traders-token" and max_age_seconds is not None
+
+        def get_mid_price(self, token_id: str):
+            return 0.42 if token_id == "traders-token" else None
+
+    feed_manager = SimpleNamespace(
+        _started=True,
+        cache=_Cache(),
+        get_order_book=AsyncMock(return_value=None),
+        polymarket_feed=SimpleNamespace(
+            subscribe=subscribe_mock,
+            _subscribed_assets=set(),
+        ),
+    )
+    monkeypatch.setattr("services.intent_runtime.get_feed_manager", lambda: feed_manager)
+
+    runtime = IntentRuntime()
+    signal = SimpleNamespace(
+        id="traders-signal-2",
+        source="traders",
+        direction="buy_yes",
+        required_token_ids=[],
+        payload_json={"positions_to_take": [{"token_id": "traders-token"}]},
+    )
+
+    failures = await runtime.prewarm_execution_signals([signal], timeout_seconds=0.0)
+
+    subscribe_mock.assert_awaited_once_with(["traders-token"])
+    assert failures == {}
+
+
+def test_ws_subscribe_timeout_deferred_signal_becomes_ready_on_fresh_tick(monkeypatch):
+    class _Cache:
+        def is_fresh(self, token_id: str, *, max_age_seconds: float | None = None) -> bool:
+            return token_id == "traders-token" and max_age_seconds is not None
+
+        def get_mid_price(self, token_id: str):
+            return 0.42 if token_id == "traders-token" else None
+
+    monkeypatch.setattr(
+        "services.intent_runtime.get_feed_manager",
+        lambda: SimpleNamespace(_started=True, cache=_Cache()),
+    )
+    runtime = IntentRuntime()
+    snapshot = {
+        "id": "traders-signal-3",
+        "source": "traders",
+        "deferred_reason": "ws_subscribe_timeout",
+        "required_token_ids": ["traders-token"],
+        "payload_json": {},
+    }
+
+    assert runtime._snapshot_ready_for_runtime(snapshot) is True
+
+
 def test_snapshot_has_strict_scanner_live_market_accepts_current_subscription_without_recent_tick():
     snapshot = {
         "source": "scanner",
@@ -908,6 +1009,68 @@ def test_build_signal_contract_strips_market_history_from_durable_payload():
     assert "oracle_history" not in roster_market
 
 
+def test_build_signal_contract_promotes_crypto_strategy_origin_to_payload():
+    opportunity = Opportunity(
+        strategy="btc_eth_directional_edge",
+        title="BTC directional edge",
+        description="Producer origin regression",
+        total_cost=0.42,
+        expected_payout=1.0,
+        gross_profit=0.58,
+        fee=0.0,
+        net_profit=0.58,
+        roi_percent=10.0,
+        markets=[{"id": "btc-market", "question": "BTC up?"}],
+        positions_to_take=[
+            {
+                "market_id": "btc-market",
+                "token_id": "btc-yes-token",
+                "outcome": "YES",
+                "side": "buy",
+                "price": 0.42,
+                "_crypto_context": {"strategy_origin": "crypto_worker"},
+            }
+        ],
+        strategy_context={"strategy_origin": "crypto_worker", "asset": "BTC"},
+    )
+
+    _market_id, _direction, _entry_price, _market_question, payload, _strategy_context = (
+        build_signal_contract_from_opportunity(opportunity)
+    )
+
+    assert payload["strategy_origin"] == "crypto_worker"
+
+
+def test_build_signal_contract_does_not_invent_strategy_origin_for_unmarked_opportunity():
+    opportunity = Opportunity(
+        strategy="generic_contract",
+        title="Generic signal",
+        description="No producer origin",
+        total_cost=0.42,
+        expected_payout=1.0,
+        gross_profit=0.58,
+        fee=0.0,
+        net_profit=0.58,
+        roi_percent=10.0,
+        markets=[{"id": "generic-market", "question": "Generic?"}],
+        positions_to_take=[
+            {
+                "market_id": "generic-market",
+                "token_id": "generic-token",
+                "outcome": "YES",
+                "side": "buy",
+                "price": 0.42,
+            }
+        ],
+    )
+
+    _market_id, _direction, _entry_price, _market_question, payload, _strategy_context = (
+        build_signal_contract_from_opportunity(opportunity)
+    )
+
+    assert "strategy_origin" not in payload
+
+
 @pytest.mark.asyncio
 async def test_publish_opportunities_uses_fresh_scanner_ws_quotes_without_post_arm_deferral(monkeypatch):
     published_batches: list[dict[str, object]] = []
@@ -1424,3 +1587,75 @@ def test_snapshot_ready_for_runtime_accepts_current_fresh_scanner_quote_after_st
 
     assert runtime._snapshot_ready_for_runtime(snapshot) is True
     assert seen_max_age_seconds[-1] == pytest.approx(15.0)
+
+
+@pytest.mark.asyncio
+async def test_prewarm_execution_signals_bounds_a_hung_subscribe(monkeypatch):
+    """The subscribe+seed step must not be able to outlive the trader cycle.
+
+    ``_ensure_hot_subscriptions`` awaits a WS connect, a subscribe
+    round-trip and up to eight REST order-book fetches, each a 30s httpx
+    timeout with four retries behind a shared rate limiter.  Every other
+    caller schedules it as a detached task for exactly that reason; this
+    one awaits it inline on the trading hot path, inside a cycle whose
+    whole soft budget is 30s.  Unbounded, one throttled CLOB endpoint
+    parks the cycle for minutes and starves every sibling trader.
+
+    On timeout the batch is not blanket-failed: tokens a previous cycle
+    already subscribed still have live quotes, so each signal is judged
+    on its actual quote state.
+    """
+    hang_forever = asyncio.Event()
+
+    async def _hanging_subscribe(token_ids):
+        await hang_forever.wait()
+
+    class _Cache:
+        def is_fresh(self, token_id: str, *, max_age_seconds: float | None = None) -> bool:
+            return token_id == "fresh-token"
+
+        def get_mid_price(self, token_id: str):
+            return 0.42 if token_id == "fresh-token" else None
+
+    feed_manager = SimpleNamespace(
+        _started=True,
+        cache=_Cache(),
+        get_order_book=AsyncMock(return_value=None),
+        polymarket_feed=SimpleNamespace(
+            subscribe=_hanging_subscribe,
+            _subscribed_assets=set(),
+        ),
+    )
+    monkeypatch.setattr("services.intent_runtime.get_feed_manager", lambda: feed_manager)
+
+    runtime = IntentRuntime()
+    signals = [
+        SimpleNamespace(
+            id="fresh-signal",
+            source="traders",
+            direction="buy_yes",
+            required_token_ids=["fresh-token"],
+            payload_json={},
+        ),
+        SimpleNamespace(
+            id="slow-signal",
+            source="traders",
+            direction="buy_yes",
+            required_token_ids=["slow-token"],
+            payload_json={},
+        ),
+    ]
+
+    # The outer bound is 60x the inner one: if the inner bound is missing
+    # this raises TimeoutError instead of hanging out the CI job.
+    failures = await asyncio.wait_for(
+        runtime.prewarm_execution_signals(
+            signals,
+            timeout_seconds=0.0,
+            subscribe_timeout_seconds=0.05,
+        ),
+        timeout=3.0,
+    )
+
+    assert failures == {"slow-signal": "ws_subscribe_timeout"}
+    hang_forever.set()

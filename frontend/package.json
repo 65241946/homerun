@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:realtime-events": "vite-node scripts/test-realtime-trader-events.ts"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.12.19",

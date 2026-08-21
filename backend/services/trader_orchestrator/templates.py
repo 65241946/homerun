@@ -25,65 +25,22 @@ def _normalize_template(template: dict[str, Any]) -> dict[str, Any]:
 
 
 TRADER_TEMPLATES: list[dict[str, Any]] = [
+    # Was ``btc_eth_full_stack``: three ``crypto`` source_configs in one
+    # trader, described as "equivalent to the legacy multi-mode 'auto'
+    # trader".  A trader now runs exactly one strategy per source_key, and
+    # ``_normalize_source_configs`` enforces that by raising on a duplicate
+    # source_key.  The template was never migrated, so it raised — and
+    # because ``list_trader_templates`` normalizes every template to build
+    # its response, that one bad entry took the whole
+    # ``GET /traders/templates`` endpoint down with it, not just itself.
+    # The maker and directional halves already had single-strategy
+    # templates; convergence did not, so this is that missing third
+    # preset, carrying the convergence params the bundle held.
     {
-        "id": "btc_eth_full_stack",
-        "name": "Crypto Full-Stack Trader",
-        "description": "Runs all three BTC/ETH crypto strategies (maker_quote, directional_edge, convergence) — equivalent to the legacy multi-mode 'auto' trader.",
+        "id": "btc_eth_convergence_only",
+        "name": "Crypto Convergence Trader",
+        "description": "BTC/ETH convergence-only execution with oracle direction gating and near-expiry entry windows.",
         "source_configs": [
-            {
-                "source_key": "crypto",
-                "strategy_key": "btc_eth_maker_quote",
-                "strategy_params": {
-                    "min_edge_percent": 1.8,
-                    "min_confidence": 0.38,
-                    "max_open_order_seconds": 7.0,
-                    "timeout_taker_rescue_enabled": True,
-                    "timeout_taker_rescue_price_bps": 20.0,
-                    "timeout_taker_rescue_time_in_force": "IOC",
-                    "include_assets": ["BTC", "ETH"],
-                    "exclude_assets": ["SOL", "XRP"],
-                    "include_timeframes": ["5m", "15m"],
-                    "exclude_timeframes": ["1h", "4h"],
-                    "orderflow_alignment_enabled": True,
-                    "orderflow_alignment_modes": ["maker_quote"],
-                    "min_orderflow_alignment": 0.05,
-                    "cancel_cluster_guard_enabled": True,
-                    "cancel_cluster_guard_modes": ["maker_quote"],
-                    "max_cancel_rate_30s": 0.70,
-                    "max_market_data_age_ms_5m": 3000,
-                    "max_market_data_age_ms_15m": 3200,
-                    "min_seconds_left_for_entry_5m": 35.0,
-                    "min_seconds_left_for_entry_15m": 60.0,
-                    "maker_max_entry_price_ceiling": 0.80,
-                    "maker_max_entry_price_ceiling_buy_no": 0.95,
-                    "edge_calibration_enabled": True,
-                },
-            },
-            {
-                "source_key": "crypto",
-                "strategy_key": "btc_eth_directional_edge",
-                "strategy_params": {
-                    "min_edge_percent": 1.8,
-                    "min_confidence": 0.42,
-                    "max_open_order_seconds": 8.0,
-                    "include_assets": ["BTC", "ETH"],
-                    "exclude_assets": ["SOL", "XRP"],
-                    "include_timeframes": ["5m", "15m"],
-                    "exclude_timeframes": ["1h", "4h"],
-                    "require_oracle_for_directional": True,
-                    "oracle_direction_gate_modes": ["directional"],
-                    "orderflow_alignment_enabled": True,
-                    "orderflow_alignment_modes": ["directional"],
-                    "edge_calibration_enabled": True,
-                    "max_market_data_age_ms_5m": 3000,
-                    "max_market_data_age_ms_15m": 3200,
-                    "min_seconds_left_for_entry_5m": 35.0,
-                    "min_seconds_left_for_entry_15m": 60.0,
-                    "directional_min_entry_price_floor": 0.25,
-                    "directional_max_entry_price_ceiling": 0.80,
-                    "directional_max_entry_price_ceiling_buy_no": 0.95,
-                },
-            },
             {
                 "source_key": "crypto",
                 "strategy_key": "btc_eth_convergence",
@@ -101,7 +58,7 @@ TRADER_TEMPLATES: list[dict[str, Any]] = [
                     "min_seconds_left_for_entry_5m": 35.0,
                     "min_seconds_left_for_entry_15m": 60.0,
                 },
-            },
+            }
         ],
         "interval_seconds": 1,
         "risk_limits": {
@@ -195,10 +152,15 @@ TRADER_TEMPLATES: list[dict[str, Any]] = [
             "max_per_market_exposure_usd": 300.0,
         },
     },
+    # Was one ``scanner_weather`` template bundling a scanner config and a
+    # weather config.  ``_validate_source_configs`` requires exactly one
+    # entry — a trader runs one strategy on one source — so the bundle was
+    # rejected by ``create_trader`` and the preset could never be used.
+    # Split into the two traders it always described, params unchanged.
     {
-        "id": "scanner_weather",
-        "name": "Scanner + Weather Trader",
-        "description": "Scanner + weather executor with source-specific strategies.",
+        "id": "scanner_basic",
+        "name": "Scanner Trader",
+        "description": "Scanner executor on the basic opportunity strategy.",
         "source_configs": [
             {
                 "source_key": "scanner",
@@ -209,7 +171,19 @@ TRADER_TEMPLATES: list[dict[str, Any]] = [
                     "max_risk_score": 0.78,
                     "min_liquidity": 25.0,
                 },
-            },
+            }
+        ],
+        "interval_seconds": 120,
+        "risk_limits": {
+            "max_open_orders": 10,
+            "max_per_market_exposure_usd": 350.0,
+        },
+    },
+    {
+        "id": "weather_distribution",
+        "name": "Weather Trader",
+        "description": "Weather executor with model-agreement and source-spread gates.",
+        "source_configs": [
             {
                 "source_key": "weather",
                 "strategy_key": "weather_distribution",
@@ -220,7 +194,7 @@ TRADER_TEMPLATES: list[dict[str, Any]] = [
                     "min_source_count": 2,
                     "max_source_spread_c": 4.0,
                 },
-            },
+            }
         ],
         "interval_seconds": 120,
         "risk_limits": {
@@ -283,7 +257,7 @@ TRADER_TEMPLATES: list[dict[str, Any]] = [
                     "kelly_fractional_scale": 0.4,
                     "take_profit_pct": 70.0,
                     "stop_loss_pct": 25.0,
-                    "trailing_stop_pct": 18.0,
+                    "trailing_stop_pct": 12.0,
                     "trailing_stop_activation_profit_pct": 25.0,
                     "max_hold_minutes": 240,
                     "momentum_stall_minutes": 45,

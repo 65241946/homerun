@@ -7,6 +7,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -28,6 +29,7 @@ from services.trader_orchestrator.position_lifecycle import (
     reconcile_shadow_positions,
 )
 from services.trader_orchestrator.session_engine import ExecutionSessionEngine
+from services.trader_orchestrator.order_manager import submit_execution_leg
 from services.trader_orchestrator_state import (
     OPEN_ORDER_STATUSES,
     adopt_live_wallet_position,
@@ -2268,8 +2270,12 @@ async def manual_buy(
         direction = f"buy_{pos.outcome.lower()}" if pos.outcome else f"buy_{side_str.lower()}"
 
         live_order_result = None
+        shadow_order_result = None
         order_status = "submitted"
         error_message = None
+        effective_price = pos.price
+        actual_notional_usd = per_position_usd
+        actual_size_shares = size_shares
 
         if mode == "live":
             if not live_execution_service.is_ready():
@@ -2297,6 +2303,82 @@ async def manual_buy(
                 "size": live_order.size,
                 "price": live_order.price,
             }
+        else:
+            signal = SimpleNamespace(
+                id=order_id,
+                source="manual",
+                signal_type="manual_buy",
+                strategy_key="manual_buy",
+                market_id=pos.market_id or pos.token_id,
+                market_question=pos.market_question or "",
+                direction=direction,
+                entry_price=pos.price,
+                payload_json={
+                    "manual": True,
+                    "strategy_key": "manual_buy",
+                    "token_id": pos.token_id,
+                    "live_market": {
+                        "market_id": pos.market_id or pos.token_id,
+                        "market_question": pos.market_question,
+                        "selected_token_id": pos.token_id,
+                        "selected_outcome": pos.outcome,
+                        "live_selected_price": pos.price,
+                    },
+                },
+                live_context=None,
+            )
+            shadow_result = await submit_execution_leg(
+                mode="shadow",
+                signal=signal,
+                leg={
+                    "leg_id": order_id,
+                    "token_id": pos.token_id,
+                    "market_id": pos.market_id or pos.token_id,
+                    "market_question": pos.market_question,
+                    "side": side_str.lower(),
+                    "outcome": pos.outcome,
+                    "limit_price": pos.price,
+                    "price_policy": "maker_limit",
+                    "time_in_force": "GTC",
+                    "post_only": False,
+                },
+                notional_usd=per_position_usd,
+                risk_limits=(
+                    dict(trader.get("risk_limits") or {})
+                    if isinstance(trader, dict) and isinstance(trader.get("risk_limits"), dict)
+                    else None
+                ),
+                trader_id=trader_id,
+            )
+            shadow_status = str(getattr(shadow_result, "status", "") or "").strip().lower()
+            shadow_payload = (
+                dict(shadow_result.payload)
+                if isinstance(getattr(shadow_result, "payload", None), dict)
+                else {}
+            )
+            actual_size_shares = max(0.0, float(getattr(shadow_result, "shares", 0.0) or 0.0))
+            actual_notional_usd = max(0.0, float(getattr(shadow_result, "notional_usd", 0.0) or 0.0))
+            result_price = getattr(shadow_result, "effective_price", None)
+            if result_price is not None and float(result_price) > 0.0:
+                effective_price = float(result_price)
+            shadow_filled = (
+                shadow_status == "executed"
+                and actual_size_shares > 0.0
+                and actual_notional_usd > 0.0
+                and effective_price > 0.0
+            )
+            order_status = "executed" if shadow_filled else "failed"
+            error_message = None if shadow_filled else (
+                str(getattr(shadow_result, "error_message", "") or "").strip()
+                or f"Shadow execution did not fill (status={shadow_status or 'unknown'})."
+            )
+            shadow_order_result = {
+                **shadow_payload,
+                "status": shadow_status or "unknown",
+                "effective_price": effective_price,
+                "filled_size": actual_size_shares,
+                "filled_notional_usd": actual_notional_usd,
+            }
 
         row = TraderOrder(
             id=order_id,
@@ -2313,9 +2395,9 @@ async def manual_buy(
             trace_id=None,
             mode=mode,
             status=order_status,
-            notional_usd=per_position_usd,
+            notional_usd=actual_notional_usd,
             entry_price=pos.price,
-            effective_price=pos.price,
+            effective_price=effective_price,
             edge_percent=None,
             confidence=None,
             reason="Manual buy from UI",
@@ -2325,8 +2407,9 @@ async def manual_buy(
                 "token_id": pos.token_id,
                 "side": side_str,
                 "outcome": pos.outcome,
-                "size_shares": size_shares,
+                "size_shares": actual_size_shares,
                 "live_order": live_order_result,
+                "shadow_execution": shadow_order_result,
             },
             error_message=error_message,
             created_at=now,
@@ -2339,11 +2422,13 @@ async def manual_buy(
             "market_question": pos.market_question,
             "direction": direction,
             "status": order_status,
-            "notional_usd": per_position_usd,
+            "notional_usd": actual_notional_usd,
             "entry_price": pos.price,
-            "size_shares": size_shares,
+            "effective_price": effective_price,
+            "size_shares": actual_size_shares,
             "error": error_message,
             "live_order": live_order_result,
+            "shadow_execution": shadow_order_result,
         })
 
     await session.commit()

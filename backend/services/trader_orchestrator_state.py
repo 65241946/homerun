@@ -5369,32 +5369,6 @@ async def list_fast_traders(session: AsyncSession) -> list[dict[str, Any]]:
     return [_serialize_trader(row) for row in rows]
 
 
-async def seed_default_traders(session: AsyncSession) -> None:
-    count = int((await session.execute(select(func.count(Trader.id)))).scalar() or 0)
-    if count > 0:
-        return
-
-    for template in TRADER_TEMPLATES:
-        source_configs = _normalize_source_configs(template.get("source_configs") or [])
-        session.add(
-            Trader(
-                id=_new_id(),
-                name=template["name"],
-                description=template.get("description"),
-                source_configs_json=source_configs,
-                risk_limits_json=template.get("risk_limits") or {},
-                metadata_json={"template_id": template["id"]},
-                mode="shadow",
-                is_enabled=True,
-                is_paused=False,
-                interval_seconds=int(template.get("interval_seconds", 60) or 60),
-                created_at=_now(),
-                updated_at=_now(),
-            )
-        )
-    await _commit_with_retry(session)
-
-
 async def create_trader(session: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
     create_payload = dict(payload or {})
     copy_from_trader_id = str(create_payload.pop("copy_from_trader_id", "") or "").strip()

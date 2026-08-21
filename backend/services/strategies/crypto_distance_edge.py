@@ -7,9 +7,8 @@ Rides the heavily-favored side of a Polymarket crypto over-under cycle
 when two confirmations line up at once:
 
 1. **Distance** — the Chainlink oracle is far enough from the cycle's
-   reference price (``price_to_beat``), measured in *dollars* of the
-   underlying. A BTC cycle that's $300 in the money is far less likely
-   to flip than one that's only $40 in the money.
+   reference price (``price_to_beat``). Price-regime-neutral bps tiers take
+   priority when configured; legacy dollar tiers remain the fallback.
 2. **Cost** — the live Polymarket book lets us buy that favored side at
    or above a cost floor, where the cost floor *loosens* as distance
    grows. The book pricing the side richly is the market agreeing with
@@ -22,8 +21,8 @@ community-reported BTC 15m configuration)::
     distance ≥ $200  →  cost ≥ 85¢
     distance ≥ $300  →  cost ≥ 80¢
 
-The applicable tier is the one with the largest ``distance_usd`` that the
-current distance clears; the favored side must then cost at least that
+The applicable tier is the largest configured distance that the current move
+clears; the favored side must then cost at least that
 tier's ``min_cost_cents`` (and no more than ``max_cost_cents``, since
 buying at 99¢ leaves no edge after fees). Below the smallest tier we
 don't trade.
@@ -42,13 +41,10 @@ check matches what Polymarket itself uses at resolution.
 
 Expected value
 --------------
-There is no validated win rate for this configuration. By default the
-strategy treats the live cost as the market-implied win probability
-(``edge_uplift_pct = 0``), which after Polymarket taker fees is slightly
-negative EV — i.e. it tells the truth: the distance signal must actually
-lift the true win probability above the market price for this to profit.
-Users who have backtested an edge can dial ``edge_uplift_pct`` up in the
-UI to reflect it. Fees are always modeled via ``taker_fee_pct``.
+When oracle history is available, ``prob_above`` estimates win probability;
+otherwise the live cost remains the fallback implied probability. The optional
+``edge_uplift_pct`` is then applied, and the strategy emits only when expected
+value remains positive after the canonical Polymarket crypto taker fee.
 
 All gates are user-editable via the strategy-manager UI — see the seed
 entry in ``opportunity_strategy_catalog.py`` for the ``config_schema``.
@@ -71,12 +67,15 @@ from services.strategies._firehose import (
 from services.strategies.base import BaseStrategy
 from services.strategy_helpers.crypto_strategy_utils import (
     build_binary_crypto_market,
+    default_max_oracle_age_ms,
+    default_min_seconds_left_for_entry,
     normalize_timeframe,
     pick_oracle_source,
-    taker_fee_pct,
+    realized_vol_per_sec,
 )
 from services.strategy_sdk import StrategySDK
 from utils.converters import to_float
+from utils.kelly import polymarket_taker_fee
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -105,6 +104,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Tiered distance($)→min-cost(¢) table. Sorted ascending by distance
     # in configure(); the applicable tier is the highest distance cleared.
     "distance_cost_tiers": [dict(t) for t in _DEFAULT_TIERS],
+    # Price-regime-neutral tiers. When configured they take priority over the
+    # BTC-price-dependent USD tiers above.
+    "distance_cost_tiers_bps": [],
     # Don't buy above this — at the top of the book edge is fee-dominated.
     "max_cost_cents": 98.0,
     # Notional per trade (USD). Also sizes the VWAP depth probe so the cost
@@ -112,9 +114,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "bet_size_usd": 15.0,
     # Don't enter with less than this much time left (stale-book / fill-risk
     # guard right at resolution).
-    "min_seconds_to_resolution": 10.0,
-    # Reject Chainlink readings older than this.
-    "max_oracle_age_ms": 5000,
+    "min_seconds_to_resolution": 60.0,
+    # None delegates to the shared timeframe-aware oracle freshness policy.
+    "max_oracle_age_ms": None,
     # Belief that the distance signal lifts true win probability above the
     # market-implied price, in percentage points. Default 0 = no assumed
     # edge (honest, slightly-negative EV after fees). Raise once backtested.
@@ -151,6 +153,14 @@ def crypto_distance_edge_config_schema() -> dict[str, Any]:
                 "phase": "signal",
             },
             {
+                "key": "distance_cost_tiers_bps",
+                "label": "Distance(bps)→Min-Cost(¢) Tiers",
+                "type": "json",
+                "default": [],
+                "description": "When non-empty, takes priority over the USD tiers.",
+                "phase": "signal",
+            },
+            {
                 "key": "max_cost_cents",
                 "label": "Max Cost (¢)",
                 "type": "number",
@@ -174,7 +184,7 @@ def crypto_distance_edge_config_schema() -> dict[str, Any]:
                 "type": "number",
                 "min": 0.0,
                 "max": 900.0,
-                "default": 10.0,
+                "default": 60.0,
                 "phase": "signal",
             },
             {
@@ -183,7 +193,8 @@ def crypto_distance_edge_config_schema() -> dict[str, Any]:
                 "type": "integer",
                 "min": 0,
                 "max": 60_000,
-                "default": 5_000,
+                "default": None,
+                "description": "Optional override; blank uses the timeframe-aware crypto default.",
                 "phase": "signal",
             },
             {
@@ -244,6 +255,23 @@ def _sanitize_tiers(raw: Any) -> list[dict[str, float]]:
     return tiers
 
 
+def _sanitize_bps_tiers(raw: Any) -> list[dict[str, float]]:
+    """Coerce optional bps tiers; an empty list intentionally selects USD fallback."""
+    tiers: list[dict[str, float]] = []
+    if not isinstance(raw, (list, tuple)):
+        return tiers
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        distance = to_float(entry.get("distance_bps"), None)
+        cost = to_float(entry.get("min_cost_cents"), None)
+        if distance is None or cost is None or distance < 0.0 or cost < 0.0:
+            continue
+        tiers.append({"distance_bps": float(distance), "min_cost_cents": float(cost)})
+    tiers.sort(key=lambda tier: tier["distance_bps"])
+    return tiers
+
+
 def _select_tier(
     distance_usd: float, tiers: list[dict[str, float]]
 ) -> Optional[dict[str, float]]:
@@ -255,6 +283,18 @@ def _select_tier(
     chosen: Optional[dict[str, float]] = None
     for tier in tiers:
         if distance_usd + 1e-9 >= tier["distance_usd"]:
+            chosen = tier
+        else:
+            break
+    return chosen
+
+
+def _select_bps_tier(
+    distance_bps: float, tiers: list[dict[str, float]]
+) -> Optional[dict[str, float]]:
+    chosen: Optional[dict[str, float]] = None
+    for tier in tiers:
+        if distance_bps + 1e-9 >= tier["distance_bps"]:
             chosen = tier
         else:
             break
@@ -280,9 +320,9 @@ class CryptoDistanceEdgeStrategy(BaseStrategy):
     name = "Crypto Distance Edge"
     description = (
         "Buys the favored side of a 15-minute crypto over-under cycle when "
-        "the Chainlink oracle is far enough (in dollars) from the cycle "
+        "the Chainlink oracle is far enough from the cycle "
         "reference AND the Polymarket book prices that side richly enough — "
-        "a tiered distance($)→cost(¢) table where the cost floor loosens as "
+        "a tiered distance→cost(¢) table where the cost floor loosens as "
         "distance grows. Holds to resolution."
     )
     source_key = "crypto"
@@ -297,7 +337,6 @@ class CryptoDistanceEdgeStrategy(BaseStrategy):
     def __init__(self) -> None:
         super().__init__()
         self.min_profit = 0.0
-        self.fee = 0.0
         # Per-market guard: the cycle end_ts we've already emitted for, so a
         # condition that stays true across many ticks emits at most once per
         # cycle. Resets implicitly when the market rolls to a new end_ts.
@@ -325,6 +364,9 @@ class CryptoDistanceEdgeStrategy(BaseStrategy):
         merged["assets"] = normalized_assets
         merged["distance_cost_tiers"] = _sanitize_tiers(
             merged.get("distance_cost_tiers")
+        )
+        merged["distance_cost_tiers_bps"] = _sanitize_bps_tiers(
+            merged.get("distance_cost_tiers_bps")
         )
         self.config = merged
 
@@ -364,8 +406,19 @@ class CryptoDistanceEdgeStrategy(BaseStrategy):
     ) -> Optional[Opportunity]:
         gates: list[GateResult] = []
         tiers: list[dict[str, float]] = self.config.get("distance_cost_tiers") or []
-        min_left_cfg = float(self.config.get("min_seconds_to_resolution", 10.0))
-        max_age_ms = float(self.config.get("max_oracle_age_ms", 5000))
+        bps_tiers: list[dict[str, float]] = self.config.get("distance_cost_tiers_bps") or []
+        configured_min_left = self.config.get("min_seconds_to_resolution")
+        min_left_cfg = (
+            float(configured_min_left)
+            if configured_min_left is not None
+            else default_min_seconds_left_for_entry(market.get("timeframe"))
+        )
+        configured_max_age_ms = self.config.get("max_oracle_age_ms")
+        max_age_ms = (
+            float(configured_max_age_ms)
+            if configured_max_age_ms is not None
+            else default_max_oracle_age_ms(market.get("timeframe"))
+        )
         max_cost_cents = float(self.config.get("max_cost_cents", 98.0))
         bet_size_usd = float(self.config.get("bet_size_usd", 15.0))
         edge_uplift_pct = float(self.config.get("edge_uplift_pct", 0.0))
@@ -479,19 +532,32 @@ class CryptoDistanceEdgeStrategy(BaseStrategy):
             _emit_reject(MURMUR)
             return None
 
-        # Distance + tier selection. Distance is in DOLLARS of underlying.
+        # Bps tiers are stable across underlying price regimes and therefore
+        # take priority. USD tiers remain a backward-compatible fallback.
         distance_usd = abs(spot - reference)
+        distance_bps = (distance_usd / reference) * 10_000.0
         side = "YES" if spot >= reference else "NO"
-        tier = _select_tier(distance_usd, tiers)
+        tier_basis = "bps" if bps_tiers else "usd"
+        tier = (
+            _select_bps_tier(distance_bps, bps_tiers)
+            if bps_tiers
+            else _select_tier(distance_usd, tiers)
+        )
         tier_passed = tier is not None
-        smallest_distance = tiers[0]["distance_usd"] if tiers else float("inf")
+        distance_key = "distance_bps" if bps_tiers else "distance_usd"
+        measured_distance = distance_bps if bps_tiers else distance_usd
+        smallest_distance = (
+            (bps_tiers[0]["distance_bps"] if bps_tiers else tiers[0]["distance_usd"])
+            if (bps_tiers or tiers)
+            else float("inf")
+        )
         gates.append(GateResult(
             "distance_tier", "Distance clears a tier", tier_passed,
-            score=distance_usd,
+            score=measured_distance,
             detail=(
-                f"distance=${distance_usd:.2f} "
-                f"tier={'$%.0f→%.0f¢' % (tier['distance_usd'], tier['min_cost_cents']) if tier else 'none'} "
-                f"min_tier=${smallest_distance:.0f}"
+                f"basis={tier_basis} distance={measured_distance:.2f} "
+                f"tier={('%g→%.0f¢' % (tier[distance_key], tier['min_cost_cents'])) if tier else 'none'} "
+                f"min_tier={smallest_distance:g}"
             ),
         ))
         if tier is None:
@@ -552,14 +618,30 @@ class CryptoDistanceEdgeStrategy(BaseStrategy):
             _emit_reject(MURMUR)
             return None
 
-        # All gates passed — build the Opportunity. EV is modeled net of
-        # Polymarket taker fees; win prob is the market-implied price plus
-        # the user's (default 0) assumed edge uplift.
-        fee_frac = taker_fee_pct(vwap_price)
-        win_prob = min(0.9999, max(0.0001, vwap_price + edge_uplift_pct / 100.0))
-        ev_per_share = (
-            win_prob * (1.0 - vwap_price - fee_frac) - (1.0 - win_prob) * vwap_price
+        fee_frac = polymarket_taker_fee(vwap_price, category="crypto")
+        base_win_prob = vwap_price
+        sigma, _, _ = realized_vol_per_sec(
+            market.get("oracle_history"),
+            now_ms=now_ms,
+            lookback_seconds=900.0,
+            min_intervals=2,
+            min_span_seconds=0.0,
         )
+        if sigma is not None:
+            prob_up = StrategySDK.prob_above(spot, reference, sigma, seconds_left)
+            if prob_up is not None:
+                base_win_prob = prob_up if side == "YES" else 1.0 - prob_up
+        win_prob = min(0.9999, max(0.0001, base_win_prob + edge_uplift_pct / 100.0))
+        ev_per_share = win_prob - vwap_price - fee_frac
+        ev_passed = ev_per_share > 0.0
+        gates.append(GateResult(
+            "positive_ev", "Expected value after taker fee > 0", ev_passed,
+            score=ev_per_share,
+            detail=f"p_win={win_prob:.4f} cost={vwap_price:.4f} fee={fee_frac:.5f} ev={ev_per_share:.5f}",
+        ))
+        if not ev_passed:
+            _emit_reject(MURMUR)
+            return None
         roi_percent = (ev_per_share / vwap_price) * 100.0 if vwap_price > 0 else 0.0
         token_id = typed_market.clob_token_ids[0 if side == "YES" else 1]
 
@@ -590,7 +672,10 @@ class CryptoDistanceEdgeStrategy(BaseStrategy):
                         "reference_price": reference,
                         "spot_price": spot,
                         "distance_usd": distance_usd,
-                        "tier_distance_usd": tier["distance_usd"],
+                        "distance_bps": distance_bps,
+                        "tier_basis": tier_basis,
+                        "tier_distance_usd": tier.get("distance_usd"),
+                        "tier_distance_bps": tier.get("distance_bps"),
                         "tier_min_cost_cents": min_cost_cents,
                         "cost_cents": cost_cents,
                         "vwap_price": vwap_price,
@@ -606,10 +691,10 @@ class CryptoDistanceEdgeStrategy(BaseStrategy):
                 }
             ],
             is_guaranteed=False,
-            skip_fee_model=True,
             custom_roi_percent=roi_percent,
             custom_risk_score=1.0 - win_prob,
             confidence=win_prob,
+            fee_model_maker_mode=False,
         )
         if opp is None:
             emit_evaluation_nowait(
@@ -663,7 +748,10 @@ class CryptoDistanceEdgeStrategy(BaseStrategy):
             "reference_price": reference,
             "spot_price": spot,
             "distance_usd": distance_usd,
-            "tier_distance_usd": tier["distance_usd"],
+            "distance_bps": distance_bps,
+            "tier_basis": tier_basis,
+            "tier_distance_usd": tier.get("distance_usd"),
+            "tier_distance_bps": tier.get("distance_bps"),
             "tier_min_cost_cents": min_cost_cents,
             "cost_cents": cost_cents,
             "vwap_price": vwap_price,

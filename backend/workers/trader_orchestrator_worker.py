@@ -50,7 +50,6 @@ from services.trader_orchestrator.position_lifecycle import (
     reconcile_shadow_positions,
 )
 from services.polymarket import polymarket_client
-from services.simulation import simulation_service
 from services.live_execution_service import live_execution_service
 from services.live_pressure import current_backpressure_level, is_db_pressure_active, maybe_mark_db_pressure
 from services.trader_orchestrator.risk_manager import evaluate_risk
@@ -2738,165 +2737,6 @@ def _edge_bucket_key(min_edge: float, max_edge: float) -> str:
     return f"{int(min_edge)}-{int(max_edge)}"
 
 
-def _resolve_shadow_account_id(control: dict[str, Any], trader: dict[str, Any]) -> str:
-    settings_payload = control.get("settings")
-    settings_payload = settings_payload if isinstance(settings_payload, dict) else {}
-    metadata_payload = trader.get("metadata")
-    metadata_payload = metadata_payload if isinstance(metadata_payload, dict) else {}
-    candidates = (
-        settings_payload.get("shadow_account_id"),
-        metadata_payload.get("shadow_account_id"),
-    )
-    for candidate in candidates:
-        account_id = str(candidate or "").strip()
-        if account_id:
-            return account_id
-    return ""
-
-
-def _shadow_ledger_token_id(payload: dict[str, Any], direction: str) -> str:
-    leg_payload = payload.get("leg")
-    leg_payload = leg_payload if isinstance(leg_payload, dict) else {}
-    direction_key = str(direction or "").strip().lower()
-    if "yes" in direction_key:
-        candidates = (
-            payload.get("token_id"),
-            payload.get("yes_token_id"),
-            payload.get("selected_token_id"),
-            leg_payload.get("token_id"),
-        )
-    elif "no" in direction_key:
-        candidates = (
-            payload.get("token_id"),
-            payload.get("no_token_id"),
-            payload.get("selected_token_id"),
-            leg_payload.get("token_id"),
-        )
-    else:
-        candidates = (
-            payload.get("token_id"),
-            payload.get("selected_token_id"),
-            leg_payload.get("token_id"),
-        )
-    for raw in candidates:
-        token = str(raw or "").strip()
-        if token:
-            return token
-    return ""
-
-
-async def _backfill_simulation_ledger_for_active_shadow_orders(
-    session: Any,
-    *,
-    trader_id: str,
-    shadow_account_id: str,
-) -> dict[str, Any]:
-    account_id = str(shadow_account_id or "").strip()
-    if not trader_id or not account_id:
-        return {"attempted": 0, "backfilled": 0, "skipped": 0, "errors": []}
-
-    mode_expr = func.lower(func.coalesce(TraderOrder.mode, ""))
-    status_expr = func.lower(func.coalesce(TraderOrder.status, ""))
-    rows = list(
-        (
-            await session.execute(
-                select(TraderOrder)
-                .where(TraderOrder.trader_id == trader_id)
-                .where(mode_expr == "shadow")
-                .where(status_expr.in_(tuple(_ACTIVE_ORDER_STATUSES)))
-                .order_by(TraderOrder.created_at.asc())
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    attempted = 0
-    backfilled = 0
-    skipped = 0
-    errors: list[dict[str, Any]] = []
-    now_utc = utcnow()
-    for row in rows:
-        payload = dict(row.payload_json or {})
-        if isinstance(payload.get("simulation_ledger"), dict):
-            skipped += 1
-            continue
-        attempted += 1
-        notional = safe_float(payload.get("filled_notional_usd"), None)
-        if notional is None or notional <= 0.0:
-            notional = safe_float(payload.get("effective_notional_usd"), None)
-        if notional is None or notional <= 0.0:
-            notional = safe_float(row.notional_usd, 0.0) or 0.0
-        entry_price = safe_float(row.effective_price, None)
-        if entry_price is None or entry_price <= 0.0:
-            entry_price = safe_float(payload.get("average_fill_price"), None)
-        if entry_price is None or entry_price <= 0.0:
-            entry_price = safe_float(row.entry_price, None)
-        if entry_price is None or entry_price <= 0.0 or notional <= 0.0:
-            skipped += 1
-            errors.append(
-                {
-                    "order_id": str(row.id),
-                    "reason": "invalid_fill_metrics",
-                    "entry_price": entry_price,
-                    "notional_usd": notional,
-                }
-            )
-            continue
-
-        direction = str(row.direction or "").strip().lower()
-        shadow_sim = payload.get("shadow_simulation") or payload.get("paper_simulation")
-        shadow_sim = shadow_sim if isinstance(shadow_sim, dict) else {}
-        execution_fee_usd = safe_float(shadow_sim.get("estimated_fee_usd"), None)
-        execution_slippage_usd = safe_float(shadow_sim.get("slippage_usd"), None)
-        token_id = _shadow_ledger_token_id(payload, direction)
-        signal_id = str(row.signal_id or "").strip() or str(row.id)
-        strategy_type = str(row.strategy_key or payload.get("strategy_type") or "").strip() or "trader_orchestrator"
-        try:
-            ledger_row = await simulation_service.record_orchestrator_shadow_fill(
-                account_id=account_id,
-                trader_id=str(trader_id),
-                signal_id=signal_id,
-                market_id=str(row.market_id or ""),
-                market_question=str(row.market_question or payload.get("market_question") or ""),
-                direction=direction,
-                notional_usd=float(notional),
-                entry_price=float(entry_price),
-                strategy_type=strategy_type,
-                token_id=token_id or None,
-                payload=payload,
-                execution_fee_usd=execution_fee_usd,
-                execution_slippage_usd=execution_slippage_usd,
-                session=session,
-                commit=False,
-            )
-            payload["simulation_ledger"] = {
-                **dict(ledger_row or {}),
-                "backfilled_at": now_utc.isoformat(),
-                "mode": _canonical_trader_mode(row.mode, default="shadow"),
-            }
-            row.payload_json = payload
-            row.updated_at = now_utc
-            backfilled += 1
-        except Exception as exc:
-            errors.append(
-                {
-                    "order_id": str(row.id),
-                    "reason": "record_orchestrator_shadow_fill_failed",
-                    "error": str(exc),
-                }
-            )
-
-    if backfilled > 0:
-        await session.flush()
-    return {
-        "attempted": attempted,
-        "backfilled": backfilled,
-        "skipped": skipped,
-        "errors": errors,
-    }
-
-
 async def _build_edge_calibration_profile(
     session: Any,
     *,
@@ -5169,24 +5009,6 @@ async def _run_trader_once_inner(
 
         if run_trader_maintenance:
             if run_mode == "shadow":
-                _mnt_shadow_backfill_started = time.monotonic()
-                shadow_account_id = _resolve_shadow_account_id(control, trader)
-                backfill_result = await _backfill_simulation_ledger_for_active_shadow_orders(
-                    session,
-                    trader_id=trader_id,
-                    shadow_account_id=shadow_account_id,
-                )
-                if backfill_result.get("errors"):
-                    await create_trader_event(
-                        session,
-                        trader_id=trader_id,
-                        event_type="shadow_ledger_backfill_failed",
-                        severity="warn",
-                        source="worker",
-                        message="Shadow ledger backfill encountered one or more errors.",
-                        payload=backfill_result,
-                    )
-                _accumulate("mnt_shadow_backfill", _mnt_shadow_backfill_started)
                 _mnt_shadow_reconcile_started = time.monotonic()
                 force_flatten = resume_policy == "flatten_then_start"
                 lifecycle_result = await reconcile_shadow_positions(
@@ -6144,6 +5966,7 @@ async def _run_trader_once_inner(
             live_context_timeout_seconds: Optional[float] = None
             context_candidates: list[Any] = []
             fallback_candidates: list[Any] = []
+            ws_prewarm_failures: dict[str, str] = {}
             if enable_live_market_context:
                 for sig in signals:
                     if str(sig.id) in occupied_signal_ids or str(sig.id) in cooldown_signal_ids:
@@ -6158,6 +5981,25 @@ async def _run_trader_once_inner(
                     source_config = source_configs.get(sig_source)
                     if _supports_live_market_context(sig, source_config):
                         context_candidates.append(sig)
+
+                if strict_ws_pricing_enforced:
+                    traders_ws_candidates = [
+                        sig
+                        for sig in fallback_candidates
+                        if normalize_source_key(getattr(sig, "source", "")) == "traders"
+                    ]
+                    if traders_ws_candidates:
+                        runtime = get_intent_runtime()
+                        ws_prewarm_failures = await runtime.prewarm_execution_signals(
+                            traders_ws_candidates,
+                        )
+                        if ws_prewarm_failures:
+                            timed_out_ids = set(ws_prewarm_failures)
+                            fallback_candidates = [
+                                sig
+                                for sig in fallback_candidates
+                                if str(getattr(sig, "id", "") or "") not in timed_out_ids
+                            ]
 
                 async def _load_live_contexts() -> dict[str, dict[str, Any]]:
                     loaded_contexts: dict[str, dict[str, Any]] = {}
@@ -6371,6 +6213,38 @@ async def _run_trader_once_inner(
                 assignment_group: str | None = None
                 assignment_sample_pct: float | None = None
                 assignment_source = "pinned_config"
+
+                ws_prewarm_reason = ws_prewarm_failures.get(signal_id)
+                if ws_prewarm_reason:
+                    _enter_stage("ws_subscription_prewarm")
+                    runtime = get_intent_runtime()
+                    required_token_ids = list(getattr(signal, "required_token_ids", None) or [])
+                    if hasattr(runtime, "defer_signal"):
+                        await runtime.defer_signal(
+                            signal_id=signal_id,
+                            required_token_ids=required_token_ids,
+                            reason=ws_prewarm_reason,
+                        )
+                    deferred_signals += 1
+                    deferred_by_reason[ws_prewarm_reason] = deferred_by_reason.get(ws_prewarm_reason, 0) + 1
+                    defer_signal_processing = True
+                    logger.warning(
+                        "Trader signal deferred before strict pricing",
+                        trader_id=trader_id,
+                        signal_id=signal_id,
+                        source=signal_source,
+                        reason=ws_prewarm_reason,
+                        required_token_ids=required_token_ids,
+                    )
+                    # Skip only this signal.  ``break`` would abandon every
+                    # remaining signal in the batch — including crypto and
+                    # scanner signals that already have fresh WS quotes — and
+                    # ``ws_token_id_missing`` never self-resolves, so one
+                    # token-less traders signal would starve the batch every
+                    # cycle until its TTL expires.  ``defer_signal_processing``
+                    # already ends the outer batch loop, matching the existing
+                    # strict-pricing handler below.
+                    continue
 
                 try:
                     _enter_stage("signal_persist")

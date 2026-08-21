@@ -72,6 +72,7 @@ setup_logging(level=os.environ.get("LOG_LEVEL", "INFO"), log_file=_debug_log_fil
 if not os.environ.get("HF_TOKEN"):
     logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
 logger = get_logger("workers.host")
+_MISSING_CREDENTIALS_WARNING_INTERVAL_SECONDS = 300.0
 
 # Tracemalloc is OFF by default — the snapshot phase scales with
 # the number of live blocks, and a worker carrying tens of millions
@@ -1084,6 +1085,7 @@ class WorkerHost:
         # credentials configured at runtime.
         backoff = 2.0
         max_backoff = 30.0
+        missing_credentials_last_warning_mono: float | None = None
         # Read-only planes (cold reconciliation) load creds for authenticated
         # READS but must never mutate the venue. Set this BEFORE any init so the
         # service comes up with all mutations hard-blocked.
@@ -1092,15 +1094,52 @@ class WorkerHost:
             try:
                 if live_execution_service.is_ready():
                     return
+                if live_execution_service.get_last_init_error() == "missing_polymarket_credentials":
+                    try:
+                        resolved_credentials = await live_execution_service._resolve_polymarket_credentials()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Polymarket credential probe failed; live execution retry remains deferred",
+                            plane=self._plane_name,
+                            exc_info=exc,
+                        )
+                        resolved_credentials = (None, None, None, None, None)
+                    if not all(resolved_credentials[:4]):
+                        now_mono = asyncio.get_running_loop().time()
+                        if (
+                            missing_credentials_last_warning_mono is None
+                            or now_mono - missing_credentials_last_warning_mono
+                            >= _MISSING_CREDENTIALS_WARNING_INTERVAL_SECONDS
+                        ):
+                            logger.warning(
+                                "Polymarket credentials still missing; live execution remains disabled",
+                                plane=self._plane_name,
+                                retry_backoff_seconds=backoff,
+                            )
+                            missing_credentials_last_warning_mono = now_mono
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2.0, max_backoff)
+                        continue
                 trading_initialized = await live_execution_service.initialize()
                 if trading_initialized:
                     logger.info("Live execution service initialized", plane=self._plane_name)
                     return
-                logger.info(
-                    "Live execution service not initialized (credentials not configured); will retry",
-                    plane=self._plane_name,
-                    last_error=live_execution_service.get_last_init_error(),
-                )
+                last_error = live_execution_service.get_last_init_error()
+                if last_error == "missing_polymarket_credentials":
+                    # initialize() emits the first ERROR.  Subsequent missing-
+                    # credential checks use the quiet probe above and only a
+                    # periodic WARNING, so a shadow-only deployment does not
+                    # drown useful logs while still noticing credentials saved
+                    # through the DB-backed Settings UI.
+                    missing_credentials_last_warning_mono = asyncio.get_running_loop().time()
+                else:
+                    logger.info(
+                        "Live execution service not initialized; will retry",
+                        plane=self._plane_name,
+                        last_error=last_error,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

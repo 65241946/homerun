@@ -18,6 +18,7 @@ overlap with ``sports_overreaction_fader``).
 
 from __future__ import annotations
 
+import math
 import re
 from collections import deque
 from typing import Any, Optional
@@ -49,6 +50,14 @@ from services.strategies.reversion_helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _compile_word_boundary_patterns(keywords: tuple[str, ...]) -> dict[str, re.Pattern[str]]:
+    return {
+        keyword: re.compile(rf"\b{re.escape(keyword)}\b")
+        for keyword in keywords
+        if len(keyword) <= 4 and keyword.replace("-", "").replace("_", "").isalnum()
+    }
 
 
 class NewsMomentumBreakoutStrategy(BaseStrategy):
@@ -87,10 +96,12 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
 
     scale_out_config = ScaleOutConfig(
         targets=[
-            ScaleOutTarget(trigger_bps=30.0, exit_fraction=0.33),
-            ScaleOutTarget(trigger_bps=60.0, exit_fraction=0.50),
+            # BaseStrategy compares these historical ``trigger_bps`` fields
+            # with PnL percentage points, so 25/45 mean +25%/+45%.
+            ScaleOutTarget(trigger_bps=25.0, exit_fraction=0.33),
+            ScaleOutTarget(trigger_bps=45.0, exit_fraction=0.33),
         ],
-        trailing_stop_bps=120.0,
+        trailing_stop_bps=1200.0,  # Base trailing implementation uses true bps: 1200 = 12%.
         near_resolution_exit=True,
         near_resolution_hours=6.0,
         near_resolution_spread_widen_bps=80.0,
@@ -101,8 +112,9 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
         "lookback_seconds": 300.0,
         "stale_history_seconds": 1800.0,
         "breakout_threshold": 0.10,
+        "breakout_threshold_rel": 0.25,
         "min_target_move": 0.04,
-        "target_distance_to_one_fraction": 0.55,
+        "target_distance_to_one_fraction": 0.35,  # Requires shadow/backtest calibration.
         # Entry-price band
         "min_entry_price": 0.18,
         "max_entry_price": 0.78,
@@ -128,11 +140,12 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
         "take_profit_pct": 70.0,
         "stop_loss_pct": 25.0,
         "stop_loss_policy": "always",
-        "trailing_stop_pct": 18.0,
+        "trailing_stop_pct": 12.0,
         "trailing_stop_activation_profit_pct": 25.0,
         "max_hold_minutes": 240.0,
         "min_hold_minutes": 1.0,
         "momentum_stall_minutes": 45.0,
+        "stall_giveback_fraction": 0.5,
     }
 
     _CRYPTO_MARKET_HINTS = (
@@ -167,6 +180,9 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
         "hockey",
         "match",
         "fixture",
+    )
+    _WORD_BOUNDARY_PATTERNS = _compile_word_boundary_patterns(
+        _CRYPTO_MARKET_HINTS + _SPORTS_MARKET_HINTS
     )
 
     def __init__(self) -> None:
@@ -210,13 +226,62 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
             out.append(token)
         return out
 
-    @staticmethod
-    def _keyword_in_text(keyword: str, text: str) -> bool:
+    @classmethod
+    def _keyword_in_text(cls, keyword: str, text: str) -> bool:
         if not keyword or not text:
             return False
         if len(keyword) <= 4 and keyword.replace("-", "").replace("_", "").isalnum():
-            return re.search(rf"\b{re.escape(keyword)}\b", text) is not None
+            pattern = cls._WORD_BOUNDARY_PATTERNS.get(keyword)
+            if pattern is None:
+                pattern = re.compile(rf"\b{re.escape(keyword)}\b")
+                cls._WORD_BOUNDARY_PATTERNS[keyword] = pattern
+            return pattern.search(text) is not None
         return keyword in text
+
+    @staticmethod
+    def _breakout_threshold_passes(
+        baseline_price: float,
+        current_price: float,
+        *,
+        relative_threshold: float,
+        absolute_fallback: float,
+    ) -> bool:
+        rise = current_price - baseline_price
+        if baseline_price <= 0.0 or rise <= 0.0:
+            return False
+        if relative_threshold > 0.0:
+            return ((rise / baseline_price) + 1e-12) >= relative_threshold
+        return (rise + 1e-12) >= absolute_fallback
+
+    @staticmethod
+    def _history_maxlen(stale_history_seconds: float) -> int:
+        # Scanner refresh is approximately 5 seconds; retain the full stale window.
+        return max(2, int(math.ceil(max(0.0, stale_history_seconds) / 5.0)))
+
+    def _gc_market_state(self, now: float, stale_history_seconds: float) -> None:
+        last_seen: dict[str, float] = self.state.setdefault("last_seen", {})
+        price_history: dict[str, deque] = self.state.setdefault("price_history", {})
+        last_emit: dict[tuple[str, str], float] = self.state.setdefault("last_emit", {})
+        cutoff = now - (stale_history_seconds * 2.0)
+        observed_at_by_market = {str(market_id): safe_float(seen_at, 0.0) for market_id, seen_at in last_seen.items()}
+        for market_id, history in price_history.items():
+            if str(market_id) in observed_at_by_market:
+                continue
+            latest_history_at = safe_float(history[-1][0], 0.0) if history else 0.0
+            observed_at_by_market[str(market_id)] = latest_history_at
+        for key, emitted_at in last_emit.items():
+            observed_at_by_market.setdefault(str(key[0]), safe_float(emitted_at, 0.0))
+        stale_market_ids = {
+            market_id for market_id, observed_at in observed_at_by_market.items() if observed_at < cutoff
+        }
+        if not stale_market_ids:
+            return
+        for market_id in stale_market_ids:
+            last_seen.pop(market_id, None)
+            price_history.pop(market_id, None)
+        for key in list(last_emit):
+            if str(key[0]) in stale_market_ids:
+                last_emit.pop(key, None)
 
     @classmethod
     def _is_crypto_market_text(cls, text: str) -> bool:
@@ -356,9 +421,10 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
         lookback_seconds = max(60.0, safe_float(cfg.get("lookback_seconds"), 300.0))
         stale_history_seconds = max(lookback_seconds * 2.0, safe_float(cfg.get("stale_history_seconds"), 1800.0))
         breakout_threshold = clamp(safe_float(cfg.get("breakout_threshold"), 0.10), 0.02, 0.50)
+        breakout_threshold_rel = clamp(safe_float(cfg.get("breakout_threshold_rel"), 0.25), 0.0, 5.0)
         min_target_move = clamp(safe_float(cfg.get("min_target_move"), 0.04), 0.005, 0.30)
         target_distance_to_one_fraction = clamp(
-            safe_float(cfg.get("target_distance_to_one_fraction"), 0.55), 0.10, 0.95
+            safe_float(cfg.get("target_distance_to_one_fraction"), 0.35), 0.10, 0.95
         )
         min_entry_price = clamp(safe_float(cfg.get("min_entry_price"), 0.18), 0.05, 0.50)
         max_entry_price = clamp(safe_float(cfg.get("max_entry_price"), 0.78), 0.50, 0.95)
@@ -379,6 +445,10 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
         now = utcnow().timestamp()
         candidates: list[tuple[float, Opportunity]] = []
         last_emit: dict[tuple[str, str], float] = self.state.setdefault("last_emit", {})
+        all_history: dict[str, deque] = self.state.setdefault("price_history", {})
+        last_seen: dict[str, float] = self.state.setdefault("last_seen", {})
+        self._gc_market_state(now, stale_history_seconds)
+        history_maxlen = self._history_maxlen(stale_history_seconds)
 
         for market in markets:
             if market.closed or not market.active:
@@ -403,11 +473,13 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
             yes, no, yes_bid, yes_ask, no_bid, no_ask = self._extract_yes_no_snapshot(market, prices)
             if not (0.0 < yes < 1.0 and 0.0 < no < 1.0):
                 continue
+            last_seen[str(market.id)] = now
 
             row = (now, yes, no, yes_bid, yes_ask, no_bid, no_ask)
-            all_history = self.state.setdefault("price_history", {})
             if market.id not in all_history:
-                all_history[market.id] = deque(maxlen=240)
+                all_history[market.id] = deque(maxlen=history_maxlen)
+            elif all_history[market.id].maxlen != history_maxlen:
+                all_history[market.id] = deque(all_history[market.id], maxlen=history_maxlen)
             history = all_history[market.id]
             history.append(row)
 
@@ -436,8 +508,14 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
                     continue
 
                 rise = current_price - old_price
-                if rise < breakout_threshold:
+                if not self._breakout_threshold_passes(
+                    old_price,
+                    current_price,
+                    relative_threshold=breakout_threshold_rel,
+                    absolute_fallback=breakout_threshold,
+                ):
                     continue
+                relative_rise = rise / old_price
                 if current_price < min_entry_price:
                     continue
                 if current_price > max_entry_price:
@@ -489,6 +567,7 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
                             "new_price": current_price,
                             "peak_price": peak,
                             "rise": rise,
+                            "relative_rise": relative_rise,
                             "lookback_seconds": lookback_seconds,
                             "target_price": target_price,
                             "spread": spread,
@@ -560,7 +639,14 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
 
     def custom_checks(self, signal: Any, context: dict, params: dict, payload: dict) -> list[DecisionCheck]:
         live_market = context.get("live_market") or {}
-        min_liquidity = max(0.0, to_float(params.get("min_liquidity", 1500.0), 1500.0))
+        configured_min_liquidity = to_float(
+            (getattr(self, "config", {}) or {}).get("min_liquidity"),
+            self.default_config["min_liquidity"],
+        )
+        min_liquidity = max(
+            0.0,
+            to_float(params.get("min_liquidity", configured_min_liquidity), configured_min_liquidity),
+        )
         min_abs_move_5m = max(0.0, to_float(params.get("min_abs_move_5m", 4.0), 4.0))
         max_abs_move_2h = max(5.0, to_float(params.get("max_abs_move_2h_pct", 80.0), 80.0))
         require_alignment = self._to_bool(params.get("require_breakout_alignment"), True)
@@ -674,8 +760,16 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
     def compute_score(
         self, edge: float, confidence: float, risk_score: float, market_count: int, payload: dict
     ) -> float:
+        weights = self.scoring_weights or ScoringWeights()
         liquidity = float(payload.get("_signal_liquidity", 0) or 0)
-        return (edge * 0.65) + (confidence * 28.0) + (min(1.0, liquidity / 10000.0) * 10.0) - (risk_score * 12.0)
+        liquidity_divisor = max(1.0, weights.liquidity_divisor)
+        return (
+            (edge * weights.edge_weight)
+            + (confidence * weights.confidence_weight)
+            + (min(1.0, liquidity / liquidity_divisor) * weights.liquidity_weight)
+            - (risk_score * weights.risk_penalty)
+            + (min(6, market_count) * weights.market_count_bonus)
+        )
 
     def evaluate(self, signal: Any, context: dict) -> StrategyDecision:
         params = context.get("params") or {}
@@ -790,11 +884,12 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
         for key, fallback in (
             ("take_profit_pct", 70.0),
             ("stop_loss_pct", 25.0),
-            ("trailing_stop_pct", 18.0),
+            ("trailing_stop_pct", 12.0),
             ("trailing_stop_activation_profit_pct", 25.0),
             ("max_hold_minutes", 240.0),
             ("min_hold_minutes", 1.0),
             ("momentum_stall_minutes", 45.0),
+            ("stall_giveback_fraction", 0.5),
         ):
             try:
                 config.setdefault(key, float(defaults.get(key, fallback)))
@@ -816,16 +911,22 @@ class NewsMomentumBreakoutStrategy(BaseStrategy):
             stall_minutes = float(config.get("momentum_stall_minutes") or 0.0)
             if stall_minutes > 0:
                 tracked_high = float(ctx.get("_tracked_high", entry_price) or entry_price)
-                tracked_high_age = float(ctx.get("_tracked_high_age", age_minutes) or age_minutes)
+                raw_high_age = ctx.get("_tracked_high_age")
+                tracked_high_age = age_minutes if raw_high_age is None else float(raw_high_age)
                 if current_price > tracked_high:
                     ctx["_tracked_high"] = current_price
                     ctx["_tracked_high_age"] = age_minutes
                 else:
                     stall_age = age_minutes - tracked_high_age
-                    if stall_age >= stall_minutes and current_price <= entry_price:
+                    giveback_fraction = clamp(float(config.get("stall_giveback_fraction") or 0.5), 0.0, 1.0)
+                    giveback_price = tracked_high - giveback_fraction * (tracked_high - entry_price)
+                    if stall_age >= stall_minutes and current_price <= giveback_price:
                         return ExitDecision(
                             "close",
-                            f"Momentum stalled ({stall_age:.0f}min since new high, no follow-through)",
+                            (
+                                f"Momentum stalled ({stall_age:.0f}min since new high, "
+                                f"price {current_price:.4f} <= giveback {giveback_price:.4f})"
+                            ),
                             close_price=current_price,
                         )
 

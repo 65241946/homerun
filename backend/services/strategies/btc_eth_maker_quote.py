@@ -48,6 +48,7 @@ from services.strategy_helpers.crypto_strategy_utils import (
 )
 from services.data_events import DataEvent
 from services.strategy_sdk import StrategySDK
+from utils.kelly import polymarket_maker_fee, polymarket_taker_fee
 from utils.converters import clamp, coerce_bool as _coerce_bool, safe_float, to_bool, to_confidence, to_float
 from utils.signal_helpers import signal_payload
 from services.quality_filter import QualityFilterOverrides
@@ -578,6 +579,12 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         "resolution_risk_disable_when_take_profit_armed": True,
         # Circuit breaker
         "max_consecutive_losses_before_pause": 3,
+        "consecutive_loss_pause_minutes": 15.0,
+        "consecutive_loss_pause_enabled": True,
+        "reentry_cooldown_seconds_per_market": 5.0,
+        "min_oracle_move_pct": 0.15,
+        "debug_decision_payload": False,
+        "runtime_cache_ttl_seconds": 600.0,
         # ── Maker-quote tunables ───────────────────────────────────────
         # Quote both sides 1 tick inside the spread, capturing maker fees.
         # Thin books (low liquidity) actually IMPROVE fill rates because
@@ -594,6 +601,11 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         "maker_quote_max_size_usd": 25.0,           # maximum size per side
         "maker_quote_resolution_risk_seconds": 45.0, # window for resolution-risk penalty
         "maker_quote_skew_max": 0.03,               # max oracle-driven skew per side ($)
+        "maker_quote_skew_scale": 1.0,              # 1% oracle diff reaches max skew
+        "maker_min_combined_edge": 0.015,
+        "maker_quote_leg_fill_tolerance_ratio": 0.02,
+        "maker_session_timeout_seconds": 300.0,
+        "hedge_timeout_by_timeframe": {"5m": 5, "15m": 10, "1h": 20, "4h": 30},
     }
     # Pin sub-strategy mode for the maker-quote clone.
     default_config["enabled_sub_strategies"] = ["maker_quote"]
@@ -620,12 +632,92 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         # Runtime anti-churn controls used by evaluate().
         self._edge_first_seen_ms: dict[str, int] = {}
         self._last_selected_at_ms_by_market: dict[str, int] = {}
+        self._market_scope_cache: dict[str, tuple[str, str]] = {}
+        self._book_imbalance_memo: dict[tuple[str, str, int], Optional[float]] = {}
         # Consecutive loss circuit breaker state.
         self._consecutive_losses: int = 0
         self._paused_until_ms: int = 0
 
     def configure(self, config: dict) -> None:
         super().configure({**self.default_config, **(config or {})})
+
+    @classmethod
+    def _maker_skew(
+        cls,
+        params: dict[str, Any],
+        oracle_diff_pct: float,
+    ) -> tuple[float, float, float]:
+        skew_scale = max(
+            1e-9,
+            to_float(
+                params.get("maker_quote_skew_scale", cls.default_config["maker_quote_skew_scale"]),
+                cls.default_config["maker_quote_skew_scale"],
+            ),
+        )
+        skew_max = max(
+            0.0,
+            to_float(
+                params.get("maker_quote_skew_max", cls.default_config["maker_quote_skew_max"]),
+                cls.default_config["maker_quote_skew_max"],
+            ),
+        )
+        skew = clamp(oracle_diff_pct / skew_scale, -1.0, 1.0) * skew_max
+        yes_weight = clamp(0.5 + (skew / 2.0), 0.0, 1.0)
+        return skew, yes_weight, 1.0 - yes_weight
+
+    @staticmethod
+    def _maker_combined_cost_ok(
+        quote_yes: float,
+        quote_no: float,
+        *,
+        min_combined_edge: float,
+        hedge_taker_fee_estimate: float,
+    ) -> bool:
+        return quote_yes + quote_no + hedge_taker_fee_estimate <= 1.0 - min_combined_edge + 1e-12
+
+    @classmethod
+    def _maker_score(cls, params: dict[str, Any], *, spread: float, liquidity: float) -> float:
+        base_score = to_float(
+            params.get("maker_quote_base_score", cls.default_config["maker_quote_base_score"]),
+            cls.default_config["maker_quote_base_score"],
+        )
+        spread_scale = to_float(
+            params.get(
+                "maker_quote_spread_score_scale",
+                cls.default_config["maker_quote_spread_score_scale"],
+            ),
+            cls.default_config["maker_quote_spread_score_scale"],
+        )
+        thin_book_usd = to_float(
+            params.get("maker_quote_thin_book_usd", cls.default_config["maker_quote_thin_book_usd"]),
+            cls.default_config["maker_quote_thin_book_usd"],
+        )
+        thin_bonus = (
+            to_float(
+                params.get("maker_quote_thin_book_bonus", cls.default_config["maker_quote_thin_book_bonus"]),
+                cls.default_config["maker_quote_thin_book_bonus"],
+            )
+            if liquidity < thin_book_usd
+            else 0.0
+        )
+        max_score = to_float(
+            params.get("maker_quote_max_score", cls.default_config["maker_quote_max_score"]),
+            cls.default_config["maker_quote_max_score"],
+        )
+        return min(max_score, base_score + spread * spread_scale + thin_bonus)
+
+    def _prune_runtime_caches(self, *, now_ms: int, ttl_seconds: float) -> None:
+        cutoff_ms = now_ms - int(max(1.0, ttl_seconds) * 1000.0)
+        for cache in (self._edge_first_seen_ms, self._last_selected_at_ms_by_market):
+            for key in [key for key, timestamp_ms in cache.items() if timestamp_ms < cutoff_ms]:
+                cache.pop(key, None)
+        if len(self._market_scope_cache) > 4096:
+            self._market_scope_cache.clear()
+        if len(self._book_imbalance_memo) > 1024:
+            self._book_imbalance_memo.clear()
+
+    def _build_decision_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return payload
 
     # ------------------------------------------------------------------
     # Detection entry point — EVENT-DRIVEN (see on_event below)
@@ -786,50 +878,104 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
             0.001,
             0.05,
         )
-        quote_yes = clamp(yes_price - quote_tick, 0.01, 0.99)
-        quote_no = clamp(no_price - quote_tick, 0.01, 0.99)
+        oracle_diff_pct = to_float(payload.get("oracle_diff_pct"), 0.0)
+        skew, yes_weight, no_weight = self._maker_skew(params, oracle_diff_pct)
+        quote_yes = clamp(yes_price - quote_tick + skew, 0.01, 0.99)
+        quote_no = clamp(no_price - quote_tick - skew, 0.01, 0.99)
 
-        combined_cost = quote_yes + quote_no
-        if combined_cost >= 0.998:
-            excess = combined_cost - 0.998
-            quote_yes = clamp(quote_yes - (excess / 2.0), 0.01, 0.99)
-            quote_no = clamp(quote_no - (excess / 2.0), 0.01, 0.99)
+        leg_fill_tolerance_ratio = clamp(
+            to_float(
+                params.get(
+                    "maker_quote_leg_fill_tolerance_ratio",
+                    self.default_config["maker_quote_leg_fill_tolerance_ratio"],
+                ),
+                self.default_config["maker_quote_leg_fill_tolerance_ratio"],
+            ),
+            0.0,
+            1.0,
+        )
+        maker_fee_estimate = polymarket_maker_fee(quote_yes, category="crypto") + polymarket_maker_fee(
+            quote_no,
+            category="crypto",
+        )
+        hedge_taker_fee_estimate = max(
+            polymarket_taker_fee(quote_yes, category="crypto"),
+            polymarket_taker_fee(quote_no, category="crypto"),
+        ) * leg_fill_tolerance_ratio
+        min_combined_edge = clamp(
+            to_float(
+                params.get("maker_min_combined_edge", self.default_config["maker_min_combined_edge"]),
+                self.default_config["maker_min_combined_edge"],
+            ),
+            0.0,
+            0.99,
+        )
+        if not self._maker_combined_cost_ok(
+            quote_yes,
+            quote_no,
+            min_combined_edge=min_combined_edge,
+            hedge_taker_fee_estimate=hedge_taker_fee_estimate,
+        ):
+            return None
 
         market_question = str(
             getattr(signal, "market_question", "") or market.get("question") or payload.get("title") or ""
         ).strip()
-        session_timeout_seconds = int(
-            max(
-                60,
-                min(
-                    900,
-                    to_float(
-                        _first_present(
-                            params.get("session_timeout_seconds"),
-                            params.get("maker_session_timeout_seconds"),
-                            300,
-                        ),
-                        300.0,
-                    ),
-                ),
-            )
+        timeframe = _normalize_timeframe(
+            _first_present(payload.get("timeframe"), market.get("timeframe"), live_market.get("timeframe"))
         )
+        seconds_left = self._float(
+            _first_present(payload.get("seconds_left"), live_market.get("seconds_left"), market.get("seconds_left"))
+        )
+        min_seconds_left = to_float(
+            params.get("maker_quote_min_seconds_left", self.default_config["maker_quote_min_seconds_left"]),
+            self.default_config["maker_quote_min_seconds_left"],
+        )
+        resolution_risk_seconds = to_float(
+            params.get(
+                "maker_quote_resolution_risk_seconds",
+                self.default_config["maker_quote_resolution_risk_seconds"],
+            ),
+            self.default_config["maker_quote_resolution_risk_seconds"],
+        )
+        if seconds_left is None or seconds_left < min_seconds_left:
+            return None
+        session_timeout_cfg = to_float(
+            _first_present(
+                params.get("session_timeout_seconds"),
+                params.get("maker_session_timeout_seconds"),
+                self.default_config["maker_session_timeout_seconds"],
+            ),
+            self.default_config["maker_session_timeout_seconds"],
+        )
+        session_timeout_seconds = int(max(0.0, min(session_timeout_cfg, seconds_left - resolution_risk_seconds)))
+        if session_timeout_seconds <= 0:
+            return None
+
+        hedge_timeout_map = params.get("hedge_timeout_by_timeframe")
+        if not isinstance(hedge_timeout_map, dict):
+            hedge_timeout_map = self.default_config["hedge_timeout_by_timeframe"]
         hedge_timeout_seconds = int(
             max(
-                1,
-                min(
-                    120,
-                    to_float(
-                        _first_present(
-                            params.get("hedge_timeout_seconds"),
-                            params.get("maker_hedge_timeout_seconds"),
-                            20,
-                        ),
-                        20.0,
-                    ),
+                1.0,
+                to_float(
+                    hedge_timeout_map.get(timeframe),
+                    hedge_timeout_map.get("15m", self.default_config["hedge_timeout_by_timeframe"]["15m"]),
                 ),
             )
         )
+        min_leg_size = to_float(
+            params.get("maker_quote_min_size_usd", self.default_config["maker_quote_min_size_usd"]),
+            self.default_config["maker_quote_min_size_usd"],
+        )
+        max_leg_size = max(
+            min_leg_size,
+            to_float(
+                params.get("maker_quote_max_size_usd", self.default_config["maker_quote_max_size_usd"]),
+                self.default_config["maker_quote_max_size_usd"],
+            ),
+        )
+        leg_notional = clamp(to_float(payload.get("size_usd"), min_leg_size), min_leg_size, max_leg_size)
 
         return {
             "plan_id": f"maker_parallel_{market_id}",
@@ -847,7 +993,8 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                     "price_policy": "maker_limit",
                     "time_in_force": "GTC",
                     "post_only": True,
-                    "notional_weight": 0.5,
+                    "notional_weight": yes_weight,
+                    "notional_usd": leg_notional,
                     "min_fill_ratio": 0.0,
                     "metadata": {
                         "active_mode": "maker_quote",
@@ -866,7 +1013,8 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                     "price_policy": "maker_limit",
                     "time_in_force": "GTC",
                     "post_only": True,
-                    "notional_weight": 0.5,
+                    "notional_weight": no_weight,
+                    "notional_usd": leg_notional,
                     "min_fill_ratio": 0.0,
                     "metadata": {
                         "active_mode": "maker_quote",
@@ -876,17 +1024,21 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                 },
             ],
             "constraints": {
-                "max_unhedged_notional_usd": 0.0,
+                "max_unhedged_notional_usd": leg_fill_tolerance_ratio * leg_notional,
                 "hedge_timeout_seconds": hedge_timeout_seconds,
                 "session_timeout_seconds": session_timeout_seconds,
                 "max_reprice_attempts": 3,
                 "pair_lock": True,
-                "leg_fill_tolerance_ratio": 0.02,
+                "leg_fill_tolerance_ratio": leg_fill_tolerance_ratio,
             },
             "metadata": {
                 "generated_by": "btc_eth_maker_quote.evaluate",
                 "active_mode": "maker_quote",
                 "regime": regime,
+                "oracle_skew": skew,
+                "maker_fee_estimate_usd": maker_fee_estimate,
+                "hedge_taker_fee_estimate_usd": hedge_taker_fee_estimate,
+                "min_combined_edge": min_combined_edge,
             },
         }
 
@@ -1091,6 +1243,15 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         """
         params = context.get("params") or {}
         payload = signal_payload(signal)
+        market_id = str(getattr(signal, "market_id", "") or payload.get("market_id") or "").strip()
+        now_ms = int(utcnow().timestamp() * 1000.0)
+        self._prune_runtime_caches(
+            now_ms=now_ms,
+            ttl_seconds=to_float(
+                params.get("runtime_cache_ttl_seconds", self.default_config["runtime_cache_ttl_seconds"]),
+                self.default_config["runtime_cache_ttl_seconds"],
+            ),
+        )
         live_market = context.get("live_market")
         if not isinstance(live_market, dict):
             live_market = payload.get("live_market")
@@ -1123,26 +1284,24 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         enabled_active_modes = _resolve_enabled_active_modes(params)
 
         # --- Asset / timeframe extraction ---
-        signal_asset = _normalize_asset(
-            _first_present(
-                live_market.get("asset"),
-                live_market.get("coin"),
-                live_market.get("symbol"),
-                payload.get("asset"),
-                payload.get("coin"),
-                payload.get("symbol"),
+        cached_scope = self._market_scope_cache.get(market_id) if market_id else None
+        if cached_scope is not None:
+            signal_asset, signal_timeframe = cached_scope
+        else:
+            signal_asset = _normalize_asset(
+                _first_present(
+                    live_market.get("asset"), live_market.get("coin"), live_market.get("symbol"),
+                    payload.get("asset"), payload.get("coin"), payload.get("symbol"),
+                )
             )
-        )
-        signal_timeframe = _normalize_timeframe(
-            _first_present(
-                live_market.get("timeframe"),
-                live_market.get("cadence"),
-                live_market.get("interval"),
-                payload.get("timeframe"),
-                payload.get("cadence"),
-                payload.get("interval"),
+            signal_timeframe = _normalize_timeframe(
+                _first_present(
+                    live_market.get("timeframe"), live_market.get("cadence"), live_market.get("interval"),
+                    payload.get("timeframe"), payload.get("cadence"), payload.get("interval"),
+                )
             )
-        )
+            if market_id and signal_asset and signal_timeframe:
+                self._market_scope_cache[market_id] = (signal_asset, signal_timeframe)
 
         # --- Asset/timeframe include+exclude filtering ---
         include_assets = _normalize_scope(
@@ -1578,16 +1737,41 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
             int(to_float(params.get("orderbook_imbalance_levels", 5), 5)),
         )
         live_imbalance_signed = None
-        try:
-            live_imbalance_signed = StrategySDK.get_book_imbalance(
-                live_market_for_imbalance,
-                side="YES",
-                levels=live_imbalance_levels,
+        imbalance_token_id = str(
+            _first_present(
+                live_market_for_imbalance.get("token_id"),
+                payload.get("token_id"),
+                getattr(signal, "token_id", None),
             )
-        except Exception:
-            # SDK call should never raise, but defensively swallow any
-            # surprise so a cache hiccup can't take out the evaluate path.
-            live_imbalance_signed = None
+            or ""
+        ).strip()
+        imbalance_tick = str(
+            _first_present(
+                live_market_for_imbalance.get("book_updated_at_ms"),
+                live_market_for_imbalance.get("updated_at_ms"),
+                live_market_for_imbalance.get("market_data_observed_at"),
+                payload.get("market_data_observed_at"),
+            )
+            or ""
+        ).strip()
+        imbalance_memo_key = (
+            (imbalance_token_id, imbalance_tick, live_imbalance_levels)
+            if imbalance_token_id and imbalance_tick
+            else None
+        )
+        if imbalance_memo_key is not None and imbalance_memo_key in self._book_imbalance_memo:
+            live_imbalance_signed = self._book_imbalance_memo[imbalance_memo_key]
+        else:
+            try:
+                live_imbalance_signed = StrategySDK.get_book_imbalance(
+                    live_market_for_imbalance,
+                    side="YES",
+                    levels=live_imbalance_levels,
+                )
+            except Exception:
+                live_imbalance_signed = None
+            if imbalance_memo_key is not None:
+                self._book_imbalance_memo[imbalance_memo_key] = live_imbalance_signed
 
         if live_imbalance_signed is not None:
             raw_orderbook_imbalance = live_imbalance_signed
@@ -1936,6 +2120,8 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         required_edge = (
             min_edge * _EDGE_MODE_FACTORS.get(regime, {}).get(active_mode, 1.0) * oracle_threshold_edge_multiplier
         )
+        if active_mode == "maker_quote":
+            required_edge = 0.0
         required_conf = (
             min_conf
             * _CONF_MODE_FACTORS.get(active_mode, 1.0)
@@ -1953,7 +2139,7 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         min_oracle_move_pct_effective = (
             max(0.05, float(min_oracle_move_pct_cfg))
             if min_oracle_move_pct_cfg is not None
-            else 0.15
+            else float(self.default_config["min_oracle_move_pct"])
         )
         if low_notional_live_mode and size_cap_for_gates is not None:
             low_notional_edge_ceiling = max(0.35, min_oracle_move_pct_effective * 1.25)
@@ -2062,11 +2248,16 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         oracle_direction_detail = "not required for active mode"
         oracle_direction_gate_modes = {
             _normalize_mode(item)
-            for item in _as_list(_first_present(params.get("oracle_direction_gate_modes"), ["directional", "convergence"]))
+            for item in _as_list(
+                _first_present(
+                    params.get("oracle_direction_gate_modes"),
+                    ["directional", "maker_quote", "convergence"],
+                )
+            )
             if _normalize_mode(item) in {"directional", "maker_quote", "convergence"}
         }
         if not oracle_direction_gate_modes:
-            oracle_direction_gate_modes = {"directional", "convergence"}
+            oracle_direction_gate_modes = {"directional", "maker_quote", "convergence"}
         oracle_direction_required = active_mode in oracle_direction_gate_modes
         if oracle_direction_required:
             oracle_direction_detail = "no oracle diff data"
@@ -2091,8 +2282,6 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
 
         # --- Adaptive edge gating ---
         edge_for_gate = min(edge, mode_edge) if mode_edge > 0.0 else edge
-        now_ms = int(utcnow().timestamp() * 1000.0)
-        market_id = str(getattr(signal, "market_id", "") or "").strip()
         edge_tracker_key = f"{market_id}|{direction}|{active_mode}" if market_id else ""
         min_edge_persistence_ms = max(
             0,
@@ -2122,7 +2311,10 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         else:
             default_reentry_cooldown_seconds = max(
                 0.0,
-                to_float(getattr(self, "config", {}).get("reentry_cooldown_seconds_per_market"), 0.0),
+                to_float(
+                    getattr(self, "config", {}).get("reentry_cooldown_seconds_per_market"),
+                    self.default_config["reentry_cooldown_seconds_per_market"],
+                ),
             )
             reentry_cooldown_seconds = max(
                 0.0,
@@ -2327,6 +2519,11 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
             min_execution_adjusted_edge_percent = 0.0
 
         # --- Decision checks ---
+        maker_min_spread = to_float(
+            params.get("maker_quote_min_spread", self.default_config["maker_quote_min_spread"]),
+            self.default_config["maker_quote_min_spread"],
+        )
+        maker_spread_ok = signal_spread is not None and signal_spread >= maker_min_spread
         checks = [
             DecisionCheck("source", "Crypto source", source_ok, detail="Requires crypto worker signals."),
             DecisionCheck(
@@ -2495,6 +2692,16 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                 detail=oracle_direction_detail,
             ),
             DecisionCheck(
+                "maker_spread",
+                "Maker minimum spread",
+                maker_spread_ok,
+                score=signal_spread,
+                detail=(
+                    f"spread={signal_spread if signal_spread is not None else 'missing'} "
+                    f"min={maker_min_spread:.4f}"
+                ),
+            ),
+            DecisionCheck(
                 "edge",
                 "Edge threshold",
                 edge_for_gate >= required_edge,
@@ -2589,6 +2796,25 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                 )
             )
 
+        score = self._maker_score(
+            params,
+            spread=float(signal_spread or 0.0),
+            liquidity=float(signal_liquidity_usd or 0.0),
+        )
+        all_checks_passed = all(check.passed for check in checks)
+        debug_decision_payload = to_bool(
+            params.get("debug_decision_payload"),
+            bool(self.default_config["debug_decision_payload"]),
+        )
+        if not all_checks_passed and not debug_decision_payload:
+            return StrategyDecision(
+                decision="skipped",
+                reason="Crypto worker filters not met",
+                score=score,
+                checks=checks,
+                payload={},
+            )
+
         failed_check_keys = [
             str(getattr(check, "key", "") or "").strip()
             for check in checks
@@ -2607,7 +2833,7 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         age_present_but_unavailable = int(oracle_status.get("availability_state") == "age_present_but_unavailable")
 
         # --- Build shared payload dict ---
-        decision_payload: dict[str, Any] = {
+        decision_payload = self._build_decision_payload({
             "requested_mode": requested_mode,
             "active_mode": active_mode,
             "dominant_mode": dominant_mode,
@@ -2792,13 +3018,11 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                 "live_market": _json_safe(live_market),
                 "oracle_status": _json_safe(oracle_status),
             },
-        }
+        })
         if maker_execution_plan_override is not None:
             decision_payload["execution_plan_override"] = maker_execution_plan_override
 
-        score = (edge_for_gate * 0.7) + (confidence * 30.0)
-
-        if not all(c.passed for c in checks):
+        if not all_checks_passed:
             return StrategyDecision(
                 decision="skipped",
                 reason="Crypto worker filters not met",
@@ -3947,12 +4171,20 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
             defaults = self.config
             max_streak = max(
                 1,
-                int(to_float(defaults.get("max_consecutive_losses_before_pause"), 3.0)),
+                int(
+                    to_float(
+                        defaults.get("max_consecutive_losses_before_pause"),
+                        self.default_config["max_consecutive_losses_before_pause"],
+                    )
+                ),
             )
             if self._consecutive_losses >= max_streak:
                 pause_minutes = max(
                     1.0,
-                    to_float(defaults.get("consecutive_loss_pause_minutes"), 15.0),
+                    to_float(
+                        defaults.get("consecutive_loss_pause_minutes"),
+                        self.default_config["consecutive_loss_pause_minutes"],
+                    ),
                 )
                 self._paused_until_ms = int(utcnow().timestamp() * 1000.0) + int(pause_minutes * 60_000)
                 logger.warning(
@@ -3964,7 +4196,10 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
 
     def _circuit_breaker_active(self) -> bool:
         defaults = self.config
-        if not to_bool(defaults.get("consecutive_loss_pause_enabled"), True):
+        if not to_bool(
+            defaults.get("consecutive_loss_pause_enabled"),
+            self.default_config["consecutive_loss_pause_enabled"],
+        ):
             return False
         if self._paused_until_ms <= 0:
             return False
@@ -4091,6 +4326,29 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
 
             regime = str(market.get("regime") or self._crypto_regime(seconds_left, timeframe_seconds))
 
+            min_seconds_left = to_float(
+                defaults.get("maker_quote_min_seconds_left", self.default_config["maker_quote_min_seconds_left"]),
+                self.default_config["maker_quote_min_seconds_left"],
+            )
+            seconds_left_ok = seconds_left >= min_seconds_left
+            gates.append(GateResult(
+                "maker_seconds_left",
+                "Maker quote resolution window",
+                seconds_left_ok,
+                score=float(seconds_left),
+                detail=f"seconds_left={seconds_left:.1f} min={min_seconds_left:.1f}",
+            ))
+            if not seconds_left_ok:
+                rejections.append({
+                    "market": market.get("slug") or market_id,
+                    "asset": asset or "?",
+                    "timeframe": timeframe or "?",
+                    "gate": "maker_seconds_left",
+                    "seconds_left": seconds_left,
+                })
+                _emit_reject(MURMUR)
+                continue
+
             # --- Latency-arb detect: only signal when oracle shows decisive move ---
             # The oracle (Binance direct WS) updates 30-90s before the Polymarket
             # order book reprices.  diff_pct/oracle_move_pct are stamped by
@@ -4109,7 +4367,12 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
             # Gate 1: Minimum oracle move — small moves are noise, not signal.
             min_oracle_move = to_float(
                 _crypto_hf_param_value(defaults, "min_oracle_move_pct", timeframe),
-                _coerce_float(self._default_param("min_oracle_move_pct", timeframe), 0.30, 0.0, 100.0),
+                _coerce_float(
+                    self._default_param("min_oracle_move_pct", timeframe),
+                    self.default_config["min_oracle_move_pct"],
+                    0.0,
+                    100.0,
+                ),
             )
             oracle_move_ok = oracle_move_pct >= min_oracle_move
             gates.append(GateResult(
@@ -4135,63 +4398,38 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                 _emit_reject(MURMUR)
                 continue
 
-            # Gate 2: Price lag detection — only enter when Polymarket hasn't
-            # repriced to reflect the oracle move.  If the contract price on our
-            # predicted winning side is already expensive, there's no lag to exploit.
-            max_repricing = to_float(
-                _crypto_hf_param_value(defaults, "max_market_repricing_for_entry", timeframe),
-                _coerce_float(
-                    self._default_param("max_market_repricing_for_entry", timeframe),
-                    0.30,
-                    0.0,
-                    1.0,
-                ),
-            )
-            repricing_ceiling = round(0.50 + max_repricing, 3)
-            if diff_pct > 0 and up_price > repricing_ceiling:
-                gates.append(GateResult(
-                    "not_repriced", "Polymarket hasn't repriced (YES)", False,
-                    score=float(up_price),
-                    detail=f"up_price={up_price:.4f} ceiling={repricing_ceiling:.4f}",
-                ))
-                rejections.append({
-                    "market": market.get("slug") or market_id,
-                    "asset": asset or "?",
-                    "timeframe": timeframe or "?",
-                    "gate": "repriced",
-                    "side": "YES",
-                    "price": up_price,
-                    "max_price": repricing_ceiling,
-                    "oracle_move_pct": round(oracle_move_pct, 4),
-                })
-                _emit_reject(MURMUR)
-                continue  # YES side already repriced — no lag
-            if diff_pct < 0 and down_price > repricing_ceiling:
-                gates.append(GateResult(
-                    "not_repriced", "Polymarket hasn't repriced (NO)", False,
-                    score=float(down_price),
-                    detail=f"down_price={down_price:.4f} ceiling={repricing_ceiling:.4f}",
-                ))
-                rejections.append({
-                    "market": market.get("slug") or market_id,
-                    "asset": asset or "?",
-                    "timeframe": timeframe or "?",
-                    "gate": "repriced",
-                    "side": "NO",
-                    "price": down_price,
-                    "max_price": repricing_ceiling,
-                    "oracle_move_pct": round(oracle_move_pct, 4),
-                })
-                _emit_reject(MURMUR)
-                continue  # NO side already repriced — no lag
-            gates.append(GateResult(
-                "not_repriced", "Polymarket hasn't repriced", True,
-                score=float(up_price if diff_pct > 0 else down_price),
-                detail=f"side={'YES' if diff_pct > 0 else 'NO'} price={up_price if diff_pct > 0 else down_price:.4f} ceiling={repricing_ceiling:.4f}",
-            ))
-
             spread = clamp(self._float(market.get("spread")) or 0.0, 0.0, 0.10)
             liquidity = max(0.0, self._float(market.get("liquidity")) or 0.0)
+            min_spread = to_float(
+                defaults.get("maker_quote_min_spread", self.default_config["maker_quote_min_spread"]),
+                self.default_config["maker_quote_min_spread"],
+            )
+            min_liquidity = to_float(
+                defaults.get("maker_quote_min_liquidity", self.default_config["maker_quote_min_liquidity"]),
+                self.default_config["maker_quote_min_liquidity"],
+            )
+            maker_market_ok = spread >= min_spread and liquidity >= min_liquidity
+            gates.append(GateResult(
+                "maker_market",
+                "Maker spread and liquidity",
+                maker_market_ok,
+                score=float(spread),
+                detail=(
+                    f"spread={spread:.4f} min={min_spread:.4f} "
+                    f"liquidity={liquidity:.2f} min={min_liquidity:.2f}"
+                ),
+            ))
+            if not maker_market_ok:
+                rejections.append({
+                    "market": market.get("slug") or market_id,
+                    "asset": asset or "?",
+                    "timeframe": timeframe or "?",
+                    "gate": "maker_market",
+                    "spread": spread,
+                    "liquidity": liquidity,
+                })
+                _emit_reject(MURMUR)
+                continue
 
             # Direction: oracle dictates.
             if diff_pct > 0:
@@ -4206,6 +4444,14 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                 0.0,
                 1.0,
             )
+            quote_tick = clamp(
+                to_float(defaults.get("maker_quote_tick_size"), _MAKER_QUOTE_TICK_SIZE),
+                0.001,
+                0.05,
+            )
+            combined_quote_cost = max(0.0, up_price - quote_tick) + max(0.0, down_price - quote_tick)
+            edge_percent = max(0.0, (1.0 - combined_quote_cost) * 100.0)
+            maker_score = self._maker_score(defaults, spread=spread, liquidity=liquidity)
             base_confidence = clamp(
                 0.55
                 + clamp(oracle_move_pct / 10.0, 0.0, 0.25)
@@ -4216,18 +4462,14 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
             ml_probability_yes = _market_ml_probability_yes(market)
             if ml_probability_yes is not None:
                 ml_probability_yes = clamp(ml_probability_yes, 0.03, 0.97)
-                expected_prob = ml_probability_yes if direction == "buy_yes" else (1.0 - ml_probability_yes)
-                model_edge_percent = max(0.0, (expected_prob - entry_price) * 100.0)
-                edge_percent = max(oracle_move_pct, model_edge_percent)
                 confidence = clamp(
                     max(base_confidence, 0.48 + (abs(ml_probability_yes - 0.5) * 1.1)),
                     0.55,
                     0.97,
                 )
             else:
-                edge_percent = oracle_move_pct
                 confidence = base_confidence
-            min_required_edge = 0.0  # evaluate() handles final gating
+            min_required_edge = 0.0
 
             side = "YES" if direction == "buy_yes" else "NO"
             slug = market.get("slug") or market_id
@@ -4249,6 +4491,7 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                 live_market_fetched_at=live_market_fetched_at,
                 market_data_age_ms=market_data_age_ms,
                 signal_family="crypto_maker", token_id=position_token_id,
+                maker_score=maker_score,
             )
             if opp is not None:
                 emit_emit_nowait(
@@ -4290,12 +4533,16 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
 
         oracle_rejections = [r for r in rejections if r["gate"] == "oracle_move"]
         max_oracle_move = max((r["oracle_move_pct"] for r in oracle_rejections), default=0.0)
-        repriced_count = sum(1 for r in rejections if r["gate"] == "repriced")
         thresholds_percent = {
             timeframe_key: round(
                 to_float(
                     _crypto_hf_param_value(defaults, "min_oracle_move_pct", timeframe_key),
-                    _coerce_float(self._default_param("min_oracle_move_pct", timeframe_key), 0.30, 0.0, 100.0),
+                    _coerce_float(
+                        self._default_param("min_oracle_move_pct", timeframe_key),
+                        self.default_config["min_oracle_move_pct"],
+                        0.0,
+                        100.0,
+                    ),
                 ),
                 4,
             )
@@ -4316,13 +4563,11 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
             "message": (
                 f"Scanned {len(markets)} markets, {len(opportunities)} signals"
                 f" \u2014 {len(oracle_rejections)} below oracle threshold"
-                f" ({round(min_threshold, 4)}%-{round(max_threshold, 4)}%, max seen {round(max_oracle_move, 4)}%),"
-                f" {repriced_count} already repriced"
+                f" ({round(min_threshold, 4)}%-{round(max_threshold, 4)}%, max seen {round(max_oracle_move, 4)}%)"
             ),
             "thresholds_percent": thresholds_percent,
             "summary": {
                 "oracle_move": len(oracle_rejections),
-                "repriced": repriced_count,
                 "max_oracle_move_pct": round(max_oracle_move, 4),
                 "oracle_rejections_by_timeframe": dict(sorted(oracle_rejections_by_timeframe.items())),
                 "thresholds_percent": thresholds_percent,
@@ -4362,6 +4607,7 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
         market_data_age_ms,
         signal_family: str,
         token_id,
+        maker_score: float,
     ):
         """Build and return an Opportunity for the detect/on_event path."""
         opp = self.create_opportunity(
@@ -4402,6 +4648,7 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                         "oracle_prices_by_source": _json_safe(market.get("oracle_prices_by_source") or {}),
                         "machine_learning": _json_safe(_market_ml_contract(market) or {}),
                         "oracle_diff_pct": diff_pct,
+                        "maker_quote_score": maker_score,
                         "taker_fee_gate": min_required_edge,
                         "edge_percent": edge_percent,
                         "spread": spread,
@@ -4425,6 +4672,8 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                 }
             ],
             is_guaranteed=False,
+            # Maker entry fees are canonically zero; hedge-cross taker fees are
+            # already included in the execution-plan combined-cost gate.
             skip_fee_model=True,
             custom_roi_percent=edge_percent,
             custom_risk_score=1.0 - confidence,
@@ -4458,6 +4707,7 @@ class BtcEthMakerQuoteStrategy(BaseStrategy):
                 "oracle_prices_by_source": _json_safe(market.get("oracle_prices_by_source") or {}),
                 "machine_learning": _json_safe(_market_ml_contract(market) or {}),
                 "oracle_diff_pct": diff_pct,
+                "maker_quote_score": maker_score,
                 "taker_fee_gate": min_required_edge,
                 "edge_percent": edge_percent,
                 "spread": spread,

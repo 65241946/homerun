@@ -98,6 +98,13 @@ class WeatherDistributionStrategy(BaseStrategy):
                 if key in config:
                     self._config[key] = config[key]
 
+    @property
+    def pipeline_defaults(self) -> dict[str, Any]:
+        return {
+            "min_edge_percent": self._config.get("min_edge_percent", self.DEFAULT_CONFIG["min_edge_percent"]),
+            "min_confidence": self._config.get("min_confidence", self.DEFAULT_CONFIG["min_confidence"]),
+        }
+
     @staticmethod
     def _normalize_intent(intent: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(intent)
